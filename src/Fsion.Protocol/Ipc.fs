@@ -22,6 +22,10 @@ let sanitizeName (name: string) =
 
 let defaultEndpointName () = "fsion-" + sanitizeName Environment.UserName
 
+let validateEndpointName (name: string) =
+    if isWindows && (name.Contains '\\' || name.Contains '/') then
+        raise (ArgumentException("pipe name must not contain path separators"))
+
 let socketPath (endpoint: Endpoint) =
     if Path.IsPathRooted endpoint.Name then
         endpoint.Name
@@ -36,6 +40,7 @@ let endpointDisplay (endpoint: Endpoint) =
     if isWindows then endpoint.Name else socketPath endpoint
 
 let connect (endpoint: Endpoint) (timeout: TimeSpan) : Stream =
+    validateEndpointName endpoint.Name
     let deadline = DateTime.UtcNow + timeout
     let rec attempt () =
         try
@@ -144,6 +149,8 @@ type private UnixListener(path: string) =
         member this.Dispose() = this.Stop()
 
 let createListener (endpoint: Endpoint) : IListener =
+    validateEndpointName endpoint.Name
+
     if isWindows then
         new WindowsListener(endpoint.Name) :> IListener
     else

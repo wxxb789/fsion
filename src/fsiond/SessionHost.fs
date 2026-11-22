@@ -160,9 +160,20 @@ type SessionHost() =
                             else
                                 Path.Combine(request.WorkingDirectory, request.Source)
 
-                        let directory = Path.GetDirectoryName sourcePath
-                        ensureIncludeDirectory active directory
-                        active.EvalScript(Path.GetFileName sourcePath)
+                        if File.Exists sourcePath then
+                            let directory = Path.GetDirectoryName sourcePath
+                            ensureIncludeDirectory active directory
+                            active.EvalScript(Path.GetFileName sourcePath)
+                        else
+                            ensureIncludeDirectory active request.WorkingDirectory
+                            let escaped = request.Source.Replace("\"", "\"\"")
+                            try
+                                active.EvalInteraction("#load @\"" + escaped + "\"", "stdin")
+                            with :? FsiCompilationException ->
+                                // dotnet fsi reports the synthetic #load location as stdin(0,1); FCS uses stdin(1,1).
+                                errWriter.GetStringBuilder().Replace("stdin(1,1): error FS0078", "stdin(0,1): error FS0078")
+                                |> ignore
+                                reraise ()
                     else
                         ensureIncludeDirectory active request.WorkingDirectory
                         let sourceName = if request.Mode = "stdin" then "stdin.fsx" else "eval.fsx"

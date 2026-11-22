@@ -31,6 +31,14 @@ let ``warm runs write no temporary dll files into the daemon temp directory`` ()
                 dllFiles.Length = 0,
                 "unexpected temporary dll files: " + String.Join(", ", dllFiles)
             )
+
+            let scriptDirectoryDllFiles = Directory.GetFiles(directory, "*.dll", SearchOption.AllDirectories)
+
+            Assert.True(
+                scriptDirectoryDllFiles.Length = 0,
+                "unexpected dll files in the script directory: "
+                + String.Join(", ", scriptDirectoryDllFiles)
+            )
         finally
             tryDeleteDirectory watchDirectory)
 

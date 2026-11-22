@@ -10,6 +10,8 @@ let [<Literal>] PipeEnvironmentVariable = "FSION_PIPE"
 
 let [<Literal>] IdleTtlEnvironmentVariable = "FSION_IDLE_TTL_MINUTES"
 
+let [<Literal>] OneShotPipeEnvironmentVariable = "FSION_ONESHOT_PIPE"
+
 let [<Literal>] DefaultIdleTtlMinutes = 30.0
 
 type ExecuteRequest =

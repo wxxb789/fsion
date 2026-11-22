@@ -66,11 +66,19 @@ text is the only non-byte-identical output; tests normalize it).
 - Per run: `Directory.SetCurrentDirectory(client cwd)`, `Console.SetOut/SetError` to per-run
   `StringWriter`s, session writers are forwarding writers so FCS output also lands in the run
   capture, restore afterwards. Runs are serialized by a semaphore.
+- Missing script files never reach `EvalScript` (which would report `missing.fsx(1,1)` with the
+  basename). When `File.Exists` is false, the daemon `#cd`s to the client working directory and
+  evaluates `#load @"<source as typed>"` with source name `stdin`, then rewrites the FCS location
+  `stdin(1,1): error FS0078` to `stdin(0,1): error FS0078` so the diagnostic text, search path,
+  and exit code match `dotnet fsi --nologo missing.fsx` byte for byte; a missing parent directory
+  no longer emits a spurious `FS2302` from `#cd`.
 
 ## Daemon lifecycle
 
 - Endpoint: `fsion-<user>` sanitized; `FSION_PIPE`/`--pipe` override. Windows named pipe,
-  Unix domain socket under `$XDG_RUNTIME_DIR` or the temp directory.
+  Unix domain socket under `$XDG_RUNTIME_DIR` or the temp directory. Windows pipe names with `\`
+  or `/` are rejected before any connect/spawn (`validateEndpointName`), and empty or
+  whitespace-only `--pipe` values fail argument parsing.
 - Auto-start: connect (~250 ms) then spawn `fsiond --endpoint <name> --idle-ttl <min>` and retry
   for up to 30 s. `FSIOND_PATH` overrides daemon discovery; otherwise `fsiond` must sit next to
   `fsion`. On Windows the client spawns the apphost via `CreateProcessW` with
@@ -78,8 +86,9 @@ text is the only non-byte-identical output; tests normalize it).
   redirected-stdio path, so a long-lived daemon can never hold the caller's stream handles.
 - Windows singleton: named mutex. Unix singleton: live-connect probe then stale socket deletion.
 - Idle TTL defaults to 30 minutes and only executions/warmups count as activity, so `status`
-  polling does not keep a daemon alive. `--no-daemon` spawns a `--oneshot` daemon on a unique
-  endpoint that exits after one execute.
+  polling does not keep a daemon alive. `--no-daemon` spawns a `--oneshot` daemon that exits after
+  one execute; its endpoint is `--pipe <name>` when given, else `FSION_ONESHOT_PIPE`, else a unique
+  `fsion-oneshot-<pid>-<hex>` name.
 - `fsion daemon status` prints `pid=...`, uptime, idle, executed count and warm flag;
   `restart` = stop + start.
 

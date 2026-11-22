@@ -32,12 +32,14 @@ Fast, Windows-first F# script execution (`fsion` NativeAOT thin CLI + `fsiond` C
 - **Process & file hygiene in tests**:
   - Never kill processes globally by name (`taskkill /IM dotnet.exe`, `pkill -f dotnet`); isolate test daemon endpoints/pipes per test run and shut down only the test's own daemon instance.
   - Keep all tracked text files LF-terminated (`git ls-files --eol` -> `i/lf`).
+  - On Windows Git Bash, never run `find /` (it crawls entire drives and hangs); query `dotnet nuget locals global-packages -l` when inspecting the NuGet cache.
 - **Comments**: Default to zero comments; keep short inline notes only for non-obvious platform/IPC/AOT hazards.
 
 ## Windows IPC & Process Hazards
 
 - `fsion` spawns `fsiond` on Windows via Win32 `CreateProcessW` with `bInheritHandles=false` and `CREATE_NO_WINDOW | DETACHED_PROCESS` (`spawnDaemonWindows` in `src/fsion/Program.fs`). `Process.Start` sets `bInheritHandles=TRUE`, so a long-lived `fsiond` would inherit the caller's `stdout`/`stderr` pipe write ends and any redirected `ReadToEnd`/`capture_output` would block forever after `fsion` exits. Do not revert the Windows path to `Process.Start`.
 - Daemon sessions serialize runs with a semaphore; `exit <n>` is shadowed in the prelude and surfaces as the client exit code without terminating `fsiond`.
+- Windows Named Pipe names (`--pipe` / `FSION_PIPE`) must be single-segment names without `\` or `/`; `resolveEndpoint` rejects path separators in `src/fsion/Program.fs` and `validateEndpointName` in `src/Fsion.Protocol/Ipc.fs` enforces it at connect/listen time.
 
 ## Goal Close Ritual
 

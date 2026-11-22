@@ -110,8 +110,12 @@ let private parse (argv: string[]) : Result<Options * Input, string> =
             options <- { options with NoDaemon = true }
             index <- index + 1
         | "--pipe" when index + 1 < argv.Length ->
-            options <- { options with PipeName = Some argv.[index + 1] }
-            index <- index + 2
+            let name = argv.[index + 1]
+            if name.Trim().Length = 0 then
+                outcome <- Some(Error "--pipe requires a non-empty endpoint name")
+            else
+                options <- { options with PipeName = Some name }
+                index <- index + 2
         | "--idle-ttl" when index + 1 < argv.Length ->
             match Double.TryParse(argv.[index + 1], NumberStyles.Float, CultureInfo.InvariantCulture) with
             | true, value when value > 0.0 ->
@@ -154,6 +158,7 @@ let private resolveEndpoint (options: Options) =
             match Environment.GetEnvironmentVariable PipeEnvironmentVariable with
             | null | "" -> defaultEndpointName ()
             | value -> value
+    validateEndpointName name
     { Name = name }
 
 let private resolveIdleTtl (options: Options) =
@@ -179,7 +184,9 @@ let private findDaemonBinary () =
     | path -> path
 
 let private quoteWindowsArgument (value: string) =
-    if value.Length > 0 && not (value.Contains ' ' || value.Contains '\t' || value.Contains '"') then
+    if value.Length = 0 then
+        "\"\""
+    elif not (value.Contains ' ' || value.Contains '\t' || value.Contains '"') then
         value
     else
         let builder = StringBuilder()
@@ -318,11 +325,22 @@ let private executeOverDaemon (options: Options) (endpoint: Endpoint) (request: 
     | NoResponse -> responseOf first
     | NotDelivered -> attempt () |> responseOf
 
-let private executeOneShot (request: ExecuteRequest) : Response =
-    let endpoint =
-        { Name = "fsion-oneshot-" + string Environment.ProcessId + "-" + Guid.NewGuid().ToString("N").Substring(0, 8) }
-    spawnDaemon None endpoint
-    let stream = connect endpoint (TimeSpan.FromSeconds 60.0)
+let private executeOneShot (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) : Response =
+    let oneshotEndpoint =
+        match options.PipeName with
+        | Some _ -> endpoint
+        | None ->
+            match Environment.GetEnvironmentVariable OneShotPipeEnvironmentVariable with
+            | null | "" ->
+                { Name =
+                    "fsion-oneshot-"
+                    + string Environment.ProcessId
+                    + "-"
+                    + Guid.NewGuid().ToString("N").Substring(0, 8) }
+            | name -> { Name = name }
+    validateEndpointName oneshotEndpoint.Name
+    spawnDaemon None oneshotEndpoint
+    let stream = connect oneshotEndpoint (TimeSpan.FromSeconds 60.0)
     try
         responseOf (sendAndReceive stream (Execute request))
     finally
@@ -450,7 +468,7 @@ let rec private runDaemonCommand (options: Options) (endpoint: Endpoint) (input:
 
 let private executeInput (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) : int =
     if options.NoDaemon then
-        emit (executeOneShot request)
+        emit (executeOneShot options endpoint request)
     else
         emit (executeOverDaemon options endpoint request)
 

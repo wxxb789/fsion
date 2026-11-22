@@ -84,6 +84,22 @@ let ``type errors match dotnet fsi diagnostics and exit code`` () =
         assertSameOutput expected actual)
 
 [<Fact>]
+let ``missing script files match dotnet fsi diagnostics and exit code`` () =
+    withContext "parity-missing" (fun context directory ->
+        writeFile directory "present.fsx" "printfn \"present\"\n"
+        let warm = context.Run [ "present.fsx" ]
+        Assert.Equal(0, warm.ExitCode)
+
+        for missing in [ "missing.fsx"; "missing_dir/missing.fsx" ] do
+            let expected = runFsi directory [ missing ] None
+            let actual = context.Run [ missing ]
+            assertSameOutput expected actual
+
+        let after = context.Run [ "present.fsx" ]
+        Assert.Equal(0, after.ExitCode)
+        Assert.Equal("present" + Environment.NewLine, after.Stdout))
+
+[<Fact>]
 let ``eval type errors match the script-file diagnostics`` () =
     withContext "parity-eval-type" (fun context directory ->
         let code = "let x : int = \"nope\"\n"

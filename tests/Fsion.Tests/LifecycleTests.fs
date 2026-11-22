@@ -74,12 +74,53 @@ let ``daemon restart replaces the process and serves scripts afterwards`` () =
 [<Fact>]
 let ``no-daemon runs a single-shot daemon and leaves no background endpoint`` () =
     withContext "lifecycle" (fun context _ ->
-        let first = context.Run([ "--no-daemon"; "-e"; "printfn \"oneshot\"" ], timeoutMs = 120000)
+        let oneshotEndpoint = "fsion-test-oneshot-" + Guid.NewGuid().ToString("N")
+        let oneshotEnvironment = [ "FSION_ONESHOT_PIPE", oneshotEndpoint ]
+        let code = "printfn \"oneshot\"\nSystem.Threading.Thread.Sleep 3000\n"
+
+        let firstTask =
+            System.Threading.Tasks.Task.Run(fun () ->
+                context.Run([ "--no-daemon"; "-e"; code ], timeoutMs = 120000, extraEnv = oneshotEnvironment))
+
+        let reachableDeadline = DateTime.UtcNow.AddSeconds 30.0
+        let mutable sawOneshotRunning = false
+
+        while not sawOneshotRunning && DateTime.UtcNow < reachableDeadline do
+            let status =
+                context.Run([ "--pipe"; oneshotEndpoint; "daemon"; "status" ], timeoutMs = 30000)
+
+            sawOneshotRunning <- status.Stdout.Contains "fsiond running"
+
+            if not sawOneshotRunning then
+                Thread.Sleep 100
+
+        let first = firstTask.Result
+        Assert.True(sawOneshotRunning, "the single-shot fsiond was never reachable on " + oneshotEndpoint)
         Assert.Equal(0, first.ExitCode)
         Assert.Equal("oneshot" + Environment.NewLine, first.Stdout)
         Assert.True((context.DaemonPid()).IsNone, "no-daemon left a background daemon behind")
 
-        let second = context.Run([ "--no-daemon"; "-e"; "printfn \"again\"" ], timeoutMs = 120000)
+        let exitDeadline = DateTime.UtcNow.AddSeconds 3.0
+        let mutable reachable = true
+
+        while reachable && DateTime.UtcNow < exitDeadline do
+            let status =
+                context.Run([ "--pipe"; oneshotEndpoint; "daemon"; "status" ], timeoutMs = 30000)
+
+            reachable <- status.Stdout.Contains "fsiond running"
+
+            if reachable then
+                Thread.Sleep 100
+
+        Assert.False(reachable, "the single-shot fsiond was still reachable on " + oneshotEndpoint)
+
+        let second =
+            context.Run(
+                [ "--no-daemon"; "-e"; "printfn \"again\"" ],
+                timeoutMs = 120000,
+                extraEnv = oneshotEnvironment
+            )
+
         Assert.Equal(0, second.ExitCode)
         Assert.Equal("again" + Environment.NewLine, second.Stdout))
 
@@ -139,6 +180,25 @@ let ``--pipe without a value fails before contacting any daemon`` () =
         Assert.NotEqual(0, run.ExitCode)
         Assert.Contains("--pipe", run.Stderr)
         Assert.True((context.DaemonPid()).IsNone, "a daemon was started for an invalid command line"))
+
+[<Fact>]
+let ``--pipe with an empty value fails fast without contacting any daemon`` () =
+    withContext "lifecycle-pipe-empty" (fun context _ ->
+        let run = context.Run [ "--pipe"; "" ]
+        Assert.NotEqual(0, run.ExitCode)
+        Assert.Contains("--pipe", run.Stderr)
+        Assert.True(run.DurationMs < 10000.0, "--pipe with an empty value did not fail fast")
+        Assert.True((context.DaemonPid()).IsNone, "a daemon was started for an empty pipe name"))
+
+[<Fact>]
+let ``--pipe with path separators fails fast without contacting any daemon`` () =
+    withContext "lifecycle-pipe-separators" (fun context _ ->
+        for badName in [ "bad\\name"; "bad/name" ] do
+            let run = context.Run [ "--pipe"; badName; "daemon"; "status" ]
+            Assert.NotEqual(0, run.ExitCode)
+            Assert.Contains("path separators", run.Stderr)
+            Assert.True(run.DurationMs < 10000.0, "--pipe " + badName + " did not fail fast")
+            Assert.True((context.DaemonPid()).IsNone, "a daemon was started for an invalid pipe name"))
 
 [<Fact>]
 let ``fsion discovers fsiond next to its own binary without FSIOND_PATH`` () =

@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <AssemblyName>Fsion.Protocol</AssemblyName>
+    <RootNamespace>Fsion</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Protocol.fs" />
+    <Compile Include="Ipc.fs" />
+  </ItemGroup>
+</Project>

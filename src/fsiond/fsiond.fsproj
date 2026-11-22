@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>fsiond</AssemblyName>
+    <RootNamespace>Fsiond</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Log.fs" />
+    <Compile Include="SessionHost.fs" />
+    <Compile Include="Server.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="FSharp.Compiler.Service" Version="43.13.101" />
+    <ProjectReference Include="../Fsion.Protocol/Fsion.Protocol.fsproj" />
+  </ItemGroup>
+</Project>

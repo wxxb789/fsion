@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Fsion.Protocol/Fsion.Protocol.fsproj" />
+    <Project Path="src/fsion/fsion.fsproj" />
+    <Project Path="src/fsiond/fsiond.fsproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Fsion.Tests/Fsion.Tests.fsproj" />
+  </Folder>
+</Solution>

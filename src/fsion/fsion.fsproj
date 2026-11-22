@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>fsion</AssemblyName>
+    <PublishAot>true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <PublishDir>$(MSBuildThisFileDirectory)../../artifacts/publish/fsion/$(TargetFramework)/</PublishDir>
+    <!-- FSharp.Core 11.0.101 keeps unannotated reflection paths; suppress its aggregate AOT/trim
+         warnings only. Individual warnings from fsion/Fsion.Protocol are still errors. -->
+    <NoWarn>$(NoWarn);IL2104;IL3053</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Fsion.Protocol/Fsion.Protocol.fsproj" />
+  </ItemGroup>
+</Project>

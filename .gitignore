@@ -1,0 +1,16 @@
+[Bb]in/
+[Oo]bj/
+artifacts/
+out/
+publish/
+TestResults/
+BenchmarkDotNet.Artifacts/
+.vs/
+.ionide/
+*.suo
+*.user
+__pycache__/
+*.py[cod]
+.venv/
+.tmp-artifacts/
+local/

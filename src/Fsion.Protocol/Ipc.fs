@@ -42,31 +42,33 @@ let endpointDisplay (endpoint: Endpoint) =
 let connect (endpoint: Endpoint) (timeout: TimeSpan) : Stream =
     validateEndpointName endpoint.Name
     let deadline = DateTime.UtcNow + timeout
-    let rec attempt () =
+    let mutable stream: Stream = null
+    while isNull stream do
         try
-            if isWindows then
-                let pipe =
-                    new NamedPipeClientStream(".", endpoint.Name, PipeDirection.InOut, PipeOptions.Asynchronous)
-                try
-                    pipe.Connect 250
-                    pipe :> Stream
-                with _ ->
-                    pipe.Dispose()
-                    reraise ()
-            else
-                let socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)
-                try
-                    socket.Connect(UnixDomainSocketEndPoint(socketPath endpoint))
-                    new NetworkStream(socket, true) :> Stream
-                with _ ->
-                    socket.Dispose()
-                    reraise ()
+            let candidate =
+                if isWindows then
+                    let pipe =
+                        new NamedPipeClientStream(".", endpoint.Name, PipeDirection.InOut, PipeOptions.Asynchronous)
+                    try
+                        pipe.Connect 250
+                        pipe :> Stream
+                    with _ ->
+                        pipe.Dispose()
+                        reraise ()
+                else
+                    let socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)
+                    try
+                        socket.Connect(UnixDomainSocketEndPoint(socketPath endpoint))
+                        new NetworkStream(socket, true) :> Stream
+                    with _ ->
+                        socket.Dispose()
+                        reraise ()
+            stream <- candidate
         with ex ->
             if DateTime.UtcNow >= deadline then
                 raise (TimeoutException("fsiond endpoint '" + endpointDisplay endpoint + "' is not reachable", ex))
             Thread.Sleep 20
-            attempt ()
-    attempt ()
+    stream
 
 let tryConnect (endpoint: Endpoint) (timeout: TimeSpan) : Stream option =
     try

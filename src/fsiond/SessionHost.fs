@@ -48,6 +48,7 @@ type SessionHost() =
     let mutable session: FsiEvaluationSession option = None
     let mutable stateObject: obj = null
     let mutable commandLineArgsProperty: PropertyInfo = null
+    let mutable exitedProperty: PropertyInfo = null
     let mutable exitCodeProperty: PropertyInfo = null
     let warm = ref false
     let executed = ref 0
@@ -71,11 +72,13 @@ type SessionHost() =
         String.Concat(
             [ "type FsionFsiState() =\n"
               "    member val CommandLineArgs : string[] = [||] with get, set\n"
-              "    member val ExitCode : int = -1 with get, set\n"
+              "    member val Exited : bool = false with get, set\n"
+              "    member val ExitCode : int = 0 with get, set\n"
               "let fsionFsiState = FsionFsiState()\n"
               "let fsi = fsionFsiState\n"
               "exception FsionExit of int\n"
               "let exit (code: int) : 'T =\n"
+              "    fsionFsiState.Exited <- true\n"
               "    fsionFsiState.ExitCode <- code\n"
               "    System.Console.Error.Write(\""
               exitMarker
@@ -103,6 +106,7 @@ type SessionHost() =
         let stateType = state.GetType()
         stateObject <- state
         commandLineArgsProperty <- stateType.GetProperty "CommandLineArgs"
+        exitedProperty <- stateType.GetProperty "Exited"
         exitCodeProperty <- stateType.GetProperty "ExitCode"
         created
 
@@ -138,7 +142,8 @@ type SessionHost() =
             let errWriter = new StringWriter()
             currentOut <- outWriter
             currentErr <- errWriter
-            exitCodeProperty.SetValue(stateObject, box -1)
+            exitedProperty.SetValue(stateObject, box false)
+            exitCodeProperty.SetValue(stateObject, box 0)
             commandLineArgsProperty.SetValue(stateObject, request.Args)
             let previousDirectory = Directory.GetCurrentDirectory()
             let previousOut = Console.Out
@@ -183,13 +188,12 @@ type SessionHost() =
                         evaluate ()
                         0
                     with :? FsiCompilationException ->
-                        let scriptExitCode = exitCodeProperty.GetValue stateObject :?> int
-                        if scriptExitCode >= 0 then
+                        if exitedProperty.GetValue stateObject :?> bool then
                             let text = errWriter.ToString()
                             let markerIndex = text.IndexOf(exitMarker, StringComparison.Ordinal)
                             if markerIndex >= 0 then
                                 errWriter.GetStringBuilder().Length <- markerIndex
-                            scriptExitCode
+                            exitCodeProperty.GetValue stateObject :?> int
                         else
                             1
                 executed.Value <- executed.Value + 1

@@ -4,7 +4,20 @@ open System
 open System.IO
 open System.Threading
 open Xunit
+open Fsion
 open Fsion.Tests.TestInfra
+
+[<Fact>]
+let ``connect raises TimeoutException when an endpoint never comes up`` () =
+    let endpoint: Ipc.Endpoint = { Name = "fsion-nonexistent-" + Guid.NewGuid().ToString("N") }
+    let started = DateTime.UtcNow
+
+    let thrown =
+        Assert.Throws<TimeoutException>(fun () ->
+            Ipc.connect endpoint (TimeSpan.FromMilliseconds 120.0) |> ignore)
+
+    Assert.Contains("is not reachable", thrown.Message)
+    Assert.True(DateTime.UtcNow - started < TimeSpan.FromSeconds 5.0, "connect did not stop at its deadline")
 
 [<Fact>]
 let ``auto-start serves scripts and keeps the same daemon across invocations`` () =

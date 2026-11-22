@@ -134,6 +134,16 @@ let ``exit in eval mode returns its code`` () =
         assertSameOutput expected actual)
 
 [<Fact>]
+let ``negative exit returns its code without leaking the internal marker`` () =
+    withContext "parity-exit-negative" (fun context directory ->
+        let code = "printfn \"pre\"\nexit (-1)\n"
+        writeFile directory "eval.fsx" code
+        let expected = runFsi directory [ "eval.fsx" ] None
+        let actual = context.Run [ "-e"; code ]
+        assertSameOutput expected actual
+        Assert.DoesNotContain("@@FSION-EXIT", actual.Stderr))
+
+[<Fact>]
 let ``uncaught runtime exceptions match dotnet fsi after normalizing generated frames`` () =
     withContext "parity-runtime" (fun context directory ->
         writeFile directory "boom.fsx" "printfn \"before\"\ndo failwith \"boom\"\n"

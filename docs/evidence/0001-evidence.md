@@ -20,15 +20,15 @@ Implementation choices: [../plans/2026-11-22-goal-0001-implementation-choices.md
 
 Single runnable gate: `cd Q:/repos/fsion && pwsh -NoProfile -File eng/gate.ps1`.
 
-Recorded run on this tree after the review-fix round: **exit code 0**.
+Recorded run on this tree after the round-2 review fixes: **exit code 0**.
 
 | Step | Result |
 |---|---|
 | `dotnet build fsion.slnx -c Release` | Build succeeded, 0 warnings, 0 errors |
 | `dotnet publish src/fsion -c Release -f net10.0` | exit 0, `Generating native code`, 0 warning lines, `artifacts/publish/fsion/net10.0/fsion.exe` (3,946,496 bytes) |
 | `dotnet publish src/fsion -c Release -f net11.0` | exit 0, `Generating native code`, 0 warning lines, `artifacts/publish/fsion/net11.0/fsion.exe` (3,976,192 bytes) |
-| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 34, Skipped 0, Total 34, 4 m 46 s |
-| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 34, Skipped 0, Total 34, 3 m 57 s |
+| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 36, Skipped 0, Total 36, 4 m 27 s |
+| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 36, Skipped 0, Total 36, 4 m 7 s |
 | `git ls-files --eol` + untracked scan | 35 tracked and 35 non-ignored files clean, 0 CR bytes |
 
 The forced full NativeAOT analysis for both TFMs was also captured separately
@@ -58,15 +58,16 @@ Transcript endpoint `fsion-evidence-b59a5a8d`, published `fsion` net11.0,
 | `FSION_ONESHOT_PIPE=<name> fsion --no-daemon -e 'printfn "oneshot"'` | `oneshot` | 0 |
 | `fsion --pipe <name> daemon status` (right after) | `fsiond not running (endpoint <name>)` | 0 |
 
-Pinned by the 12 `Fsion.Tests.LifecycleTests`: auto-start with PID stability,
+Pinned by the 13 `Fsion.Tests.LifecycleTests`: auto-start with PID stability,
 warmup, stop/auto-restart, restart/PID change, `--no-daemon` (also polling the
 `FSION_ONESHOT_PIPE` endpoint to prove the single-shot `fsiond` is gone), idle-TTL
 retirement (`--idle-ttl 0.05` retires within a 30 s deadline), a `FSIOND_LOG` path
 containing spaces (exercising `quoteWindowsArgument` on the Windows spawn), `--pipe`
 overriding `FSION_PIPE` with the override daemon stopped in cleanup, `--pipe` without
 a value or with an empty value exiting non-zero before any daemon contact, `--pipe`
-with `\` or `/` rejected before any connect, and colocated binary discovery without
-`FSIOND_PATH`.
+with `\` or `/` rejected before any connect, colocated binary discovery without
+`FSIOND_PATH`, and `Ipc.connect` raising `TimeoutException` at its deadline for an
+endpoint that never appears.
 
 ## Clause 2 — `dotnet fsi` parity
 
@@ -81,13 +82,15 @@ Byte comparison on `probe.fsx` (stdout + stderr + `fsi.CommandLineArgs` +
 Both exits were 0; fsion printed `args=[|"probe.fsx"; "one"; "two"|]`,
 `src=Q:\tmp\fsion-evidence-b59a5a8d`, `cwd=Q:\tmp\fsion-evidence-b59a5a8d`.
 
-Pinned by the 16 `Fsion.Tests.ParityTests`: file mode, file-mode argument
+Pinned by the 17 `Fsion.Tests.ParityTests`: file mode, file-mode argument
 quoting (`a"b`, `c\d\`, `x\"y`, `tail\`, `""`), file mode in a subdirectory with
 `#load`, `-e` mode against an `eval.fsx` oracle, stdin mode against a `stdin.fsx`
 oracle, stdin prefixed with a UTF-8 BOM against the same file, syntax errors,
 type errors (`-e` and file), missing script files, `exit` mid-file, `exit` at end
-of file, `exit` in `-e` mode, uncaught runtime exceptions (stack frames normalized
-only for `--multiemit-` generated names), 4000-line output, and unicode output.
+of file, `exit` in `-e` mode, negative `exit (-1)` (also asserting no
+`@@FSION-EXIT` marker leaks to stderr), uncaught runtime exceptions (stack frames
+normalized only for `--multiemit-` generated names), 4000-line output, and unicode
+output.
 
 Missing script files (`missing.fsx` and `missing_dir/missing.fsx`, the latter with a
 nonexistent parent directory) now match `dotnet fsi --nologo` byte for byte on stdout,
@@ -125,12 +128,12 @@ by the two `Fsion.Tests.HygieneTests` (the zero-`.dll` test checks both director
 
 Warm latency on freshly generated unseen scripts (`LatencyTests`, 8 fsion rounds
 vs 3 `dotnet fsi` rounds on the same host, same script text, medians, re-measured
-per TFM after the review-fix round):
+per TFM after the round-2 review fixes):
 
 | Runtime | fsion median | `dotnet fsi` median | Speedup | Required floor |
 |---|---|---|---|---|
-| net11.0 | 127.79 ms | 2970.0682 ms | 23.24x | 5x (asserted); 20x is Goal 0005 |
-| net10.0 | 124.5477 ms | 3074.5669 ms | 24.69x | 5x (asserted); 20x is Goal 0005 |
+| net11.0 | 125.9617 ms | 2965.0916 ms | 23.54x | 5x (asserted); 20x is Goal 0005 |
+| net10.0 | 121.7797 ms | 2977.4926 ms | 24.45x | 5x (asserted); 20x is Goal 0005 |
 
 ## Windows handle-inheritance hang (observed failure → fix → regression check)
 
@@ -152,11 +155,35 @@ per TFM after the review-fix round):
   so `LifecycleTests`/`ParityTests` would time out again if inheritance
   regressed.
 
+## Round-2 review fixes (negative exit sentinel, connect stack growth)
+
+- **Negative `exit <n>` (before):** `fsion -e 'exit (-1)'` exited **1** and leaked
+  `@@FSION-EXIT-...@@FSI_0001+FsionExit: FsionExit -1` plus the FSI stack trace to
+  stderr, because `FsionFsiState.ExitCode` used `-1` as its "not exited" sentinel.
+- **Negative `exit <n>` (after):** the prelude sets a separate `Exited` flag before
+  writing `ExitCode`, and the daemon truncates the marker whenever `Exited` is true,
+  returning **all** integer codes verbatim. `fsion -e 'exit (-1)'` now exits **-1**
+  (MSYS bash reports 127) with empty stderr; `fsion exitneg.fsx` prints `pre` and also
+  exits **-1**; `exit 0`, `exit 42`, and compile-error exit **1** are unchanged. Pinned
+  by the parity test `negative exit returns its code without leaking the internal
+  marker`, which compares against `dotnet fsi`'s signed `-1` exit code.
+- **`Ipc.connect` retry loop (before):** a `dotnet fsi` harness loading `Ipc.fs` and
+  calling `connect` on a nonexistent endpoint with a 60 s timeout died after 32 s with
+  `Stack overflow. Repeated 93 times: ... FSI_0001.Fsion.Ipc.attempt@45 ...` and signed
+  exit `-1073741571` (`STATUS_STACK_OVERFLOW`); the recursive `attempt ()` was not
+  tail-optimized because it sat inside the `with` handler.
+- **`Ipc.connect` retry loop (after):** rewritten as an O(1)-stack `while` loop. The
+  same 60 s repro now finishes cleanly: `timeout after 60243.72 ms: fsiond endpoint
+  'fsion-nonexistent-...' is not reachable`, rc 0, empty stderr. Pinned by
+  `Fsion.Tests.LifecycleTests.connect raises TimeoutException when an endpoint never
+  comes up` (120 ms timeout; the test project now references `Fsion.Protocol` to call
+  `Ipc.connect` directly).
+
 ## Known limits
 
-- Warm medians are ~125–128 ms, above the ~30–70 ms aspiration; the formal
+- Warm medians are ~122–126 ms, above the ~30–70 ms aspiration; the formal
   benchmark gate (>= 20x, `bun`-class latency) is Goal 0005. Current measured
-  speedups are 24.69x (net10.0) and 23.24x (net11.0).
+  speedups are 24.45x (net10.0) and 23.54x (net11.0).
 - `--multiemit-` (kept for the measured compile saving) means uncaught
   runtime-exception stack frames lack `in <file>:line N`; parity tests
   normalize only those generated frame names.

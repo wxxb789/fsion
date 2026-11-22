@@ -25,6 +25,15 @@ let ``file mode matches dotnet fsi byte for byte`` () =
         assertSameOutput expected actual)
 
 [<Fact>]
+let ``file mode passes quoting-sensitive arguments like dotnet fsi`` () =
+    withContext "parity-file-args" (fun context directory ->
+        writeFile directory "probe.fsx" contextScript
+        let arguments = [ "probe.fsx"; "a\"b"; "c\\d\\"; "x\\\"y"; "tail\\"; "\"\"" ]
+        let expected = runFsi directory arguments None
+        let actual = context.Run arguments
+        assertSameOutput expected actual)
+
+[<Fact>]
 let ``file mode in a subdirectory matches dotnet fsi and resolves nested loads`` () =
     withContext "parity-subdir" (fun context directory ->
         writeFile directory "sub/inner.fsx" "let innerValue = 41\nprintfn \"inner loaded\"\n"
@@ -47,6 +56,15 @@ let ``stdin mode matches the same code evaluated as a script file`` () =
         writeFile directory "stdin.fsx" contextScript
         let expected = runFsi directory [ "stdin.fsx" ] None
         let actual = context.Run([], stdin = contextScript)
+        assertSameOutput expected actual)
+
+[<Fact>]
+let ``stdin mode strips a UTF-8 BOM like the same file run by dotnet fsi`` () =
+    withContext "parity-stdin-bom" (fun context directory ->
+        let content = "\uFEFF" + contextScript
+        writeFile directory "stdin.fsx" content
+        let expected = runFsi directory [ "stdin.fsx" ] None
+        let actual = context.Run([], stdin = content)
         assertSameOutput expected actual)
 
 [<Fact>]

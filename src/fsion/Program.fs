@@ -151,7 +151,7 @@ let private resolveEndpoint (options: Options) =
         match options.PipeName with
         | Some value -> value
         | None ->
-            match Environment.GetEnvironmentVariable "FSION_PIPE" with
+            match Environment.GetEnvironmentVariable PipeEnvironmentVariable with
             | null | "" -> defaultEndpointName ()
             | value -> value
     { Name = name }
@@ -160,12 +160,12 @@ let private resolveIdleTtl (options: Options) =
     match options.IdleTtlMinutes with
     | Some value -> value
     | None ->
-        match Environment.GetEnvironmentVariable "FSION_IDLE_TTL_MINUTES" with
-        | null | "" -> 30.0
+        match Environment.GetEnvironmentVariable IdleTtlEnvironmentVariable with
+        | null | "" -> DefaultIdleTtlMinutes
         | value ->
             match Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture) with
             | true, parsed -> parsed
-            | _ -> 30.0
+            | _ -> DefaultIdleTtlMinutes
 
 let private findDaemonBinary () =
     match Environment.GetEnvironmentVariable "FSIOND_PATH" with
@@ -197,12 +197,11 @@ let private quoteWindowsArgument (value: string) =
         builder.Append('\\', backslashes * 2).Append '"' |> ignore
         builder.ToString()
 
-let private daemonArguments (options: Options) (endpoint: Endpoint) (oneshot: bool) =
+let private daemonArguments (idleTtlMinutes: float option) (endpoint: Endpoint) =
     let modeArguments =
-        if oneshot then
-            [ "--oneshot" ]
-        else
-            [ "--idle-ttl"; (resolveIdleTtl options).ToString(CultureInfo.InvariantCulture) ]
+        match idleTtlMinutes with
+        | Some minutes -> [ "--idle-ttl"; minutes.ToString(CultureInfo.InvariantCulture) ]
+        | None -> [ "--oneshot" ]
     let logArguments =
         match Environment.GetEnvironmentVariable "FSIOND_LOG" with
         | null | "" -> []
@@ -266,9 +265,9 @@ let private spawnDaemonManaged (daemonPath: string) (arguments: string list) =
             ())
     |> ignore
 
-let private spawnDaemon (options: Options) (endpoint: Endpoint) (oneshot: bool) =
+let private spawnDaemon (idleTtlMinutes: float option) (endpoint: Endpoint) =
     let daemonPath = findDaemonBinary ()
-    let arguments = daemonArguments options endpoint oneshot
+    let arguments = daemonArguments idleTtlMinutes endpoint
     if isWindows then
         spawnDaemonWindows daemonPath arguments
     else
@@ -278,7 +277,7 @@ let private ensureDaemon (options: Options) (endpoint: Endpoint) : Stream =
     match tryConnect endpoint (TimeSpan.FromMilliseconds 250.0) with
     | Some stream -> stream
     | None ->
-        spawnDaemon options endpoint false
+        spawnDaemon (Some(resolveIdleTtl options)) endpoint
         connect endpoint (TimeSpan.FromSeconds 30.0)
 
 type private Delivery =
@@ -300,6 +299,12 @@ let private sendAndReceive (stream: Stream) (request: Request) : Delivery =
         | Some payload -> Delivered(parseResponse payload)
         | None -> NoResponse
 
+let private responseOf (delivery: Delivery) : Response =
+    match delivery with
+    | Delivered response -> response
+    | NoResponse -> Failure "fsiond closed the connection without a response"
+    | NotDelivered -> Failure "fsiond did not accept the request"
+
 let private executeOverDaemon (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) : Response =
     let attempt () =
         let stream = ensureDaemon options endpoint
@@ -307,30 +312,19 @@ let private executeOverDaemon (options: Options) (endpoint: Endpoint) (request: 
             sendAndReceive stream (Execute request)
         finally
             stream.Dispose()
-    match attempt () with
+    let first = attempt ()
+    match first with
     | Delivered response -> response
-    | NoResponse -> Failure "fsiond closed the connection without a response"
-    | NotDelivered ->
-        match attempt () with
-        | Delivered response -> response
-        | NoResponse -> Failure "fsiond closed the connection without a response"
-        | NotDelivered -> Failure "fsiond did not accept the request"
+    | NoResponse -> responseOf first
+    | NotDelivered -> attempt () |> responseOf
 
 let private executeOneShot (request: ExecuteRequest) : Response =
     let endpoint =
         { Name = "fsion-oneshot-" + string Environment.ProcessId + "-" + Guid.NewGuid().ToString("N").Substring(0, 8) }
-    spawnDaemon
-        { NoDaemon = true
-          PipeName = None
-          IdleTtlMinutes = None }
-        endpoint
-        true
+    spawnDaemon None endpoint
     let stream = connect endpoint (TimeSpan.FromSeconds 60.0)
     try
-        match sendAndReceive stream (Execute request) with
-        | Delivered response -> response
-        | NoResponse -> Failure "fsiond closed the connection without a response"
-        | NotDelivered -> Failure "fsiond did not accept the request"
+        responseOf (sendAndReceive stream (Execute request))
     finally
         stream.Dispose()
 

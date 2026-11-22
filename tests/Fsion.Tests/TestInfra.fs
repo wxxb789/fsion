@@ -83,6 +83,7 @@ let runProcess
     startInfo.RedirectStandardOutput <- true
     startInfo.RedirectStandardError <- true
     startInfo.RedirectStandardInput <- true
+    startInfo.StandardInputEncoding <- UTF8Encoding(false)
     startInfo.StandardOutputEncoding <- UTF8Encoding(false)
     startInfo.StandardErrorEncoding <- UTF8Encoding(false)
 
@@ -92,6 +93,7 @@ let runProcess
     for key, value in environment do
         startInfo.Environment.[key] <- value
 
+    let stopwatch = Stopwatch.StartNew()
     use childProcess = Process.Start startInfo
 
     if isNull childProcess then
@@ -105,7 +107,6 @@ let runProcess
     | None -> ()
 
     childProcess.StandardInput.Close()
-    let stopwatch = Stopwatch.StartNew()
 
     if not (childProcess.WaitForExit timeoutMs) then
         childProcess.Kill true
@@ -159,18 +160,9 @@ type FsionContext(workingDirectory: string) =
 
     let mutable disposed = false
 
-    member _.Endpoint = endpoint
-    member _.WorkingDirectory = workingDirectory
-
     member _.Run(args: string list, ?stdin: string, ?timeoutMs: int, ?extraEnv: (string * string) list) =
         let environment = baseEnvironment @ (defaultArg extraEnv [])
         runProcess fsionBinary args workingDirectory environment stdin (defaultArg timeoutMs 90000)
-
-    member _.RunWithBinary
-        (binary: string, args: string list, ?stdin: string, ?timeoutMs: int, ?extraEnv: (string * string) list)
-        =
-        let environment = [ "FSION_PIPE", endpoint ] @ (defaultArg extraEnv [])
-        runProcess binary args workingDirectory environment stdin (defaultArg timeoutMs 90000)
 
     member _.DaemonPid() : int option =
         let result = runProcess fsionBinary [ "daemon"; "status" ] workingDirectory baseEnvironment None 30000

@@ -43,7 +43,7 @@ type private ForwardingWriter(target: unit -> TextWriter) =
     override _.Write(value: string) = target().Write value
     override _.Flush() = target().Flush()
 
-type SessionHost(endpointName: string) =
+type SessionHost() =
     let gate = new SemaphoreSlim(1, 1)
     let mutable session: FsiEvaluationSession option = None
     let mutable stateObject: obj = null
@@ -118,8 +118,6 @@ type SessionHost(endpointName: string) =
             let escaped = directory.Replace("\"", "\"\"")
             active.EvalInteraction("#cd @\"" + escaped + "\"")
             includeDirectory <- directory
-
-    member _.EndpointName = endpointName
 
     member _.EnsureWarm() =
         gate.Wait()

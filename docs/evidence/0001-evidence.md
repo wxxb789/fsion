@@ -27,9 +27,9 @@ Recorded run on this tree: **exit code 0**.
 | `dotnet build fsion.slnx -c Release` | Build succeeded, 0 warnings, 0 errors |
 | `dotnet publish src/fsion -c Release -f net10.0` | exit 0, `Generating native code`, 0 warning lines, `artifacts/publish/fsion/net10.0/fsion.exe` (3,945,472 bytes) |
 | `dotnet publish src/fsion -c Release -f net11.0` | exit 0, `Generating native code`, 0 warning lines, `artifacts/publish/fsion/net11.0/fsion.exe` (3,975,168 bytes) |
-| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 26, Skipped 0, Total 26, 3 m 36 s |
-| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 26, Skipped 0, Total 26, 3 m 17 s |
-| `git ls-files --eol` + untracked scan | 13 tracked and 35 non-ignored files clean, 0 CR bytes |
+| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 31, Skipped 0, Total 31, 4 m |
+| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 31, Skipped 0, Total 31, 3 m 44 s |
+| `git ls-files --eol` + untracked scan | 36 tracked and 36 non-ignored files clean, 0 CR bytes |
 
 The forced full NativeAOT analysis for both TFMs was also captured separately
 (`obj/.../win-x64` and publish outputs deleted first): 0 `warning` lines in
@@ -54,10 +54,13 @@ Transcript endpoint `fsion-evidence-b59a5a8d`, published `fsion` net11.0,
 | `fsion --no-daemon -e 'printfn "oneshot"'` | `oneshot` | 0 |
 | `fsion daemon status` (after `--no-daemon`) | `fsiond not running (endpoint fsion-evidence-b59a5a8d)` | 0 |
 
-Pinned by `Fsion.Tests.LifecycleTests` (7 tests): auto-start with PID stability,
+Pinned by the 10 `Fsion.Tests.LifecycleTests`: auto-start with PID stability,
 warmup, stop/auto-restart, restart/PID change, `--no-daemon`, idle-TTL retirement
-(`--idle-ttl 0.05` retires within a 30 s deadline), and colocated binary
-discovery without `FSIOND_PATH`.
+(`--idle-ttl 0.05` retires within a 30 s deadline), a `FSIOND_LOG` path containing
+spaces (exercising `quoteWindowsArgument` on the Windows spawn), `--pipe` overriding
+`FSION_PIPE` with the override daemon stopped in cleanup, `--pipe` without a value
+exiting non-zero before any daemon contact, and colocated binary discovery without
+`FSIOND_PATH`.
 
 ## Clause 2 — `dotnet fsi` parity
 
@@ -72,12 +75,13 @@ Byte comparison on `probe.fsx` (stdout + stderr + `fsi.CommandLineArgs` +
 Both exits were 0; fsion printed `args=[|"probe.fsx"; "one"; "two"|]`,
 `src=Q:\tmp\fsion-evidence-b59a5a8d`, `cwd=Q:\tmp\fsion-evidence-b59a5a8d`.
 
-Pinned by the 13 `Fsion.Tests.ParityTests`: file mode, file mode in a
-subdirectory with `#load`, `-e` mode against an `eval.fsx` oracle, stdin mode
-against a `stdin.fsx` oracle, syntax errors, type errors (`-e` and file),
-`exit` mid-file, `exit` at end of file, `exit` in `-e` mode, uncaught runtime
-exceptions (stack frames normalized only for `--multiemit-` generated names),
-4000-line output, and unicode output.
+Pinned by the 15 `Fsion.Tests.ParityTests`: file mode, file-mode argument
+quoting (`a"b`, `c\d\`, `x\"y`, `tail\`, `""`), file mode in a subdirectory with
+`#load`, `-e` mode against an `eval.fsx` oracle, stdin mode against a `stdin.fsx`
+oracle, stdin prefixed with a UTF-8 BOM against the same file, syntax errors,
+type errors (`-e` and file), `exit` mid-file, `exit` at end of file, `exit` in
+`-e` mode, uncaught runtime exceptions (stack frames normalized only for
+`--multiemit-` generated names), 4000-line output, and unicode output.
 
 ## Clause 3 — `exit 42` keeps `fsiond` alive
 
@@ -110,8 +114,8 @@ vs 3 `dotnet fsi` rounds on the same host, same script text, medians):
 
 | Runtime | fsion median | `dotnet fsi` median | Speedup | Required floor |
 |---|---|---|---|---|
-| net11.0 | 111.911 ms | 2953.8108 ms | 26.39x | 5x (asserted); 20x is Goal 0005 |
-| net10.0 | 114.1338 ms | 3002.3217 ms | 26.31x | 5x (asserted); 20x is Goal 0005 |
+| net11.0 | 122.7815 ms | 2940.0917 ms | 23.95x | 5x (asserted); 20x is Goal 0005 |
+| net10.0 | 119.7797 ms | 2939.8481 ms | 24.54x | 5x (asserted); 20x is Goal 0005 |
 
 ## Windows handle-inheritance hang (observed failure → fix → regression check)
 
@@ -135,9 +139,9 @@ vs 3 `dotnet fsi` rounds on the same host, same script text, medians):
 
 ## Known limits
 
-- Warm medians are ~112–114 ms, above the ~30–70 ms aspiration; the formal
+- Warm medians are ~120–123 ms, above the ~30–70 ms aspiration; the formal
   benchmark gate (>= 20x, `bun`-class latency) is Goal 0005. Current measured
-  speedup is 26.3x.
+  speedups are 24.54x (net10.0) and 23.95x (net11.0).
 - `--multiemit-` (kept for the measured compile saving) means uncaught
   runtime-exception stack frames lack `in <file>:line N`; parity tests
   normalize only those generated frame names.

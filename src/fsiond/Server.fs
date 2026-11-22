@@ -19,8 +19,7 @@ type [<NoEquality; NoComparison>] private Hooks =
     { EnsureWarm: unit -> unit
       Execute: ExecuteRequest -> RunOutcome
       Status: unit -> StatusInfo
-      Stop: unit -> unit
-      MarkExecuted: unit -> unit }
+      Stop: unit -> unit }
 
 let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) =
     use connection = stream
@@ -33,7 +32,6 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
                 let started = Stopwatch.GetTimestamp()
                 let outcome = hooks.Execute request
                 sendResponse connection (Executed(outcome.ExitCode, outcome.StandardOut, outcome.StandardError))
-                hooks.MarkExecuted ()
                 let elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
                 Log.info options.LogPath ("executed exit=" + string outcome.ExitCode + " elapsedMs=" + string (int elapsedMs))
                 if options.Oneshot then
@@ -53,7 +51,7 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
             ()
 
 let run (options: Options) (listener: IListener) : int =
-    let session = new SessionHost(options.Endpoint.Name)
+    let session = new SessionHost()
     let startedAt = DateTime.UtcNow
     let lastActivity = ref DateTime.UtcNow
     let activeRequests = ref 0
@@ -85,8 +83,7 @@ let run (options: Options) (listener: IListener) : int =
                   IdleMs = int64 (DateTime.UtcNow - lastActivity.Value).TotalMilliseconds
                   Executed = session.ExecutedCount
                   Warm = session.IsWarm }
-          Stop = stop
-          MarkExecuted = fun () -> () }
+          Stop = stop }
 
     let acceptLoop =
         Task.Factory.StartNew(

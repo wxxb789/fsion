@@ -5,6 +5,7 @@ open System.Globalization
 open System.IO
 open System.Threading
 open Fsion.Ipc
+open Fsion.Protocol
 open Fsiond.Server
 
 type private Options =
@@ -16,7 +17,7 @@ type private Options =
 let private parse (argv: string[]) =
     let mutable endpointName = defaultEndpointName ()
     let mutable endpointSet = false
-    let mutable idleTtlMinutes = 30.0
+    let mutable idleTtlMinutes = DefaultIdleTtlMinutes
     let mutable idleTtlSet = false
     let mutable oneshot = false
     let mutable logPath = None
@@ -50,14 +51,14 @@ let private parse (argv: string[]) =
             if endpointSet then
                 endpointName
             else
-                match Environment.GetEnvironmentVariable "FSION_PIPE" with
+                match Environment.GetEnvironmentVariable PipeEnvironmentVariable with
                 | null | "" -> endpointName
                 | value -> value
         let envTtl =
             if idleTtlSet then
                 idleTtlMinutes
             else
-                match Environment.GetEnvironmentVariable "FSION_IDLE_TTL_MINUTES" with
+                match Environment.GetEnvironmentVariable IdleTtlEnvironmentVariable with
                 | null | "" -> idleTtlMinutes
                 | value ->
                     match Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture) with

@@ -100,6 +100,47 @@ let ``idle ttl retires an auto-started daemon`` () =
         Assert.False(running, "daemon did not exit after the idle TTL elapsed"))
 
 [<Fact>]
+let ``daemon log path containing spaces is passed to fsiond intact`` () =
+    withContext "lifecycle-log-path" (fun context directory ->
+        let logDirectory = Path.Combine(directory, "dir with spaces")
+        Directory.CreateDirectory logDirectory |> ignore
+        let logPath = Path.Combine(logDirectory, "daemon.log")
+
+        let run =
+            context.Run([ "-e"; "printfn \"logged\"" ], extraEnv = [ "FSIOND_LOG", logPath ])
+
+        Assert.Equal(0, run.ExitCode)
+        Assert.Equal("logged" + Environment.NewLine, run.Stdout)
+        Assert.True(File.Exists logPath, "fsiond did not write its log to the spaced path")
+        Assert.Contains("listening on", File.ReadAllText logPath))
+
+[<Fact>]
+let ``--pipe overrides FSION_PIPE and its daemon is stopped afterwards`` () =
+    withContext "lifecycle-pipe-override" (fun context _ ->
+        let overrideEndpoint = "fsion-test-override-" + Guid.NewGuid().ToString("N")
+
+        try
+            let run = context.Run [ "--pipe"; overrideEndpoint; "-e"; "printfn \"override\"" ]
+            Assert.Equal(0, run.ExitCode)
+            Assert.Equal("override" + Environment.NewLine, run.Stdout)
+
+            let status = context.Run [ "--pipe"; overrideEndpoint; "daemon"; "status" ]
+            Assert.Contains("fsiond running", status.Stdout)
+            Assert.Contains(overrideEndpoint, status.Stdout)
+            Assert.True((context.DaemonPid()).IsNone, "FSION_PIPE endpoint was started despite --pipe")
+        finally
+            context.Run([ "--pipe"; overrideEndpoint; "daemon"; "stop" ], timeoutMs = 30000)
+            |> ignore)
+
+[<Fact>]
+let ``--pipe without a value fails before contacting any daemon`` () =
+    withContext "lifecycle-pipe-missing" (fun context _ ->
+        let run = context.Run [ "--pipe" ]
+        Assert.NotEqual(0, run.ExitCode)
+        Assert.Contains("--pipe", run.Stderr)
+        Assert.True((context.DaemonPid()).IsNone, "a daemon was started for an invalid command line"))
+
+[<Fact>]
 let ``fsion discovers fsiond next to its own binary without FSIOND_PATH`` () =
     let deployDirectory = createTempDir "colocated-bin"
     let workingDirectory = createTempDir "colocated-work"

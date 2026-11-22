@@ -6,6 +6,12 @@ open System.Text
 
 let [<Literal>] ProtocolVersion = 1
 
+let [<Literal>] PipeEnvironmentVariable = "FSION_PIPE"
+
+let [<Literal>] IdleTtlEnvironmentVariable = "FSION_IDLE_TTL_MINUTES"
+
+let [<Literal>] DefaultIdleTtlMinutes = 30.0
+
 type ExecuteRequest =
     { Mode: string
       Source: string

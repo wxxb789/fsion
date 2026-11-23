@@ -3,6 +3,7 @@ module Fsion.Tests.PreludeTests
 open System
 open System.IO
 open System.Text
+open System.Text.Json
 open Xunit
 open Xunit.Abstractions
 open Fsion.Tests.TestInfra
@@ -80,9 +81,17 @@ type PreludeTests(output: ITestOutputHelper) =
                 let feed = createTinyPackage directory packageId
                 writeNugetConfig directory feed
 
+                let preloadCountPath = Path.Combine(directory, "preload-count.txt")
+
                 File.WriteAllText(
                     preludePath,
-                    "#r \"nuget: " + packageId + ", 1.0.0\"\n" + "let preludeGreeting () = \"first\"\n",
+                    "#r \"nuget: "
+                    + packageId
+                    + ", 1.0.0\"\n"
+                    + "System.IO.File.AppendAllText(@\""
+                    + preloadCountPath.Replace("\"", "\"\"")
+                    + "\", \"1\\n\")\n"
+                    + "let preludeGreeting () = \"first\"\n",
                     UTF8Encoding(true)
                 )
 
@@ -92,6 +101,11 @@ type PreludeTests(output: ITestOutputHelper) =
 
                 let before = context.MetricsOrFail()
                 Assert.True(before.PoolWarm > 0, "warm pool was empty after warmup")
+                let preloadedBeforeRun = File.ReadAllLines preloadCountPath
+                Assert.True(
+                    preloadedBeforeRun.Length >= before.PoolWarm,
+                    "prelude.fsx was not evaluated during warmup pool creation"
+                )
 
                 let code = "printfn \"%s|%s\" (preludeGreeting()) (FsionTinyPkgNs.Greeter.Hello())"
 
@@ -104,7 +118,6 @@ type PreludeTests(output: ITestOutputHelper) =
 
                 let daemonPid = context.DaemonPid()
                 Assert.True(daemonPid.IsSome, "daemon was not reported as running")
-
                 writeFile
                     directory
                     "prelude.fsx"
@@ -168,12 +181,17 @@ type PreludeTests(output: ITestOutputHelper) =
             Assert.Equal(1, hidden.ExitCode)
             Assert.Contains("FS0039", hidden.Stderr)
 
-            let missing =
-                context.Run([ "--prelude"; Path.Combine(directory, "no-such-prelude.fsx"); "-e"; "1" ], timeoutMs = 60000)
+            let missingPath = Path.Combine(directory, "no-such-prelude.fsx")
+            let missing = context.Run([ "--prelude"; missingPath; "-e"; "1" ], timeoutMs = 60000)
 
             Assert.Equal(1, missing.ExitCode)
             Assert.Contains("prelude file not found", missing.Stderr)
 
+            let missingJson = context.Run([ "--json"; "--prelude"; missingPath; "-e"; "1" ], timeoutMs = 60000)
+            Assert.Equal(1, missingJson.ExitCode)
+            use missingDocument = JsonDocument.Parse missingJson.Stdout
+            Assert.Equal(1, missingDocument.RootElement.GetProperty("exitCode").GetInt32())
+            Assert.Contains("prelude file not found", missingDocument.RootElement.GetProperty("stderr").GetString())
             let conflicting =
                 context.Run([ "--prelude"; flagPrelude; "--no-prelude"; "-e"; "1" ], timeoutMs = 60000)
 
@@ -195,27 +213,60 @@ type PreludeTests(output: ITestOutputHelper) =
         withContext "prelude-named-tag" (fun context directory ->
             let preludeA = Path.Combine(directory, "prelude-a.fsx")
             let preludeB = Path.Combine(directory, "prelude-b.fsx")
-            writeFile directory "prelude-a.fsx" "let preludeVersion () = \"A\"\n"
+
+            writeFile
+                directory
+                "prelude-a.fsx"
+                "let mutable preludeTurns = 0\nlet onlyInPreludeA () = \"only-A\"\nlet preludeVersion () = \"A\"\n"
+
             writeFile directory "prelude-b.fsx" "let preludeVersion () = \"B\"\n"
 
             let first =
                 context.Run(
-                    [ "--prelude"; preludeA; "--session"; "alpha"; "-e"; "printfn \"%s\" (preludeVersion())" ],
+                    [ "--prelude"
+                      preludeA
+                      "--session"
+                      "alpha"
+                      "-e"
+                      "preludeTurns <- preludeTurns + 1\nprintfn \"%s|%d|%s\" (preludeVersion()) preludeTurns (onlyInPreludeA())" ],
                     timeoutMs = 120000
                 )
 
             Assert.Equal(0, first.ExitCode)
-            Assert.Equal("A" + Environment.NewLine, first.Stdout)
+            Assert.Equal("A|1|only-A" + Environment.NewLine, first.Stdout)
+
+            let secondSame =
+                context.Run(
+                    [ "--prelude"
+                      preludeA
+                      "--session"
+                      "alpha"
+                      "-e"
+                      "preludeTurns <- preludeTurns + 1\nprintfn \"%d\" preludeTurns" ],
+                    timeoutMs = 120000
+                )
+
+            Assert.Equal(0, secondSame.ExitCode)
+            Assert.Equal("2" + Environment.NewLine, secondSame.Stdout)
 
             let daemonPid = context.DaemonPid()
             Assert.True(daemonPid.IsSome, "daemon was not reported as running")
 
-            let second =
+            let switched =
                 context.Run(
                     [ "--prelude"; preludeB; "--session"; "alpha"; "-e"; "printfn \"%s\" (preludeVersion())" ],
                     timeoutMs = 120000
                 )
 
-            Assert.Equal(0, second.ExitCode)
-            Assert.Equal("B" + Environment.NewLine, second.Stdout)
+            Assert.Equal(0, switched.ExitCode)
+            Assert.Equal("B" + Environment.NewLine, switched.Stdout)
+
+            let oldBindingGone =
+                context.Run(
+                    [ "--prelude"; preludeB; "--session"; "alpha"; "-e"; "printfn \"%s\" (onlyInPreludeA())" ],
+                    timeoutMs = 120000
+                )
+
+            Assert.Equal(1, oldBindingGone.ExitCode)
+            Assert.Contains("FS0039", oldBindingGone.Stderr)
             Assert.Equal(daemonPid, context.DaemonPid()))

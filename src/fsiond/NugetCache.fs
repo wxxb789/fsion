@@ -236,6 +236,21 @@ let private configFingerprint (startDirectory: string) =
     if File.Exists userConfig then
         paths.Add userConfig
 
+    let machineConfigDir =
+        if OperatingSystem.IsWindows() then
+            Path.Combine(Environment.GetFolderPath Environment.SpecialFolder.CommonApplicationData, "NuGet")
+        else
+            "/etc/opt/NuGet"
+
+    for candidate in [ Path.Combine(machineConfigDir, "NuGetDefaults.Config"); Path.Combine(machineConfigDir, "Config") ] do
+        if File.Exists candidate then
+            paths.Add candidate
+        elif Directory.Exists candidate then
+            try
+                for file in Directory.EnumerateFiles(candidate, "*.config") do
+                    paths.Add file
+            with _ ->
+                ()
     paths
     |> Seq.distinct
     |> Seq.map (fun path ->

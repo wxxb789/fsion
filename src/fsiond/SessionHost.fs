@@ -443,9 +443,9 @@ type SessionHost(options: SessionHostOptions) =
     let mutable pendingCreations = 0
     let mutable stopped = false
 
-    let tryEvaluateUserPrelude (session: FsiEvaluationSession) (path: string) : Prelude.Tag option =
+    let evaluateUserPrelude (session: FsiEvaluationSession) (path: string) : Prelude.Tag =
         match Prelude.readAndHashFile path with
-        | None -> None
+        | None -> failwith ("configured prelude file could not be read: " + path)
         | Some (text, contentHash) ->
             let directory =
                 match Path.GetDirectoryName path with
@@ -461,8 +461,7 @@ type SessionHost(options: SessionHostOptions) =
                 session.EvalInteraction(plan.RewrittenSource + "\n()", fileName)
             | None -> session.EvalInteraction(text + "\n()", fileName)
 
-            Some(Prelude.Tag.File(path, contentHash))
-
+            Prelude.Tag.File(path, contentHash)
     let createWarmSession (spec: Prelude.Spec) : WarmSession =
         let processExitBefore = processExitSnapshot ()
         let unmanagedDllBefore = unmanagedDllSnapshot ()
@@ -501,9 +500,7 @@ type SessionHost(options: SessionHostOptions) =
                 | Prelude.Spec.File path ->
                     session.EvalInteraction(prelude exitMarker + builtinPrelude)
 
-                    match tryEvaluateUserPrelude session path with
-                    | Some tag -> preludeTag <- tag
-                    | None -> preludeTag <- Prelude.Tag.Builtin
+                    preludeTag <- evaluateUserPrelude session path
             with :? FsiCompilationException ->
                 let diagnostics = creationErr.ToString()
 

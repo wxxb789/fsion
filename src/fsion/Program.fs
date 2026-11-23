@@ -592,9 +592,7 @@ let main argv =
 
         match resolvedOptions with
         | Error message ->
-            Console.Error.Write("fsion: " + message + Environment.NewLine)
-            Console.Error.Flush()
-            1
+            emitFailure options (elapsedMs ()) message
         | Ok options ->
             try
                 let endpoint = resolveEndpoint options

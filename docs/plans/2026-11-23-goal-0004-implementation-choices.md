@@ -41,8 +41,8 @@ the deliberately deferred work.
   and on every `ExecuteRequest` (`PreludePath`/`NoPrelude`).
 - The daemon evaluates the user prelude inside `createWarmSession` (not per run) after the built-in
   module, from the prelude's own directory, so `#r`, `#load`, `open`, and helper bindings are all
-  preloaded at pool-creation time. A prelude that fails to compile aborts session creation with the
-  captured compiler text instead of silently running bare. The prelude is evaluated as an FSI
+  preloaded at pool-creation time. A prelude that fails to compile or becomes unreadable aborts session
+  creation with a clear error instead of silently running bare (fail-closed). The prelude is evaluated as an FSI
   interaction, not `EvalScript`: FSI's `EvalScript` bindings measured invisible to later interactions
   in the same session (observed with a named session file turn followed by an `-e` turn on `c65d63f`),
   so `EvalScript` cannot preload anything for a run.
@@ -65,7 +65,7 @@ the deliberately deferred work.
   `SHA-256("fsion-nuget-cache-v1" | TFM | RID | sorted distinct normalized directives | nuget.config
   fingerprint)`, stored as `<FSION_CACHE_DIR or %LOCALAPPDATA%/fsion/nuget-cache>/<key>.json`. The
   fingerprint is the digest of every `nuget.config` from the script directory up to the root plus the
-  user-level `NuGet.Config`, so a config edit invalidates the entry.
+  user-level and machine-level NuGet configuration files, so a config edit invalidates the entry.
 - Misses go through the official `FSharp.Compiler.DependencyManager.DependencyProvider`
   (`TryFindDependencyManagerByKey` + `Resolve`) with `executionTfm`/`executionRid` from the running
   runtime and the script's directory as `implicitIncludeDir`; nothing re-implements NuGet

@@ -56,7 +56,7 @@ let tagOfSpec (spec: Spec) : Tag =
 
         match hashFile path with
         | Some contentHash -> Tag.File(path, contentHash)
-        | None -> Tag.Builtin
+        | None -> Tag.File(path, "unreadable")
 
 let specOfTag (tag: Tag) : Spec =
     match tag with

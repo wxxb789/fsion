@@ -3,7 +3,6 @@ module Fsiond.NugetCache
 open System
 open System.IO
 open System.Runtime.InteropServices
-open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 open FSharp.Compiler.DependencyManager
@@ -28,11 +27,6 @@ type private ScanState =
     | NormalString
     | VerbatimString
     | TripleString
-
-let private digest (bytes: byte[]) =
-    SHA256.HashData bytes |> Convert.ToHexString |> fun value -> value.ToLowerInvariant()
-
-let private digestText (text: string) = digest (Encoding.UTF8.GetBytes text)
 
 let private normalizePackage (text: string) =
     text.Split(',')
@@ -253,7 +247,7 @@ let private configFingerprint (startDirectory: string) =
     |> String.concat "\n"
 
 let private cacheKey (tfm: string) (rid: string) (packages: string list) (fingerprint: string) =
-    digestText (String.concat "\n" ("fsion-nuget-cache-v1" :: tfm :: rid :: (packages @ [ fingerprint ])))
+    Fsiond.Prelude.hashText (String.concat "\n" ("fsion-nuget-cache-v1" :: tfm :: rid :: (packages @ [ fingerprint ])))
 
 let private tryReadEntry (cachePath: string) : (string list * string list) option =
     try
@@ -331,7 +325,7 @@ let mutable private cachedManager : IDependencyManagerProvider option = None
 let private resolveWithOfficialProvider
     (tfm: string)
     (rid: string)
-    (packages: string list)
+    (originalDirectives: string list)
     (includeDirectory: string)
     (scriptName: string)
     : (string list * string list) option =
@@ -354,7 +348,7 @@ let private resolveWithOfficialProvider
 
             let errors = ResizeArray<string>()
             let report (kind: ErrorReportType) (number: int) (message: string) = errors.Add message
-            let lines = packages |> List.map (fun package -> Tuple.Create("nuget", package))
+            let lines = originalDirectives |> List.map (fun package -> Tuple.Create("nuget", package))
 
             let directory =
                 if Directory.Exists includeDirectory then
@@ -405,10 +399,12 @@ let prepare (source: string) (includeDirectory: string) (scriptName: string) : P
         | None -> None
 
 let referenceBlock (plan: Plan) =
-    let escape (value: string) = value.Replace("\"", "\"\"")
+    let references =
+        plan.ReferencedAssemblies
+        |> List.map (fun reference -> "#r @\"" + Fsiond.Prelude.escapeVerbatim reference + "\"")
 
-    plan.ReferencedAssemblies
-    |> List.map (fun reference -> "#r @\"" + escape reference + "\"")
-    |> fun references ->
-        references @ (plan.IncludeDirectories |> List.map (fun directory -> "#I @\"" + escape directory + "\""))
-    |> String.concat "\n"
+    let includes =
+        plan.IncludeDirectories
+        |> List.map (fun directory -> "#I @\"" + Fsiond.Prelude.escapeVerbatim directory + "\"")
+
+    String.concat "\n" (references @ includes)

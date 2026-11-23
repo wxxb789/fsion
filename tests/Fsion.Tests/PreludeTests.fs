@@ -2,13 +2,10 @@ module Fsion.Tests.PreludeTests
 
 open System
 open System.IO
+open System.Text
 open Xunit
 open Xunit.Abstractions
 open Fsion.Tests.TestInfra
-
-let private metricsOrFail (context: FsionContext) =
-    context.Metrics 30000
-    |> Option.defaultWith (fun () -> failwith "fsiond did not answer GetMetrics")
 
 type PreludeTests(output: ITestOutputHelper) =
     [<Fact>]
@@ -17,7 +14,7 @@ type PreludeTests(output: ITestOutputHelper) =
             let warmup = context.Run([ "warmup" ], timeoutMs = 180000)
             Assert.Equal(0, warmup.ExitCode)
 
-            let before = metricsOrFail context
+            let before = context.MetricsOrFail()
             Assert.True(before.PoolWarm > 0, "warm pool was empty after warmup")
 
             writeFile directory "in.txt" "hello-prelude"
@@ -51,7 +48,7 @@ type PreludeTests(output: ITestOutputHelper) =
             Assert.Contains("json=v", result.Stdout)
             Assert.Equal("written-by-fsion", File.ReadAllText(Path.Combine(directory, "out.txt")))
 
-            let after = metricsOrFail context
+            let after = context.MetricsOrFail()
             Assert.Equal(before.ColdClaims, after.ColdClaims)
 
             let hidden =
@@ -83,16 +80,17 @@ type PreludeTests(output: ITestOutputHelper) =
                 let feed = createTinyPackage directory packageId
                 writeNugetConfig directory feed
 
-                writeFile
-                    directory
-                    "prelude.fsx"
-                    ("#r \"nuget: " + packageId + ", 1.0.0\"\n" + "let preludeGreeting () = \"first\"\n")
+                File.WriteAllText(
+                    preludePath,
+                    "#r \"nuget: " + packageId + ", 1.0.0\"\n" + "let preludeGreeting () = \"first\"\n",
+                    UTF8Encoding(true)
+                )
 
                 let warmup = context.Run([ "warmup" ], timeoutMs = 240000, extraEnv = environment)
 
                 Assert.Equal(0, warmup.ExitCode)
 
-                let before = metricsOrFail context
+                let before = context.MetricsOrFail()
                 Assert.True(before.PoolWarm > 0, "warm pool was empty after warmup")
 
                 let code = "printfn \"%s|%s\" (preludeGreeting()) (FsionTinyPkgNs.Greeter.Hello())"
@@ -101,7 +99,7 @@ type PreludeTests(output: ITestOutputHelper) =
                 Assert.Equal(0, first.ExitCode)
                 Assert.Equal("first|tiny-package-ok", first.Stdout.Trim())
 
-                let afterFirst = metricsOrFail context
+                let afterFirst = context.MetricsOrFail()
                 Assert.Equal(before.ColdClaims, afterFirst.ColdClaims)
 
                 let daemonPid = context.DaemonPid()
@@ -180,4 +178,44 @@ type PreludeTests(output: ITestOutputHelper) =
                 context.Run([ "--prelude"; flagPrelude; "--no-prelude"; "-e"; "1" ], timeoutMs = 60000)
 
             Assert.Equal(1, conflicting.ExitCode)
-            Assert.Contains("cannot be combined", conflicting.Stderr))
+            Assert.Contains("cannot be combined", conflicting.Stderr)
+
+            let staleEnvironment =
+                environment @ [ "FSION_PRELUDE", Path.Combine(directory, "stale-prelude.fsx") ]
+
+            let version = context.Run([ "--version" ], timeoutMs = 60000, extraEnv = staleEnvironment)
+            Assert.Equal(0, version.ExitCode)
+            Assert.StartsWith("fsion ", version.Stdout)
+
+            let status = context.Run([ "daemon"; "status" ], timeoutMs = 60000, extraEnv = staleEnvironment)
+            Assert.Equal(0, status.ExitCode))
+
+    [<Fact>]
+    member _.``a named session recycles when its prelude tag changes`` () =
+        withContext "prelude-named-tag" (fun context directory ->
+            let preludeA = Path.Combine(directory, "prelude-a.fsx")
+            let preludeB = Path.Combine(directory, "prelude-b.fsx")
+            writeFile directory "prelude-a.fsx" "let preludeVersion () = \"A\"\n"
+            writeFile directory "prelude-b.fsx" "let preludeVersion () = \"B\"\n"
+
+            let first =
+                context.Run(
+                    [ "--prelude"; preludeA; "--session"; "alpha"; "-e"; "printfn \"%s\" (preludeVersion())" ],
+                    timeoutMs = 120000
+                )
+
+            Assert.Equal(0, first.ExitCode)
+            Assert.Equal("A" + Environment.NewLine, first.Stdout)
+
+            let daemonPid = context.DaemonPid()
+            Assert.True(daemonPid.IsSome, "daemon was not reported as running")
+
+            let second =
+                context.Run(
+                    [ "--prelude"; preludeB; "--session"; "alpha"; "-e"; "printfn \"%s\" (preludeVersion())" ],
+                    timeoutMs = 120000
+                )
+
+            Assert.Equal(0, second.ExitCode)
+            Assert.Equal("B" + Environment.NewLine, second.Stdout)
+            Assert.Equal(daemonPid, context.DaemonPid()))

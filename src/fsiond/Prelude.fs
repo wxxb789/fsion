@@ -29,9 +29,21 @@ let private normalizePath (path: string) =
 
 let hashText (text: string) = digest (Encoding.UTF8.GetBytes text)
 
+let escapeVerbatim (value: string) = value.Replace("\"", "\"\"")
+
 let hashFile (path: string) : string option =
     try
         Some(digest (File.ReadAllBytes path))
+    with _ ->
+        None
+
+// Hash the raw bytes exactly like hashFile while decoding with BOM detection: hashing the
+// decoded text would tag a BOM'd prelude differently from what tagOfSpec computes on claims.
+let readAndHashFile (path: string) : (string * string) option =
+    try
+        let bytes = File.ReadAllBytes path
+        use reader = new StreamReader(new MemoryStream(bytes), Encoding.UTF8, true)
+        Some(reader.ReadToEnd(), digest bytes)
     with _ ->
         None
 

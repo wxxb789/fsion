@@ -2,9 +2,15 @@ module Fsion.Tests.NugetCacheTests
 
 open System
 open System.IO
+open System.Text.Json
 open Xunit
 open Xunit.Abstractions
 open Fsion.Tests.TestInfra
+
+let private diagnosticStartLines (json: string) =
+    use document = JsonDocument.Parse json
+    let diagnostics = document.RootElement.GetProperty("diagnostics")
+    [ for diagnostic in diagnostics.EnumerateArray() -> diagnostic.GetProperty("startLine").GetInt32() ]
 
 type NugetCacheTests(output: ITestOutputHelper) =
     [<Fact>]
@@ -89,26 +95,64 @@ type NugetCacheTests(output: ITestOutputHelper) =
     member _.``a nuget directive inside a comment or string is neither rewritten nor cached`` () =
         withContext "nuget-extraction" (fun context directory ->
             let cacheDirectory = createTempDir "nuget-extraction-cache"
+            let packageId = uniquePackageId "fsionextract"
 
             try
+                let feed = createTinyPackage directory packageId
+                writeNugetConfig directory feed
+
                 let script =
                     String.concat
                         "\n"
                         [ "(*"
-                          "#r \"nuget: Not.A.Package, 1.0.0\""
+                          "#r \"nuget: " + packageId + ", 1.0.0\""
                           "*)"
                           "let text = \"\"\""
-                          "#r \"nuget: Also.Not.A.Package, 2.0.0\""
+                          "#r \"nuget: " + packageId + ", 1.0.0\""
                           "\"\"\""
                           "printfn \"ok=%b\" (text.Contains \"nuget:\")" ]
 
                 writeFile directory "commented.fsx" script
 
                 let result =
-                    context.Run([ "commented.fsx" ], timeoutMs = 120000, extraEnv = [ "FSION_CACHE_DIR", cacheDirectory ])
+                    context.Run([ "commented.fsx" ], timeoutMs = 180000, extraEnv = [ "FSION_CACHE_DIR", cacheDirectory ])
 
                 Assert.Equal(0, result.ExitCode)
                 Assert.Equal("ok=true" + Environment.NewLine, result.Stdout)
                 Assert.Equal(0, Directory.GetFiles(cacheDirectory, "*.json").Length)
             finally
+                purgeDependencyManagerCache packageId
+                tryDeleteDirectory cacheDirectory)
+
+    [<Fact>]
+    member _.``cached nuget hits preserve source line numbers after directive blanking`` () =
+        withContext "nuget-line-numbers" (fun context directory ->
+            let cacheDirectory = createTempDir "nuget-line-numbers-cache"
+            let packageId = uniquePackageId "fsionlines"
+            let packagesDirectory = Path.Combine(directory, "packages")
+            let environment = [ "FSION_CACHE_DIR", cacheDirectory; "NUGET_PACKAGES", packagesDirectory ]
+
+            try
+                let feed = createTinyPackage directory packageId
+                writeNugetConfig directory feed
+
+                let source =
+                    "#r \"nuget: " + packageId + ", 1.0.0\"\n" + "let value = 1\n" + "let bad: int = \"nope\""
+
+                writeFile directory "broken.fsx" (source + "\n")
+
+                let firstFile = context.Run([ "--json"; "broken.fsx" ], timeoutMs = 180000, extraEnv = environment)
+                Assert.Equal(1, firstFile.ExitCode)
+                Assert.True(Directory.GetFiles(cacheDirectory, "*.json").Length > 0, "the first run did not persist a cache entry")
+                Assert.Contains(3, diagnosticStartLines firstFile.Stdout)
+
+                let cachedFile = context.Run([ "--json"; "broken.fsx" ], timeoutMs = 120000, extraEnv = environment)
+                Assert.Equal(1, cachedFile.ExitCode)
+                Assert.Contains(3, diagnosticStartLines cachedFile.Stdout)
+
+                let cachedEval = context.Run([ "--json"; "-e"; source ], timeoutMs = 120000, extraEnv = environment)
+                Assert.Equal(1, cachedEval.ExitCode)
+                Assert.Contains(3, diagnosticStartLines cachedEval.Stdout)
+            finally
+                purgeDependencyManagerCache packageId
                 tryDeleteDirectory cacheDirectory)

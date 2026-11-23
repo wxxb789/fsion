@@ -23,11 +23,11 @@ Recorded run on this tree: **exit code 0** (`GATE PASSED`).
 | Step | Result |
 |---|---|
 | `dotnet build fsion.slnx -c Release` | Build succeeded, 0 warnings, 0 errors |
-| `dotnet publish src/fsion -c Release -f net10.0` | exit 0, `artifacts/publish/fsion/net10.0/fsion.exe` (4,134,912 bytes, 0 trim/AOT warnings) |
-| `dotnet publish src/fsion -c Release -f net11.0` | exit 0, `artifacts/publish/fsion/net11.0/fsion.exe` (4,160,512 bytes, 0 trim/AOT warnings) |
-| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 65, Skipped 0, Total 65, 11 m 19 s |
-| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 65, Skipped 0, Total 65, 10 m 20 s |
-| `Assert-LineEndings` | `line endings: 44 tracked and 51 non-ignored files clean` |
+| `dotnet publish src/fsion -c Release -f net10.0` | exit 0, `artifacts/publish/fsion/net10.0/fsion.exe` (4,129,280 bytes, 0 trim/AOT warnings) |
+| `dotnet publish src/fsion -c Release -f net11.0` | exit 0, `artifacts/publish/fsion/net11.0/fsion.exe` (4,154,880 bytes, 0 trim/AOT warnings) |
+| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 67, Skipped 0, Total 67, 11 m 30 s |
+| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 67, Skipped 0, Total 67, 11 m 6 s |
+| `Assert-LineEndings` | `line endings: 51 tracked and 51 non-ignored files clean` |
 
 Focused detailed run (prior to the full gate, non-concurrent):
 
@@ -50,18 +50,17 @@ Baseline observed on `c65d63f` before Goal 0004:
 ## Clause 2 — 0 ms Preloaded User `prelude.fsx` & Live Edit Invalidation
 
 - **Precedence & black-box proof (`PreludeTests.prelude resolution prefers the flag, then the environment, then the config directory`, Passed [12 s])**:
-  - Verified `<FSION_CONFIG_DIR>/prelude.fsx` -> overridden by `FSION_PRELUDE` -> overridden by `--prelude <path>`, `--no-prelude` hiding all user prelude bindings (`FS0039`), missing `--prelude` returning exit `1` (`prelude file not found`), and `--prelude` + `--no-prelude` rejected (`cannot be combined`).
-- **Preloaded NuGet package + live SHA-256 invalidation (`PreludeTests.configured prelude with a nuget package preloads bindings and refreshes on edit`, Passed [19 s])**:
-  - A custom `prelude.fsx` containing `#r "nuget: fsiontiny..., 1.0.0"` (packed into a local deterministic feed) and `let preludeGreeting () = "first"` is preloaded during `fsion warmup`.
+  - Verified `<FSION_CONFIG_DIR>/prelude.fsx` -> overridden by `FSION_PRELUDE` -> overridden by `--prelude <path>`, `--no-prelude` hiding all user prelude bindings (`FS0039`), missing `--prelude` returning exit `1` (`prelude file not found`), `--prelude` + `--no-prelude` rejected (`cannot be combined`), and `--version` / `daemon status` succeeding even when `FSION_PRELUDE` points to a missing path.
+- **Preloaded NuGet package + UTF-8 BOM + live SHA-256 invalidation (`PreludeTests.configured prelude with a nuget package preloads bindings and refreshes on edit` & `a named session recycles when its prelude tag changes`)**:
+  - A custom UTF-8-with-BOM `prelude.fsx` containing `#r "nuget: fsiontiny..., 1.0.0"` (packed into a local deterministic feed) and `let preludeGreeting () = "first"` is preloaded during `fsion warmup` (`Prelude.readAndHashFile` hashes raw bytes and decodes from the same snapshot, preventing BOM hash drift).
   - First one-shot script `printfn "%s|%s" (preludeGreeting()) (FsionTinyPkgNs.Greeter.Hello())` prints `first|tiny-package-ok` at warm-pool speed (`ColdClaims` unchanged before vs after).
-  - Editing `prelude.fsx` on disk to return `"edited"` causes the next one-shot run to print `edited|tiny-package-ok` while `context.DaemonPid()` remains identical (no manual daemon restart required; SHA-256 content-tag mismatch recycles stale warm sessions automatically).
-
+  - Editing `prelude.fsx` on disk to return `"edited"` causes the next one-shot run to print `edited|tiny-package-ok` while `context.DaemonPid()` remains identical, and switching `--prelude` on an active `--session` recycles the session cleanly.
 ## Clause 3 — Persistent `#r "nuget: ..."` Resolution Cache
 
 - **Official `DependencyProvider` + lexical scanner**:
   - `src/fsiond/NugetCache.fs` scans top-level `#r "nuget: ..."` directives (ignoring directives inside `//` comments, nested `(* ... *)` comments, normal strings, `@"..."` verbatim strings, and `"""..."""` triple-quoted strings), keys entries by `SHA-256("fsion-nuget-cache-v1" | TFM | RID | sorted normalized directives | nuget.config fingerprint)` under `FSION_CACHE_DIR` (`%LOCALAPPDATA%/fsion/nuget-cache` default on Windows), delegates cache misses to FCS's official `DependencyProvider.Resolve`, and rewrites cache hits to `#r @"<dll>"` + `#I @"<root>"` while blanking directive lines in place so source line numbers stay exact.
 - **Black-box proof & side-by-side timing (`NugetCacheTests`, Passed [24 s & 6 s])**:
-  - `a nuget directive inside a comment or string is neither rewritten nor cached`: exits `0` (`ok=true`) and writes `0` cache files.
+  - `a nuget directive inside a comment or string is neither rewritten nor cached`: uses a real resolvable local package inside `(* ... *)` and `"""..."""`, exits `0` (`ok=true`), and writes `0` cache files; `cached nuget hits preserve source line numbers after directive blanking` verifies `--json` diagnostic `startLine = 3` on both file and `-e` cache hits.
   - `cached nuget directives skip official resolution on a later daemon generation`:
     - **Run 1 (`first.fsx`, cache miss — full official NuGet DependencyManager resolution)**: **`6,346 ms`**, prints `first=tiny-package-ok`, persists JSON cache entry under `FSION_CACHE_DIR`.
     - Daemon is stopped (`fsion daemon stop`), FCS's own `~/.packagemanagement/nuget` cache is purged, the local NuGet feed directory is moved away, and `NUGET_PACKAGES` is pointed at a brand-new empty directory (`packages-second`).

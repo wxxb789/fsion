@@ -183,6 +183,10 @@ type FsionContext(workingDirectory: string) =
                 | _ -> None
             | None -> None
 
+    member this.MetricsOrFail(?timeoutMs: int) : MetricsInfo =
+        this.Metrics(defaultArg timeoutMs 30000)
+        |> Option.defaultWith (fun () -> failwith "fsiond did not answer GetMetrics")
+
     member _.DaemonPid() : int option =
         let result = runProcess fsionBinary [ "daemon"; "status" ] workingDirectory baseEnvironment None 30000
         let matched = Regex.Match(result.Stdout, "pid=(\\d+)")

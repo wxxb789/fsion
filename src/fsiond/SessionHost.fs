@@ -444,21 +444,15 @@ type SessionHost(options: SessionHostOptions) =
     let mutable stopped = false
 
     let tryEvaluateUserPrelude (session: FsiEvaluationSession) (path: string) : Prelude.Tag option =
-        let source =
-            try
-                Some(File.ReadAllText path)
-            with _ ->
-                None
-
-        match source with
+        match Prelude.readAndHashFile path with
         | None -> None
-        | Some text ->
+        | Some (text, contentHash) ->
             let directory =
                 match Path.GetDirectoryName path with
                 | null | "" -> AppContext.BaseDirectory
                 | directory -> directory
 
-            session.EvalInteraction("#cd @\"" + directory.Replace("\"", "\"\"") + "\"")
+            session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
             let fileName = Path.GetFileName path
 
             match NugetCache.prepare text directory fileName with
@@ -467,7 +461,7 @@ type SessionHost(options: SessionHostOptions) =
                 session.EvalInteraction(plan.RewrittenSource + "\n()", fileName)
             | None -> session.EvalInteraction(text + "\n()", fileName)
 
-            Some(Prelude.Tag.File(path, Prelude.hashText text))
+            Some(Prelude.Tag.File(path, contentHash))
 
     let createWarmSession (spec: Prelude.Spec) : WarmSession =
         let processExitBefore = processExitSnapshot ()
@@ -656,7 +650,7 @@ type SessionHost(options: SessionHostOptions) =
         claimed.ExitCodeProperty.Value.SetValue(state, box 0)
 
         let changeDirectory (directory: string) =
-            session.EvalInteraction("#cd @\"" + directory.Replace("\"", "\"\"") + "\"")
+            session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
 
         let sourceName = if request.Mode = "stdin" then "stdin.fsx" else "eval.fsx"
 
@@ -1135,7 +1129,7 @@ type SessionHost(options: SessionHostOptions) =
         else
             let completedInGrace =
                 try
-                    worker.Wait 150
+                    worker.Wait 500
                 with :? AggregateException ->
                     true
 

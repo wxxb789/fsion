@@ -77,10 +77,11 @@ the deliberately deferred work.
   line numbers and diagnostic spans are preserved (verified for eval mode and file mode: an error on
   line 3 still reports line 3). A hit is validated by `File.Exists` on every referenced assembly, so a
   wiped package folder degrades to a miss instead of a broken script. File mode with directives switches
-  from `EvalScript` to `EvalInteraction` with the script's file name; `#cd`, `__SOURCE_DIRECTORY__`,
-  `#load`, and the emitted diagnostics are equivalent because the daemon already `#cd`s to the script
-  directory. The rewritten file-mode path therefore shares `EvalInteraction`'s property that top-level
-  bindings persist into later named-session turns, unlike the plain `EvalScript` file path.
+  from `EvalScript` to `EvalInteraction` passing the full `sourcePath` (not just the file name), because
+  FCS derives `__SOURCE_DIRECTORY__` and diagnostic `FileName` on `EvalInteraction` from the directory
+  of `scriptFileName` (falling back to process cwd rather than `#cd` if only a basename is passed). The
+  rewritten file-mode path therefore also shares `EvalInteraction`'s property that top-level bindings
+  persist into later named-session turns, unlike the plain `EvalScript` file path.
 - The configured user `prelude.fsx` goes through the same scanner/cache path during session creation,
   so a prelude that carries a `#r "nuget: ..."` package pays official resolution once and every
   subsequent warm-session creation feeds the cached references.

@@ -453,13 +453,11 @@ type SessionHost(options: SessionHostOptions) =
                 | directory -> directory
 
             session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
-            let fileName = Path.GetFileName path
-
-            match NugetCache.prepare text directory fileName with
+            match NugetCache.prepare text directory path with
             | Some plan ->
                 session.EvalInteraction(NugetCache.referenceBlock plan, "fsion-prelude-refs.fsx")
-                session.EvalInteraction(plan.RewrittenSource + "\n()", fileName)
-            | None -> session.EvalInteraction(text + "\n()", fileName)
+                session.EvalInteraction(plan.RewrittenSource + "\n()", path)
+            | None -> session.EvalInteraction(text + "\n()", path)
 
             Prelude.Tag.File(path, contentHash)
     let createWarmSession (spec: Prelude.Spec) : WarmSession =
@@ -685,7 +683,7 @@ type SessionHost(options: SessionHostOptions) =
                     let text = File.ReadAllText sourcePath
 
                     if containsNuget text then
-                        NugetCache.prepare text scriptDirectory (Path.GetFileName sourcePath)
+                        NugetCache.prepare text scriptDirectory sourcePath
                         |> Option.map (fun plan -> NugetCache.referenceBlock plan, plan.RewrittenSource)
                     else
                         None
@@ -699,10 +697,9 @@ type SessionHost(options: SessionHostOptions) =
 
         let checkedSourceName =
             if request.Mode = "file" && sourceExists then
-                Path.GetFileName sourcePath
+                sourcePath
             else
                 sourceName
-
         let run () =
             match rewritten with
             | Some (referenceBlock, rewrittenSource) ->
@@ -865,9 +862,7 @@ type SessionHost(options: SessionHostOptions) =
     let replenish () =
         while not stopped do
             replenishSignal.Wait 250 |> ignore
-            drainCleanups ()
             recycleStalePoolSessions ()
-            drainCleanups ()
 
             let mutable working = true
 
@@ -897,6 +892,8 @@ type SessionHost(options: SessionHostOptions) =
                 else
                     working <- false
 
+            if pendingCleanups.Count >= 4 || (pool.Count >= targetPoolSize && not pendingCleanups.IsEmpty) then
+                drainCleanups ()
     do
         Task.Factory.StartNew(replenish, TaskCreationOptions.LongRunning) |> ignore
         replenishSignal.Release() |> ignore
@@ -923,9 +920,8 @@ type SessionHost(options: SessionHostOptions) =
             while filling do
                 filling <-
                     not stopped
-                    && pool.Count + pendingCreations < targetPoolSize
+                    && pool.Count < targetPoolSize
                     && Environment.TickCount64 < deadline
-
                 if filling then
                     Thread.Sleep 5
 

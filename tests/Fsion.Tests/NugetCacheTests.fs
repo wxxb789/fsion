@@ -7,11 +7,11 @@ open Xunit
 open Xunit.Abstractions
 open Fsion.Tests.TestInfra
 
-let private diagnosticStartLines (json: string) =
+let private diagnosticLocations (json: string) =
     use document = JsonDocument.Parse json
     let diagnostics = document.RootElement.GetProperty("diagnostics")
-    [ for diagnostic in diagnostics.EnumerateArray() -> diagnostic.GetProperty("startLine").GetInt32() ]
-
+    [ for diagnostic in diagnostics.EnumerateArray() ->
+          diagnostic.GetProperty("file").GetString(), diagnostic.GetProperty("startLine").GetInt32() ]
 type NugetCacheTests(output: ITestOutputHelper) =
     [<Fact>]
     member _.``cached nuget directives skip official resolution on a later daemon generation`` () =
@@ -125,34 +125,57 @@ type NugetCacheTests(output: ITestOutputHelper) =
                 tryDeleteDirectory cacheDirectory)
 
     [<Fact>]
-    member _.``cached nuget hits preserve source line numbers after directive blanking`` () =
+    member _.``cached nuget hits preserve source line numbers and subdirectory __SOURCE_DIRECTORY__`` () =
         withContext "nuget-line-numbers" (fun context directory ->
             let cacheDirectory = createTempDir "nuget-line-numbers-cache"
             let packageId = uniquePackageId "fsionlines"
             let packagesDirectory = Path.Combine(directory, "packages")
+            let subdirectory = Path.Combine(directory, "sub")
             let environment = [ "FSION_CACHE_DIR", cacheDirectory; "NUGET_PACKAGES", packagesDirectory ]
 
             try
                 let feed = createTinyPackage directory packageId
                 writeNugetConfig directory feed
 
+                writeFile
+                    subdirectory
+                    "srcdir.fsx"
+                    ("#r \"nuget: "
+                     + packageId
+                     + ", 1.0.0\"\n"
+                     + "printfn \"%s|%s\" __SOURCE_DIRECTORY__ (FsionTinyPkgNs.Greeter.Hello())\n")
+
+                let subdirRun =
+                    context.Run([ Path.Combine("sub", "srcdir.fsx") ], timeoutMs = 180000, extraEnv = environment)
+
+                Assert.Equal(0, subdirRun.ExitCode)
+                Assert.Equal((subdirectory + "|tiny-package-ok").ToLowerInvariant(), subdirRun.Stdout.Trim().ToLowerInvariant())
+
                 let source =
                     "#r \"nuget: " + packageId + ", 1.0.0\"\n" + "let value = 1\n" + "let bad: int = \"nope\""
 
-                writeFile directory "broken.fsx" (source + "\n")
+                let brokenPath = Path.Combine(subdirectory, "broken.fsx")
+                writeFile subdirectory "broken.fsx" (source + "\n")
 
-                let firstFile = context.Run([ "--json"; "broken.fsx" ], timeoutMs = 180000, extraEnv = environment)
+                let firstFile =
+                    context.Run([ "--json"; Path.Combine("sub", "broken.fsx") ], timeoutMs = 180000, extraEnv = environment)
+
                 Assert.Equal(1, firstFile.ExitCode)
                 Assert.True(Directory.GetFiles(cacheDirectory, "*.json").Length > 0, "the first run did not persist a cache entry")
-                Assert.Contains(3, diagnosticStartLines firstFile.Stdout)
+                let firstLocations = diagnosticLocations firstFile.Stdout
+                Assert.Contains(firstLocations, fun (file, line) -> line = 3 && String.Equals(file, brokenPath, StringComparison.OrdinalIgnoreCase))
 
-                let cachedFile = context.Run([ "--json"; "broken.fsx" ], timeoutMs = 120000, extraEnv = environment)
+                let cachedFile =
+                    context.Run([ "--json"; Path.Combine("sub", "broken.fsx") ], timeoutMs = 120000, extraEnv = environment)
+
                 Assert.Equal(1, cachedFile.ExitCode)
-                Assert.Contains(3, diagnosticStartLines cachedFile.Stdout)
+                let cachedLocations = diagnosticLocations cachedFile.Stdout
+                Assert.Contains(cachedLocations, fun (file, line) -> line = 3 && String.Equals(file, brokenPath, StringComparison.OrdinalIgnoreCase))
 
                 let cachedEval = context.Run([ "--json"; "-e"; source ], timeoutMs = 120000, extraEnv = environment)
                 Assert.Equal(1, cachedEval.ExitCode)
-                Assert.Contains(3, diagnosticStartLines cachedEval.Stdout)
+                let evalLocations = diagnosticLocations cachedEval.Stdout
+                Assert.Contains(evalLocations, fun (file, line) -> line = 3 && file = "eval.fsx")
             finally
                 purgeDependencyManagerCache packageId
                 tryDeleteDirectory cacheDirectory)

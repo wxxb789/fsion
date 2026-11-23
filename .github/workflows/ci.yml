@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-package:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+          - ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # net10.0 and net11.0 test hosts both run here, so both runtimes must exist:
+      # 10.0.x supplies the Microsoft.NETCore.App 10 runtime, 11.0.x the SDK used to build.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.x
+            11.0.x
+
+      - name: Install NativeAOT prerequisites (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+
+      - name: Repository gate (build, NativeAOT publish, black-box tests, LF hygiene)
+        shell: pwsh
+        run: pwsh -NoProfile -File eng/gate.ps1
+
+      - name: Package and verify the host bundle (net10.0)
+        shell: pwsh
+        run: pwsh -NoProfile -File eng/package.ps1 -Framework net10.0
+
+      - name: Upload distribution archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsion-bundle-${{ matrix.os }}
+          path: |
+            artifacts/package/*.zip
+            artifacts/package/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7

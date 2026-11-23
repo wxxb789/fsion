@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "description": "Interleaved unseen-script benchmark definition for fsion vs peer runtimes. Every round embeds a fresh nonce, so no runner can serve the same source twice.",
+  "defaults": {
+    "rounds": 30,
+    "warmupRounds": 3,
+    "tfm": "net10.0"
+  },
+  "env": {
+    "BENCH_DOMAIN": "bench.example.local"
+  },
+  "workloads": [
+    "hello",
+    "typical"
+  ],
+  "typical": {
+    "rows": 8,
+    "scoreModulus": 97,
+    "inactiveEvery": 3
+  },
+  "ac07": {
+    "minSpeedupOverFsi": 20.0,
+    "maxRatioToBun": 1.0
+  },
+  "runners": [
+    {
+      "id": "fsion",
+      "kind": "fsion",
+      "ext": "fsx",
+      "enabled": true,
+      "description": "warm fsion NativeAOT client against a warm fsiond pool"
+    },
+    {
+      "id": "dotnet-fsi",
+      "kind": "fsi",
+      "command": ["dotnet", "fsi", "--nologo"],
+      "ext": "fsx",
+      "enabled": true,
+      "description": "dotnet fsi, one fresh process per round"
+    },
+    {
+      "id": "bun",
+      "kind": "node",
+      "command": ["bun", "run"],
+      "ext": "ts",
+      "enabled": true,
+      "description": "bun running TypeScript"
+    },
+    {
+      "id": "node",
+      "kind": "node",
+      "command": ["node"],
+      "ext": "js",
+      "enabled": true,
+      "description": "node running JavaScript"
+    },
+    {
+      "id": "python",
+      "kind": "python",
+      "command": ["python"],
+      "ext": "py",
+      "enabled": true,
+      "description": "CPython"
+    }
+  ]
+}

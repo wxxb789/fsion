@@ -71,9 +71,9 @@ type private Settings() =
 
     member val AddedPrinters : Choice<Type * (obj -> string), Type * (obj -> obj)> list = []
 
-    member val ShowDeclarationValues = true
-    member val ShowIEnumerable = true
-    member val ShowProperties = true
+    member val ShowDeclarationValues = false
+    member val ShowIEnumerable = false
+    member val ShowProperties = false
     member val PrintSize = 10000
     member val PrintDepth = 100
     member val PrintWidth = 78
@@ -90,6 +90,7 @@ type private WarmSession() =
     member val CancellationTokenProperty: PropertyInfo option = None with get, set
     member val ExitMarker: string = "" with get, set
     member val Prelude: Prelude.Tag = Prelude.Tag.Builtin with get, set
+    member val CompilerDirectory: string = "" with get, set
     member val ProcessExitHandlers: Delegate[] = [||] with get, set
     member val UnmanagedDllHandlers: Delegate[] = [||] with get, set
     member val AssemblyResolveHandlers: Delegate[] = [||] with get, set
@@ -266,10 +267,13 @@ let private sweepFinalizers () =
 // Top-level IDisposable bindings are disposed by clearScriptStatics; this Gen-0 sweep finalizes
 // throwaway streams created inside functions so their Windows handles close before the response
 // while the collectible unload (checker caches, session dispose, full sweep) stays off the
-// request's critical path.
+// request's critical path. The wait is skipped when the collection left nothing on the
+// finalization queue, which is the common case for scripts that allocate no finalizable objects.
 let private sweepTransientFinalizers () =
     GC.Collect(0, GCCollectionMode.Forced, true, false)
-    GC.WaitForPendingFinalizers()
+
+    if GC.GetGCMemoryInfo().FinalizationPendingCount > 0L then
+        GC.WaitForPendingFinalizers()
 
 let private severityText (severity: FSharpDiagnosticSeverity) =
     match severity with
@@ -337,6 +341,15 @@ module Fsion =
           typeof<System.Net.Http.HttpClient>
           typeof<System.Linq.Enumerable> ]
         |> List.map (fun warmType -> warmType.Assembly.GetName().Name)
+
+    let private warmCompilerPaths =
+        let root = (System.Text.Json.JsonDocument.Parse "[{\"a\":1,\"b\":\"x\",\"ok\":true}]").RootElement
+        root.EnumerateArray()
+        |> Seq.filter (fun item -> item.GetProperty("ok").GetBoolean())
+        |> Seq.map (fun item -> item.GetProperty("b").GetString(), item.GetProperty("a").GetInt32())
+        |> Seq.sortBy (fun (label, score) -> -score, label)
+        |> Seq.toArray
+        |> Array.length
 
     let cwd () : string = System.IO.Directory.GetCurrentDirectory()
     let path (rel: string) : string = System.IO.Path.GetFullPath rel
@@ -443,7 +456,7 @@ type SessionHost(options: SessionHostOptions) =
     let mutable pendingCreations = 0
     let mutable stopped = false
 
-    let evaluateUserPrelude (session: FsiEvaluationSession) (path: string) : Prelude.Tag =
+    let evaluateUserPrelude (session: FsiEvaluationSession) (path: string) : Prelude.Tag * string =
         match Prelude.readAndHashFile path with
         | None -> failwith ("configured prelude file could not be read: " + path)
         | Some (text, contentHash) ->
@@ -459,7 +472,7 @@ type SessionHost(options: SessionHostOptions) =
                 session.EvalInteraction(plan.RewrittenSource + "\n()", path)
             | None -> session.EvalInteraction(text + "\n()", path)
 
-            Prelude.Tag.File(path, contentHash)
+            Prelude.Tag.File(path, contentHash), directory
     let releaseSession (claimed: WarmSession) =
         match claimed.Session with
         | Some session -> clearScriptStatics session.DynamicAssemblies
@@ -517,6 +530,7 @@ type SessionHost(options: SessionHostOptions) =
             let creationErr = new StringWriter()
             Ambient.set { Out = creationOut; Error = creationErr; In = TextReader.Null }
             let mutable preludeTag = Prelude.Tag.Builtin
+            let mutable compilerDirectory = Directory.GetCurrentDirectory()
 
             try
                 try
@@ -529,7 +543,9 @@ type SessionHost(options: SessionHostOptions) =
                         preludeTag <- Prelude.Tag.Builtin
                     | Prelude.Spec.File path ->
                         session.EvalInteraction(prelude exitMarker + builtinPrelude)
-                        preludeTag <- evaluateUserPrelude session path
+                        let fileTag, fileDirectory = evaluateUserPrelude session path
+                        preludeTag <- fileTag
+                        compilerDirectory <- fileDirectory
                 with :? FsiCompilationException ->
                     let diagnostics = creationErr.ToString()
 
@@ -554,6 +570,7 @@ type SessionHost(options: SessionHostOptions) =
             warm.CancellationTokenProperty <- Some(stateType.GetProperty "CancellationToken")
             warm.ExitMarker <- exitMarker
             warm.Prelude <- preludeTag
+            warm.CompilerDirectory <- compilerDirectory
             succeeded <- true
             warm
         finally
@@ -657,7 +674,15 @@ type SessionHost(options: SessionHostOptions) =
         finally
             creationGate.Release() |> ignore
 
-    let prepareRewrittenSource (request: ExecuteRequest) : (string * string) option =
+    let stripLeadingBom (text: string) =
+        if text.Length > 0 && text.[0] = '\uFEFF' then text.Substring 1 else text
+
+    let readUtf8File (path: string) =
+        use stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite ||| FileShare.Delete)
+        use reader = new StreamReader(stream, Encoding.UTF8, true)
+        reader.ReadToEnd()
+
+    let prepareExecution (request: ExecuteRequest) : string option * (string * string) option =
         let sourceName = if request.Mode = "stdin" then "stdin.fsx" else "eval.fsx"
 
         let sourcePath =
@@ -680,24 +705,33 @@ type SessionHost(options: SessionHostOptions) =
 
         if request.Mode = "file" then
             if sourceExists then
-                let text = File.ReadAllText sourcePath
+                let text = stripLeadingBom (readUtf8File sourcePath)
 
+                let rewritten =
+                    if containsNuget text then
+                        NugetCache.prepare text scriptDirectory sourcePath
+                        |> Option.map (fun plan -> NugetCache.referenceBlock plan, plan.RewrittenSource)
+                    else
+                        None
+
+                Some text, rewritten
+            else
+                None, None
+        else
+            let text = stripLeadingBom request.Source
+
+            let rewritten =
                 if containsNuget text then
-                    NugetCache.prepare text scriptDirectory sourcePath
+                    NugetCache.prepare text scriptDirectory sourceName
                     |> Option.map (fun plan -> NugetCache.referenceBlock plan, plan.RewrittenSource)
                 else
                     None
-            else
-                None
-        elif containsNuget request.Source then
-            NugetCache.prepare request.Source scriptDirectory sourceName
-            |> Option.map (fun plan -> NugetCache.referenceBlock plan, plan.RewrittenSource)
-        else
-            None
 
+            Some text, rewritten
     let evaluate
         (claimed: WarmSession)
         (request: ExecuteRequest)
+        (loadedText: string option)
         (rewritten: (string * string) option)
         (outWriter: RunTextWriter)
         (errWriter: RunTextWriter)
@@ -710,7 +744,9 @@ type SessionHost(options: SessionHostOptions) =
         claimed.ExitCodeProperty.Value.SetValue(state, box 0)
 
         let changeDirectory (directory: string) =
-            session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
+            if not (String.Equals(claimed.CompilerDirectory, directory, StringComparison.Ordinal)) then
+                session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
+                claimed.CompilerDirectory <- directory
 
         let sourceName = if request.Mode = "stdin" then "stdin.fsx" else "eval.fsx"
 
@@ -746,23 +782,35 @@ type SessionHost(options: SessionHostOptions) =
             else
                 sourceName
 
+        let mutable attemptedCode = ""
+        let mutable attemptedScriptName = sourceName
+
+        let evalCode (code: string) (scriptName: string) =
+            checkedSource <- true
+            let wrapped = code + "\n()"
+            attemptedCode <- wrapped
+            attemptedScriptName <- scriptName
+
+            try
+                session.EvalInteraction(wrapped, scriptName, cancellationToken = cancellationToken)
+            finally
+                if request.Mode = "file" && sourceExists then
+                    let fileName = Path.GetFileName sourcePath
+
+                    if not (String.Equals(sourcePath, fileName, StringComparison.Ordinal)) then
+                        errWriter.ReplaceInBuilder(sourcePath + "(", fileName + "(")
+
         let run () =
             match rewritten with
             | Some (referenceBlock, rewrittenSource) ->
                 changeDirectory scriptDirectory
-                checkedSource <- true
                 session.EvalInteraction(referenceBlock, "fsion-nuget-refs.fsx")
-                session.EvalInteraction(rewrittenSource + "\n()", checkedSourceName, cancellationToken = cancellationToken)
+                evalCode rewrittenSource checkedSourceName
             | None ->
                 if request.Mode = "file" then
                     if sourceExists then
-                        let directory = Path.GetDirectoryName sourcePath
-
-                        if not (String.IsNullOrEmpty directory) then
-                            changeDirectory directory
-
-                        checkedSource <- true
-                        session.EvalScript(Path.GetFileName sourcePath)
+                        changeDirectory scriptDirectory
+                        evalCode (defaultArg loadedText "") checkedSourceName
                     else
                         changeDirectory request.WorkingDirectory
                         checkedSource <- true
@@ -775,9 +823,7 @@ type SessionHost(options: SessionHostOptions) =
                             reraise ()
                 else
                     changeDirectory request.WorkingDirectory
-                    checkedSource <- true
-                    session.EvalInteraction(request.Source + "\n()", sourceName, cancellationToken = cancellationToken)
-
+                    evalCode (defaultArg loadedText "") sourceName
         let compileDiagnostics () =
             if not checkedSource || (request.Mode = "file" && not sourceExists) then
                 [||]
@@ -790,14 +836,7 @@ type SessionHost(options: SessionHostOptions) =
 
                 let diagnostics =
                     try
-                        match rewritten with
-                        | Some (_, rewrittenSource) ->
-                            snd (session.EvalInteractionNonThrowing(rewrittenSource + "\n()", checkedSourceName))
-                        | None ->
-                            if request.Mode = "file" then
-                                snd (session.EvalScriptNonThrowing(Path.GetFileName sourcePath))
-                            else
-                                snd (session.EvalInteractionNonThrowing(request.Source + "\n()", sourceName))
+                        snd (session.EvalInteractionNonThrowing(attemptedCode, attemptedScriptName))
                     finally
                         Ambient.set saved
 
@@ -807,7 +846,12 @@ type SessionHost(options: SessionHostOptions) =
 
         try
             run ()
-            0, [||]
+
+            if emittedTypeCount () = typesBeforeRun && errWriter.SafeText().Length > 0 then
+                let diagnostics = if request.IncludeDiagnostics then compileDiagnostics () else [||]
+                1, diagnostics
+            else
+                0, [||]
         with :? FsiCompilationException ->
             if claimed.ExitedProperty.Value.GetValue state :?> bool then
                 let text = errWriter.SafeText()
@@ -818,9 +862,9 @@ type SessionHost(options: SessionHostOptions) =
 
                 claimed.ExitCodeProperty.Value.GetValue state :?> int, [||]
             else
-                // A failed compilation emits no CLR types; every compiled interaction or script
-                // (even a comment-only one) emits its types before executing, so the emitted-type
-                // delta proves user IL never ran without sniffing the diagnostic text.
+                // A failed compilation emits no CLR types; every non-empty compiled interaction
+                // emits its types before executing, so the emitted-type delta proves user IL never
+                // ran without sniffing the diagnostic text.
                 let compiledAndEnteredRuntime = emittedTypeCount () > typesBeforeRun
 
                 if
@@ -1097,7 +1141,7 @@ type SessionHost(options: SessionHostOptions) =
                         | _ -> ()
 
                         try
-                            let rewritten = prepareRewrittenSource request
+                            let loadedText, rewritten = prepareExecution request
                             disconnectToken.ThrowIfCancellationRequested()
                             Volatile.Write(&evaluationStarted.contents, 1)
 
@@ -1120,7 +1164,7 @@ type SessionHost(options: SessionHostOptions) =
                                         Unchecked.defaultof<Timer>
 
                                 let exitCode, diagnostics =
-                                    evaluate claimed request rewritten outWriter errWriter runCts.Token
+                                    evaluate claimed request loadedText rewritten outWriter errWriter runCts.Token
 
                                 Interlocked.Increment(&executed.contents) |> ignore
 
@@ -1140,10 +1184,10 @@ type SessionHost(options: SessionHostOptions) =
                 finally
                     processState.Exit ()
             finally
-                replenishSignal.Release() |> ignore
-
                 if stateless then
                     releaseSession claimed
+
+                replenishSignal.Release() |> ignore
 
         let canceledOutcome () =
             Interlocked.Increment(&executed.contents) |> ignore

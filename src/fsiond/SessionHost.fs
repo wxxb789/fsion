@@ -356,8 +356,8 @@ let private mayMutateCompilerDirectory (text: string) =
 // EvalInteraction stops at the first top-level `;;` terminator, whereas `dotnet fsi` executes every
 // `;;`-delimited interaction in a script. Use FCS's own `FSharpSourceTokenizer` to find top-level
 // `SEMICOLON_SEMICOLON` tokens outside strings/comments/backtick identifiers/inactive `#if` blocks
-// and outside active `#if`..`#endif` regions or interpolated `{...}` holes, and pad subsequent chunks
-// with leading `\n` + spaces so diagnostic line and column numbers remain exact.
+// and outside interpolated `{...}` holes, closing/reopening any active `#if` scopes across chunk
+// boundaries and preserving exact diagnostic line and column numbers.
 let private firstLineMinIndent (text: string) =
     let mutable idx = 0
     let mutable col = 0
@@ -428,13 +428,12 @@ let private splitInteractions (source: string) (scriptName: string) : string[] =
         let mutable chunkStart = 0
         let mutable chunkStartLines = 0
         let mutable chunkStartCols = 0
+        let mutable chunkOpenIfs = 0
 
-        let emitChunk endExclusive nextStart nextLines nextCols =
+        let emitChunk endExclusive nextStart nextLines nextCols closeIfs reopenIfs =
             let body = source.Substring(chunkStart, endExclusive - chunkStart)
 
-            if chunks.Count = 0 || body.Trim().Length > 0 then
-                let linePrefix = if chunkStartLines > 0 then String('\n', chunkStartLines) else ""
-
+            if chunks.Count = 0 || body.Trim().Length > 0 || chunkOpenIfs > 0 then
                 let hasCodeOnFirstLine =
                     let nl = body.IndexOf '\n'
                     let firstLine = if nl >= 0 then body.Substring(0, nl) else body
@@ -446,11 +445,27 @@ let private splitInteractions (source: string) (scriptName: string) : string[] =
                     else
                         ""
 
-                chunks.Add(appendTrailingUnit (linePrefix + colPrefix + body))
+                let prefix =
+                    if chunkOpenIfs > 0 then
+                        String.replicate chunkOpenIfs "#if INTERACTIVE\n"
+                        + "#line "
+                        + string (chunkStartLines + 1)
+                        + " @\""
+                        + Prelude.escapeVerbatim scriptName
+                        + "\"\n"
+                    elif chunkStartLines > 0 then
+                        String('\n', chunkStartLines)
+                    else
+                        ""
+
+                let withUnit = appendTrailingUnit (prefix + colPrefix + body)
+                let suffix = if closeIfs > 0 then String.replicate closeIfs "\n#endif" else ""
+                chunks.Add(withUnit + suffix)
 
             chunkStart <- nextStart
             chunkStartLines <- nextLines
             chunkStartCols <- nextCols
+            chunkOpenIfs <- reopenIfs
 
         for lineIdx = 0 to lineStarts.Count - 1 do
             let lStart = lineStarts.[lineIdx]
@@ -469,15 +484,14 @@ let private splitInteractions (source: string) (scriptName: string) : string[] =
                             hashIfDepth <- hashIfDepth + 1
                         elif slice.StartsWith("#endif", StringComparison.Ordinal) then
                             hashIfDepth <- max 0 (hashIfDepth - 1)
-                    | "INTERP_STRING_BEGIN_PART"
-                    | "INTERP_STRING_PART" ->
+                    | "INTERP_STRING_BEGIN_PART" ->
                         interpDepth <- interpDepth + 1
                     | "INTERP_STRING_END" ->
                         interpDepth <- max 0 (interpDepth - 1)
-                    | "SEMICOLON_SEMICOLON" when hashIfDepth = 0 && interpDepth = 0 ->
+                    | "SEMICOLON_SEMICOLON" when interpDepth = 0 ->
                         let semiStart = lStart + tok.LeftColumn
                         let nextStart = lStart + tok.RightColumn + 1
-                        emitChunk semiStart nextStart lineIdx (tok.RightColumn + 1)
+                        emitChunk semiStart nextStart lineIdx (tok.RightColumn + 1) hashIfDepth hashIfDepth
                     | _ -> ()
 
                     scanLine nextState
@@ -485,10 +499,10 @@ let private splitInteractions (source: string) (scriptName: string) : string[] =
 
             lexState <- scanLine lexState
 
-        if chunkStart < length || chunks.Count = 0 then
+        if chunkStart < length || chunks.Count = 0 || chunkOpenIfs > 0 then
             let lastLine = lineStarts.Count - 1
             let tailCols = if chunkStart >= lineStarts.[lastLine] then chunkStart - lineStarts.[lastLine] else 0
-            emitChunk length length lastLine tailCols
+            emitChunk length length lastLine tailCols 0 0
 
         chunks.ToArray()
 // The throwing Eval* APIs print diagnostics to the session's error writer but construct

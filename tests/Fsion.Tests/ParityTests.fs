@@ -26,9 +26,14 @@ let ``file mode matches dotnet fsi byte for byte`` () =
 
         let multiScript =
             "let ``a;;b`` = 41\n"
+            + "let interp = $\"x{1}y{2}z\"\n"
             + "#if FOO\n"
             + "let skipped = 1\n"
             + ";;\n"
+            + "#endif\n"
+            + "#if INTERACTIVE\n"
+            + "let insideActive = 10;;\n"
+            + "printfn \"active=%d|%s\" insideActive interp\n"
             + "#endif\n"
             + "let full = System.IO.Path.Combine(__SOURCE_DIRECTORY__, __SOURCE_FILE__)\n"
             + "eprintfn \"%s(\" full;;\n"

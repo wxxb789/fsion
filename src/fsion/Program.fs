@@ -353,15 +353,6 @@ let private executeOneShot (options: Options) (endpoint: Endpoint) (request: Exe
     finally
         stream.Dispose()
 
-let private clientEnvironment () =
-    let variables = Environment.GetEnvironmentVariables()
-
-    [| for entry in variables.Keys do
-         let key = entry :?> string
-
-         if key.Length > 0 && key.IndexOf '=' < 0 then
-             key, string variables.[entry] |]
-
 let private writeJsonResult (elapsedMs: float) (result: ExecutionResult) =
     use stream = Console.OpenStandardOutput()
     use writer = new Utf8JsonWriter(stream, JsonWriterOptions(Indented = false))
@@ -389,6 +380,20 @@ let private writeJsonResult (elapsedMs: float) (result: ExecutionResult) =
     writer.WriteEndObject()
     writer.Flush()
 
+let private emitFailure (options: Options) (elapsedMs: float) (message: string) : int =
+    if options.Json then
+        writeJsonResult
+            elapsedMs
+            { ExitCode = 1
+              StandardOut = ""
+              StandardError = "fsion: " + message + Environment.NewLine
+              Diagnostics = [||] }
+    else
+        Console.Error.Write("fsion: " + message + Environment.NewLine)
+        Console.Error.Flush()
+
+    1
+
 let private emit (options: Options) (elapsedMs: float) (response: Response) : int =
     match response with
     | Executed result ->
@@ -405,32 +410,8 @@ let private emit (options: Options) (elapsedMs: float) (response: Response) : in
             Console.Error.Flush()
 
         result.ExitCode
-    | Failure message ->
-        if options.Json then
-            writeJsonResult
-                elapsedMs
-                { ExitCode = 1
-                  StandardOut = ""
-                  StandardError = "fsion: " + message + Environment.NewLine
-                  Diagnostics = [||] }
-        else
-            Console.Error.Write("fsion: " + message + Environment.NewLine)
-            Console.Error.Flush()
-
-        1
-    | _ ->
-        if options.Json then
-            writeJsonResult
-                elapsedMs
-                { ExitCode = 1
-                  StandardOut = ""
-                  StandardError = "fsion: unexpected daemon response" + Environment.NewLine
-                  Diagnostics = [||] }
-        else
-            Console.Error.Write("fsion: unexpected daemon response" + Environment.NewLine)
-            Console.Error.Flush()
-
-        1
+    | Failure message -> emitFailure options elapsedMs message
+    | _ -> emitFailure options elapsedMs "unexpected daemon response"
 
 let private fetchStatus (endpoint: Endpoint) : StatusInfo option =
     match tryConnect endpoint (TimeSpan.FromMilliseconds 250.0) with
@@ -578,7 +559,8 @@ let main argv =
                       Source = path
                       WorkingDirectory = Directory.GetCurrentDirectory()
                       Args = Array.append [| path |] args
-                      Environment = clientEnvironment () }
+                      Environment = environmentSnapshot ()
+                      IncludeDiagnostics = options.Json }
                     elapsedMs
             | RunEval (code, args) ->
                 executeInput
@@ -588,7 +570,8 @@ let main argv =
                       Source = code
                       WorkingDirectory = Directory.GetCurrentDirectory()
                       Args = Array.append [| "eval.fsx" |] args
-                      Environment = clientEnvironment () }
+                      Environment = environmentSnapshot ()
+                      IncludeDiagnostics = options.Json }
                     elapsedMs
             | RunStdin args ->
                 executeInput
@@ -598,7 +581,8 @@ let main argv =
                       Source = readAllStdin ()
                       WorkingDirectory = Directory.GetCurrentDirectory()
                       Args = Array.append [| "stdin.fsx" |] args
-                      Environment = clientEnvironment () }
+                      Environment = environmentSnapshot ()
+                      IncludeDiagnostics = options.Json }
                     elapsedMs
             | Warmup -> runWarmup options endpoint
             | DaemonStart
@@ -606,15 +590,4 @@ let main argv =
             | DaemonRestart
             | DaemonStatus -> runDaemonCommand options endpoint input
         with ex ->
-            if options.Json then
-                writeJsonResult
-                    (elapsedMs ())
-                    { ExitCode = 1
-                      StandardOut = ""
-                      StandardError = "fsion: " + ex.Message + Environment.NewLine
-                      Diagnostics = [||] }
-            else
-                Console.Error.Write("fsion: " + ex.Message + Environment.NewLine)
-                Console.Error.Flush()
-
-            1
+            emitFailure options (elapsedMs ()) ex.Message

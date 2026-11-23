@@ -14,8 +14,10 @@ deliberately out of scope.
   claim cold).
 - A default run dequeues a warm session in ~0 ms. If the pool is empty the run creates a session
   inline (`coldClaims` counter) so executions never stall behind replenishment. The completed run
-  disposes its session and signals the replenisher; a single background task refills to the
-  watermark while the client is already gone.
+  releases its session — disposing `IDisposable` static bindings and running a Gen-0 finalizer
+  sweep synchronously — and signals the replenisher, which unloads and disposes it in the
+  background; a single background task refills to the watermark while the client is already gone,
+  and that task also runs with `--pool-size 0` so pending cleanups are still drained promptly.
 - `fsion warmup` (the `Ping` request) blocks until `poolWarm + pendingCreations >= target`, so a
   warmed daemon has no session-creation cost on the next run's critical path.
 - `Executed` runs remain stateless: every default invocation claims an unused session and disposes
@@ -41,7 +43,8 @@ installs process-wide roots that are never removed:
 
 Independently, each session's collectible `FSI-ASSEMBLY` dynamic assembly keeps its top-level
 bindings and `leaked@` closures in static fields; those statics root undisposed streams and file
-handles, so the Windows locks from clause 3 survive until the fields are nulled. Without cleanup,
+handles, so the Windows locks from clause 3 survive until the bindings are disposed or the fields
+are nulled. Without cleanup,
 30 sequential create/dispose rounds grow the managed heap linearly (~27.3 MB per round,
 `GC.GetTotalMemory(true)`). `fsiond` therefore, per session:
 
@@ -51,20 +54,26 @@ handles, so the Windows locks from clause 3 survive until the fields are nulled.
   misattribute handlers);
 - removes exactly those delegates when the session is released, under the same `creationGate`
   semaphore that serializes session creation, because the runtime events are plain read-modify-write
-  delegate fields and adds/removes must not interleave; a run that cannot take the gate
-  non-blockingly queues its removal for the replenisher/Metrics drain;
+  delegate fields and adds/removes must not interleave; the release path never takes the gate, it
+  queues the removal (together with the session unload) as a `CleanupWork` item drained by the
+  background replenisher — which runs with `--pool-size 0` too — and synchronously by `GetMetrics`
+  before it samples;
 - severs the `TcConfigBuilder` `tryGetMetadataSnapshot*` callback fields and asks the checker to
-  `ClearLanguageServiceRootCachesAndCollectAndFinalizeAllTransients`, breaking the remaining
-  closure chain to the session;
-- nulls the static fields of the session's `FSI-ASSEMBLY` types so undisposed `StreamReader`/
-  `FileStream` objects become collectible and their finalizers can run;
+  `ClearLanguageServiceRootCachesAndCollectAndFinalizeAllTransients` in that drain, breaking the
+  remaining closure chain to the session;
+- on the request thread before the response, disposes every `IDisposable` static binding of the
+  session's `FSI-ASSEMBLY` types (a top-level `let reader = new StreamReader(...)` otherwise keeps
+  its Windows file handle locked, and `initonly` fields cannot be nulled) and nulls the remaining
+  static fields so those objects become collectible and their finalizers can run;
 - clears the two diagnostics `AsyncLocal` values on the thread that created or evaluated the
   session;
 - nulls its strong references to the session, the prelude `state` object, and the cached
   `PropertyInfo`s, and records a `WeakReference` for the `AliveDisposedSessions` metric;
-- runs `GC.Collect(2, Forced, true, true)`, `GC.WaitForPendingFinalizers()`, then collects again
-  before the response is sent, so undisposed `StreamReader`/`FileStream` handles opened by
-  throwaway scripts are finalized and Windows file locks are gone when `fsion` returns.
+- runs `GC.Collect(0, Forced, true, false)` + `GC.WaitForPendingFinalizers()` synchronously on
+  release so throwaway function-local streams also close before the response, and runs the full
+  `GC.Collect(2, Forced, true, true)` + `WaitForPendingFinalizers` + second collect once per
+  cleanup batch in the drain so the collectible assembly really unloads and `AliveDisposedSessions`
+  stays 0.
 
 With the cleanup, 50 sequential create/eval/dispose rounds on the same host kept post-GC managed
 heap at 41.0 → 44.6 MB (all but the last probe session collected), versus 41 → 831 MB without it.
@@ -137,15 +146,16 @@ passing.
 ```
 
 - The throwing `Eval*` APIs construct `FsiCompilationException` with `ErrorInfos = None` in
-  FCS 43.13.101, and their formatted text always starts (after leading blank lines) with
-  `file(line,col): error|warning FSnnnn:` while runtime failures start with the exception type. On a
-  throwing-pass `FsiCompilationException` with that shape, the daemon re-runs the same source once
-  through `EvalInteractionNonThrowing`/`EvalScriptNonThrowing` with console output redirected to
-  discard writers and maps the returned `FSharpDiagnostic` list; a failed compilation never executed
-  user code, so nothing runs twice. Successful runs report an empty array; warnings printed on
-  successful runs stay in the `stderr` text. Rendered compiler text numbers columns from 1, while
-  the JSON `startColumn`/`endColumn` carry FCS's 0-based values (the example above is
-  `eval.fsx(1,15)` in text and columns 14..20 in JSON).
+  FCS 43.13.101, and compile errors print `file(line,col): error FSnnnn:` while a warning can
+  precede a runtime failure. Only when the client asked for diagnostics (`--json`, carried as
+  `ExecuteRequest.IncludeDiagnostics`) and the text contains a compile-error line does the daemon
+  re-run the same source once through `EvalInteractionNonThrowing`/`EvalScriptNonThrowing` with
+  console output redirected to discard writers and map the returned `FSharpDiagnostic` list; a
+  failed compilation never executed user code, so nothing runs twice, and a warning before a
+  runtime failure never triggers a second execution. Successful runs report an empty array;
+  warnings printed on successful runs stay in the `stderr` text. Rendered compiler text numbers
+  columns from 1, while the JSON `startColumn`/`endColumn` carry FCS's 0-based values (the example
+  above is `eval.fsx(1,15)` in text and columns 14..20 in JSON).
 - `elapsedMs` is the client-observed wall time of the whole invocation (process start through the
   daemon response), matching what an agent actually pays.
 - Infra failures (daemon unreachable, unexpected response) still emit the same JSON envelope with

@@ -4,7 +4,7 @@ open System
 open System.IO
 open System.Text
 
-let [<Literal>] ProtocolVersion = 1
+let [<Literal>] ProtocolVersion = 2
 
 let [<Literal>] PipeEnvironmentVariable = "FSION_PIPE"
 
@@ -16,12 +16,22 @@ let [<Literal>] OneShotPipeEnvironmentVariable = "FSION_ONESHOT_PIPE"
 
 let [<Literal>] DefaultIdleTtlMinutes = 30.0
 
+let environmentSnapshot () : (string * string)[] =
+    let variables = Environment.GetEnvironmentVariables()
+
+    [| for entry in variables.Keys do
+         let key = entry :?> string
+
+         if key.Length > 0 && key.IndexOf '=' < 0 then
+             key, string variables.[entry] |]
+
 type ExecuteRequest =
     { Mode: string
       Source: string
       WorkingDirectory: string
       Args: string[]
-      Environment: (string * string)[] }
+      Environment: (string * string)[]
+      IncludeDiagnostics: bool }
 
 type ScriptDiagnostic =
     { Code: string
@@ -89,6 +99,7 @@ let private writeRequestPayload (writer: BinaryWriter) (request: Request) =
         for key, value in payload.Environment do
             writer.Write key
             writer.Write value
+        writer.Write payload.IncludeDiagnostics
     | GetStatus -> writer.Write 2uy
     | GetMetrics -> writer.Write 5uy
     | Shutdown -> writer.Write 3uy
@@ -200,12 +211,14 @@ let parseRequest (payload: byte[]) : Request =
         let args = Array.init count (fun _ -> reader.ReadString())
         let environmentCount = reader.ReadInt32()
         let environment = Array.init environmentCount (fun _ -> reader.ReadString(), reader.ReadString())
+        let includeDiagnostics = reader.ReadBoolean()
         Execute
             { Mode = mode
               Source = source
               WorkingDirectory = workingDirectory
               Args = args
-              Environment = environment }
+              Environment = environment
+              IncludeDiagnostics = includeDiagnostics }
     | 2uy -> GetStatus
     | 5uy -> GetMetrics
     | 3uy -> Shutdown

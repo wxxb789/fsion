@@ -188,6 +188,48 @@ type IsolationTests(output: ITestOutputHelper) =
             Assert.Equal(0, second.AliveDisposedSessions))
 
     [<Fact>]
+    member _.``per-request environment snapshots apply to the run and are restored afterwards`` () =
+        let readSnapshot =
+            "printfn \"%s\" (match System.Environment.GetEnvironmentVariable \"FSION_TEST_SNAPSHOT\" with | null -> \"<null>\" | value -> value)"
+
+        withContext "isolation-env-snapshot" (fun context _ ->
+            let first =
+                context.Run(
+                    [ "-e"; readSnapshot ],
+                    timeoutMs = 120000,
+                    extraEnv = [ "FSION_TEST_SNAPSHOT", "alpha-42" ]
+                )
+
+            Assert.Equal(0, first.ExitCode)
+            Assert.Equal("alpha-42" + Environment.NewLine, first.Stdout)
+
+            let second = context.Run([ "-e"; readSnapshot ], timeoutMs = 60000)
+            Assert.Equal(0, second.ExitCode)
+            Assert.Equal("<null>" + Environment.NewLine, second.Stdout))
+
+    [<Fact>]
+    member _.``pool size zero disables warm sessions and every run claims cold`` () =
+        let poolDisabled = [ "FSION_POOL_SIZE", "0" ]
+
+        withContext "isolation-pool-zero" (fun context _ ->
+            let warmup = context.Run([ "warmup" ], timeoutMs = 180000, extraEnv = poolDisabled)
+            Assert.Equal(0, warmup.ExitCode)
+            Assert.Contains("warm=False", warmup.Stdout)
+
+            let run =
+                context.Run([ "-e"; "printfn \"cold\"" ], timeoutMs = 120000, extraEnv = poolDisabled)
+
+            Assert.Equal(0, run.ExitCode)
+
+            let metrics =
+                context.Metrics(30000)
+                |> Option.defaultWith (fun () -> failwith "fsiond did not answer GetMetrics")
+
+            Assert.Equal(0, metrics.PoolTarget)
+            Assert.Equal(0, metrics.PoolWarm)
+            Assert.True(metrics.ColdClaims >= 1, "expected at least one cold claim, got " + string metrics.ColdClaims))
+
+    [<Fact>]
     member _.``spaced fresh scripts claim warm sessions without cold claims`` () =
         withContext "isolation-pool" (fun context _ ->
             let warmup = context.Run([ "warmup" ], timeoutMs = 180000)

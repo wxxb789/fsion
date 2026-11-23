@@ -1,6 +1,7 @@
 module Fsion.Tests.JsonTests
 
 open System
+open System.IO
 open System.Text.Json
 open Xunit
 open Fsion.Tests.TestInfra
@@ -105,3 +106,25 @@ type JsonTests() =
             Assert.Equal(1, root.GetProperty("exitCode").GetInt32())
             Assert.Contains("boom", root.GetProperty("stderr").GetString())
             Assert.Equal(0, root.GetProperty("diagnostics").GetArrayLength()))
+
+    [<Fact>]
+    member _.``a compile warning before a runtime failure never re-executes the script`` () =
+        withContext "json-warning-runtime" (fun context directory ->
+            let markerPath = Path.Combine(directory, "executed-once.txt")
+
+            let code =
+                String.concat
+                    "\n"
+                    [ "System.IO.File.AppendAllText(@\"" + markerPath + "\", \"once\\n\")"
+                      "match [1] with"
+                      "| [x] -> x |> ignore"
+                      "failwith \"boom\"" ]
+
+            let result = context.Run([ "--json"; "-e"; code ], timeoutMs = 120000)
+            Assert.Equal(1, result.ExitCode)
+            use document = parseSingleJson result.Stdout
+            let root = document.RootElement
+            Assert.Equal(1, root.GetProperty("exitCode").GetInt32())
+            Assert.Contains("boom", root.GetProperty("stderr").GetString())
+            Assert.Equal(0, root.GetProperty("diagnostics").GetArrayLength())
+            Assert.Equal("once\n", File.ReadAllText markerPath))

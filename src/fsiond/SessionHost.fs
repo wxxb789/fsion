@@ -59,7 +59,8 @@ type private WarmSession() =
 
 [<NoComparison; NoEquality>]
 type private CleanupWork =
-    { ProcessExitHandlers: Delegate[]
+    { Session: FsiEvaluationSession option
+      ProcessExitHandlers: Delegate[]
       UnmanagedDllHandlers: Delegate[]
       AssemblyResolveHandlers: Delegate[] }
 
@@ -169,9 +170,10 @@ let private addedAssemblies (before: Assembly[]) (after: Assembly[]) =
         not (before |> Array.exists (fun existing -> Object.ReferenceEquals(existing, candidate))))
 
 // FSI emits one collectible FSI-ASSEMBLY dynamic assembly per session. Static fields on its
-// FSI_000n types hold top-level bindings and leaked@ closures, so they root the assembly and any
-// undisposed streams it captured until they are nulled; only then can GC unload the assembly and
-// run the stream finalizers that release Windows file handles.
+// FSI_000n types hold top-level bindings and leaked@ closures; a top-level
+// `let reader = new StreamReader(...)` keeps its Windows file handle locked until the binding is
+// disposed or the field is nulled (initonly fields cannot be nulled, so they must be disposed).
+// Nulling the rest lets GC unload the assembly and finalize any remaining streams.
 let private clearScriptStatics (assemblies: Assembly[]) =
     for assembly in assemblies do
         try
@@ -179,14 +181,25 @@ let private clearScriptStatics (assemblies: Assembly[]) =
                 for field in scriptType.GetFields(BindingFlags.Static ||| BindingFlags.Public ||| BindingFlags.NonPublic) do
                     if
                         not field.IsLiteral
-                        && not field.IsInitOnly
                         && not field.FieldType.IsValueType
                         && not field.FieldType.IsPointer
                     then
                         try
-                            field.SetValue(null, null)
+                            match field.GetValue null with
+                            | :? IDisposable as disposable ->
+                                try
+                                    disposable.Dispose()
+                                with _ ->
+                                    ()
+                            | _ -> ()
                         with _ ->
                             ()
+
+                        if not field.IsInitOnly then
+                            try
+                                field.SetValue(null, null)
+                            with _ ->
+                                ()
         with _ ->
             ()
 
@@ -211,6 +224,14 @@ let private sweepFinalizers () =
     GC.WaitForPendingFinalizers()
     GC.Collect(2, GCCollectionMode.Forced, true, true)
 
+// Top-level IDisposable bindings are disposed by clearScriptStatics; this Gen-0 sweep finalizes
+// throwaway streams created inside functions so their Windows handles close before the response
+// while the collectible unload (checker caches, session dispose, full sweep) stays off the
+// request's critical path.
+let private sweepTransientFinalizers () =
+    GC.Collect(0, GCCollectionMode.Forced, true, false)
+    GC.WaitForPendingFinalizers()
+
 let private severityText (severity: FSharpDiagnosticSeverity) =
     match severity with
     | FSharpDiagnosticSeverity.Error -> "error"
@@ -231,12 +252,12 @@ let private scriptDiagnostic (diagnostic: FSharpDiagnostic) =
 
 // The throwing Eval* APIs print diagnostics to the session's error writer but construct
 // FsiCompilationException with ErrorInfos = None; only the non-throwing APIs return the
-// diagnostics. Compile diagnostics always start (after the leading blank line) with
-// "file(line,col): error|warning FSnnnn:", while runtime failures start with the exception type,
-// so this anchors the compile-only re-run that collects structured diagnostics without
-// executing user code twice (a failed compilation never ran).
+// diagnostics. A compile error prints "file(line,col): error FSnnnn:" while a warning can
+// precede a runtime failure, so matching errors only keeps the diagnostics re-run from
+// executing user code twice (a failed compilation never ran); clients that did not ask for
+// structured diagnostics skip the re-run entirely.
 let private compileDiagnosticText =
-    Regex(@"\A\s*[^\r\n]*\(\d+,\d+\)[^\r\n]*: (error|warning) FS\d+:", RegexOptions.CultureInvariant)
+    Regex(@"(?m)^[^\r\n]*\(\d+,\d+\)[^\r\n]*: error FS\d+:", RegexOptions.CultureInvariant)
 
 let private sessionArguments =
     [| "fsion"
@@ -270,15 +291,6 @@ let private environmentComparer =
         StringComparer.OrdinalIgnoreCase
     else
         StringComparer.Ordinal
-
-let private environmentSnapshot () =
-    let variables = Environment.GetEnvironmentVariables()
-
-    [| for entry in variables.Keys do
-         let key = entry :?> string
-
-         if key.Length > 0 && key.IndexOf '=' < 0 then
-             key, string variables.[entry] |]
 
 let private applyEnvironment (snapshot: (string * string)[]) =
     let desired = Dictionary<string, string>(environmentComparer)
@@ -425,16 +437,52 @@ type SessionHost(options: SessionHostOptions) =
         removeUnmanagedDll work.UnmanagedDllHandlers
         removeAssemblyResolve work.AssemblyResolveHandlers
 
-    // Handler removal needs creationGate so delegate adds and removes never interleave, but a
-    // run must not stall behind a slow background session creation. The replenisher drains this
-    // queue right after it wakes, and Metrics drains it before sampling.
+    let drainReleasedSessions () =
+        let survivors = ResizeArray<WeakReference>()
+        let mutable weak = Unchecked.defaultof<WeakReference>
+
+        while releasedSessions.TryDequeue(&weak) do
+            if weak.IsAlive then
+                survivors.Add weak
+
+        for survivor in survivors do
+            releasedSessions.Enqueue survivor
+
+        survivors.Count
+
+    let drainPendingCleanups () =
+        let mutable work = Unchecked.defaultof<CleanupWork>
+        let mutable drained = 0
+
+        while pendingCleanups.TryDequeue(&work) do
+            drained <- drained + 1
+
+            match work.Session with
+            | Some session ->
+                detachSessionCallback session
+                clearCheckerCaches session
+                releasedSessions.Enqueue(WeakReference(session))
+
+                try
+                    (session :> IDisposable).Dispose()
+                with _ ->
+                    ()
+            | None -> ()
+
+            removeHandlers work
+
+        if drained > 0 then
+            sweepFinalizers ()
+            drainReleasedSessions () |> ignore
+
+    // Handler removal and collectible-session disposal need creationGate so delegate adds and
+    // removes never interleave, but a run must not stall behind a slow background session
+    // creation. The replenisher drains this queue right after it wakes (it runs with
+    // --pool-size 0 too), and Metrics drains it before sampling.
     let drainCleanups () =
         if creationGate.Wait 0 then
             try
-                let mutable work = Unchecked.defaultof<CleanupWork>
-
-                while pendingCleanups.TryDequeue(&work) do
-                    removeHandlers work
+                drainPendingCleanups ()
             finally
                 creationGate.Release() |> ignore
 
@@ -442,51 +490,21 @@ type SessionHost(options: SessionHostOptions) =
         creationGate.Wait()
 
         try
-            let mutable work = Unchecked.defaultof<CleanupWork>
-
-            while pendingCleanups.TryDequeue(&work) do
-                removeHandlers work
+            drainPendingCleanups ()
         finally
             creationGate.Release() |> ignore
 
     let releaseSession (claimed: WarmSession) =
-        let work =
-            { ProcessExitHandlers = claimed.ProcessExitHandlers
+        clearScriptStatics claimed.ScriptAssemblies
+        clearCompilerAsyncLocals ()
+        sweepTransientFinalizers ()
+
+        pendingCleanups.Enqueue
+            { Session = claimed.Session
+              ProcessExitHandlers = claimed.ProcessExitHandlers
               UnmanagedDllHandlers = claimed.UnmanagedDllHandlers
               AssemblyResolveHandlers = claimed.AssemblyResolveHandlers }
 
-        match claimed.Session with
-        | Some session ->
-            detachSessionCallback session
-            clearCheckerCaches session
-            releasedSessions.Enqueue(WeakReference(session))
-        | None -> ()
-
-        clearScriptStatics claimed.ScriptAssemblies
-
-        try
-            match claimed.Session with
-            | Some session -> (session :> IDisposable).Dispose()
-            | None -> ()
-        with _ ->
-            ()
-
-        let removalReady =
-            if targetPoolSize = 0 then
-                creationGate.Wait()
-                true
-            else
-                creationGate.Wait 0
-
-        if removalReady then
-            try
-                removeHandlers work
-            finally
-                creationGate.Release() |> ignore
-        else
-            pendingCleanups.Enqueue work
-
-        clearCompilerAsyncLocals ()
         claimed.Session <- None
         claimed.State <- None
         claimed.CommandLineArgsProperty <- None
@@ -584,7 +602,7 @@ type SessionHost(options: SessionHostOptions) =
                     errWriter.GetStringBuilder().Length <- markerIndex
 
                 claimed.ExitCodeProperty.Value.GetValue state :?> int, [||]
-            elif compileDiagnosticText.IsMatch(errWriter.ToString()) then
+            elif request.IncludeDiagnostics && compileDiagnosticText.IsMatch(errWriter.ToString()) then
                 1, compileDiagnostics ()
             else
                 1, [||]
@@ -599,23 +617,32 @@ type SessionHost(options: SessionHostOptions) =
             while working && not stopped do
                 if pool.Count + pendingCreations < targetPoolSize then
                     pendingCreations <- pendingCreations + 1
-                    creationGate.Wait()
 
-                    let warm =
+                    let created =
                         try
-                            createWarmSession ()
-                        finally
-                            creationGate.Release() |> ignore
+                            try
+                                creationGate.Wait()
 
-                    pendingCreations <- pendingCreations - 1
-                    pool.Enqueue warm
+                                try
+                                    Some(createWarmSession ())
+                                finally
+                                    creationGate.Release() |> ignore
+                            with ex ->
+                                Log.error None ("replenisher could not create a warm session: " + ex.Message)
+                                Thread.Sleep 200
+                                None
+                        finally
+                            pendingCreations <- pendingCreations - 1
+
+                    match created with
+                    | Some warm -> pool.Enqueue warm
+                    | None -> ()
                 else
                     working <- false
 
     do
-        if targetPoolSize > 0 then
-            Task.Factory.StartNew(replenish, TaskCreationOptions.LongRunning) |> ignore
-            replenishSignal.Release() |> ignore
+        Task.Factory.StartNew(replenish, TaskCreationOptions.LongRunning) |> ignore
+        replenishSignal.Release() |> ignore
 
     member _.EnsureWarm() =
         if targetPoolSize > 0 then
@@ -662,7 +689,6 @@ type SessionHost(options: SessionHostOptions) =
                 processState.Exit ()
         finally
             releaseSession claimed
-            sweepFinalizers ()
             replenishSignal.Release() |> ignore
 
     member _.Metrics() : MetricsInfo =
@@ -670,15 +696,7 @@ type SessionHost(options: SessionHostOptions) =
         sweepFinalizers ()
 
         let scriptAssemblyCount = scriptAssemblies () |> Array.length
-        let survivors = ResizeArray<WeakReference>()
-        let mutable weak = Unchecked.defaultof<WeakReference>
-
-        while releasedSessions.TryDequeue(&weak) do
-            if weak.IsAlive then
-                survivors.Add weak
-
-        for survivor in survivors do
-            releasedSessions.Enqueue survivor
+        let aliveDisposedSessions = drainReleasedSessions ()
 
         { PoolTarget = targetPoolSize
           PoolWarm = pool.Count
@@ -686,4 +704,4 @@ type SessionHost(options: SessionHostOptions) =
           Executed = executed.Value
           ManagedHeapBytes = GC.GetTotalMemory true
           ScriptAssemblies = scriptAssemblyCount
-          AliveDisposedSessions = survivors.Count }
+          AliveDisposedSessions = aliveDisposedSessions }

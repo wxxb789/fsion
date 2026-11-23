@@ -12,6 +12,7 @@ open Fsiond.Server
 type private Options =
     { Endpoint: Endpoint
       IdleTtlMinutes: float
+      SessionTtlMinutes: float
       Oneshot: bool
       PoolSize: int
       LogPath: string option }
@@ -23,6 +24,8 @@ let private parse (argv: string[]) =
     let mutable endpointSet = false
     let mutable idleTtlMinutes = DefaultIdleTtlMinutes
     let mutable idleTtlSet = false
+    let mutable sessionTtlMinutes = DefaultSessionTtlMinutes
+    let mutable sessionTtlSet = false
     let mutable oneshot = false
     let mutable poolSize = defaultPoolSize
     let mutable poolSizeSet = false
@@ -47,6 +50,13 @@ let private parse (argv: string[]) =
             | true, value when value >= 0 ->
                 poolSize <- value
                 poolSizeSet <- true
+                index <- index + 2
+            | _ -> valid <- false
+        | "--session-ttl" when index + 1 < argv.Length ->
+            match Double.TryParse(argv.[index + 1], NumberStyles.Float, CultureInfo.InvariantCulture) with
+            | true, value when value > 0.0 ->
+                sessionTtlMinutes <- value
+                sessionTtlSet <- true
                 index <- index + 2
             | _ -> valid <- false
         | "--oneshot" ->
@@ -87,39 +97,58 @@ let private parse (argv: string[]) =
                     match Int32.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture) with
                     | true, parsed when parsed >= 0 -> parsed
                     | _ -> poolSize
+        let envSessionTtl =
+            if sessionTtlSet then
+                sessionTtlMinutes
+            else
+                match Environment.GetEnvironmentVariable SessionTtlEnvironmentVariable with
+                | null | "" -> sessionTtlMinutes
+                | value ->
+                    match Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture) with
+                    | true, parsed when parsed > 0.0 -> parsed
+                    | _ -> sessionTtlMinutes
         Some
             { Endpoint = { Name = envEndpoint }
               IdleTtlMinutes = envTtl
+              SessionTtlMinutes = envSessionTtl
               Oneshot = oneshot
               PoolSize = envPoolSize
               LogPath = logPath }
 
-let private runDaemon (options: Options) =
-    let serverOptions =
+let private runDaemon (options: Options) (releaseOwnership: unit -> unit) =
+    let serverOptions: Server.Options =
         { Endpoint = options.Endpoint
-          IdleTtlMs = int64 (TimeSpan.FromMinutes(options.IdleTtlMinutes).TotalMilliseconds)
+          IdleTtlMinutes = options.IdleTtlMinutes
+          SessionTtlMinutes = options.SessionTtlMinutes
           Oneshot = options.Oneshot
           PoolSize = options.PoolSize
           LogPath = options.LogPath }
     let listener = createListener options.Endpoint
-    Server.run serverOptions listener
+    Server.run serverOptions listener releaseOwnership
 
 [<EntryPoint>]
 let main argv =
     Ambient.install ()
+
     match parse argv with
     | None -> 1
-    | Some options when options.Oneshot -> runDaemon options
+    | Some options when options.Oneshot -> runDaemon options ignore
     | Some options ->
         if isWindows then
-            let mutexName = "Local\\fsion-mutex-" + sanitizeName options.Endpoint.Name
+            let ownershipName = "Local\\fsion-endpoint-" + sanitizeName options.Endpoint.Name
             let mutable createdNew = false
-            use mutex = new Mutex(true, mutexName, &createdNew)
+            let ownership = new Semaphore(1, 1, ownershipName, &createdNew)
+
             if not createdNew then
+                ownership.Dispose()
                 Log.info options.LogPath "another fsiond owns this endpoint; exiting"
                 0
             else
-                runDaemon options
+                runDaemon options (fun () ->
+                    try
+                        ownership.Dispose()
+                    with _ ->
+                        ())
         else
             let path = socketPath options.Endpoint
             let ownedByOther =
@@ -140,4 +169,4 @@ let main argv =
                 Log.info options.LogPath "another fsiond owns this endpoint; exiting"
                 0
             else
-                runDaemon options
+                runDaemon options ignore

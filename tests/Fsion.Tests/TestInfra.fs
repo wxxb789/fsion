@@ -166,6 +166,10 @@ type FsionContext(workingDirectory: string) =
         let environment = baseEnvironment @ (defaultArg extraEnv [])
         runProcess fsionBinary args workingDirectory environment stdin (defaultArg timeoutMs 90000)
 
+    member _.Endpoint = endpoint
+
+    member _.Environment = baseEnvironment
+
     member _.Metrics(timeoutMs: int) : MetricsInfo option =
         match Ipc.tryConnect { Name = endpoint } (TimeSpan.FromMilliseconds(float timeoutMs)) with
         | None -> None

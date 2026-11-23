@@ -1,10 +1,13 @@
 module Fsion.Ipc
 
 open System
+open System.ComponentModel
+open System.Diagnostics
 open System.IO
 open System.IO.Pipes
 open System.Net.Sockets
 open System.Runtime.InteropServices
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 
@@ -157,3 +160,141 @@ let createListener (endpoint: Endpoint) : IListener =
         new WindowsListener(endpoint.Name) :> IListener
     else
         new UnixListener(socketPath endpoint) :> IListener
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type StartupInfo =
+    val mutable Cb: uint32
+    val mutable Reserved: nativeint
+    val mutable Desktop: nativeint
+    val mutable Title: nativeint
+    val mutable X: uint32
+    val mutable Y: uint32
+    val mutable XSize: uint32
+    val mutable YSize: uint32
+    val mutable XCountChars: uint32
+    val mutable YCountChars: uint32
+    val mutable FillAttribute: uint32
+    val mutable Flags: uint32
+    val mutable ShowWindow: uint16
+    val mutable Reserved2: uint16
+    val mutable Reserved2Ptr: nativeint
+    val mutable StdInput: nativeint
+    val mutable StdOutput: nativeint
+    val mutable StdError: nativeint
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type ProcessInformation =
+    val mutable Process: nativeint
+    val mutable Thread: nativeint
+    val mutable ProcessId: uint32
+    val mutable ThreadId: uint32
+
+[<DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)>]
+extern bool CreateProcessW(
+    string applicationName,
+    string commandLine,
+    nativeint processAttributes,
+    nativeint threadAttributes,
+    bool inheritHandles,
+    uint32 creationFlags,
+    nativeint environment,
+    string currentDirectory,
+    StartupInfo& startupInfo,
+    ProcessInformation& processInformation
+)
+
+[<DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)>]
+extern bool CloseHandle(nativeint handle)
+
+let private quoteWindowsArgument (value: string) =
+    if value.Length = 0 then
+        "\"\""
+    elif not (value.Contains ' ' || value.Contains '\t' || value.Contains '"') then
+        value
+    else
+        let builder = StringBuilder()
+        builder.Append '"' |> ignore
+        let mutable backslashes = 0
+
+        for character in value do
+            match character with
+            | '\\' -> backslashes <- backslashes + 1
+            | '"' ->
+                builder.Append('\\', backslashes * 2 + 1).Append '"' |> ignore
+                backslashes <- 0
+            | _ ->
+                builder.Append('\\', backslashes).Append character |> ignore
+                backslashes <- 0
+
+        builder.Append('\\', backslashes * 2).Append '"' |> ignore
+        builder.ToString()
+
+// Process.Start sets bInheritHandles=true on Windows, so a long-lived child would inherit
+// the caller's stdout/stderr pipe write ends and keep a redirected ReadToEnd blocked after
+// the caller exits. CreateProcessW with bInheritHandles=false leaves the child detached.
+let private spawnDetachedWindows (executable: string) (arguments: string list) =
+    let commandLine = executable :: arguments |> List.map quoteWindowsArgument |> String.concat " "
+    let mutable startupInfo = Unchecked.defaultof<StartupInfo>
+    startupInfo.Cb <- uint32 (Marshal.SizeOf<StartupInfo>())
+    let mutable processInformation = Unchecked.defaultof<ProcessInformation>
+    let creationFlags = 0x08000000u ||| 0x00000008u
+
+    let created =
+        CreateProcessW(
+            executable,
+            commandLine,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            false,
+            creationFlags,
+            IntPtr.Zero,
+            Path.GetDirectoryName executable,
+            &startupInfo,
+            &processInformation
+        )
+
+    if not created then
+        raise (Win32Exception(Marshal.GetLastWin32Error(), "failed to start " + executable))
+
+    if processInformation.Process <> IntPtr.Zero then
+        CloseHandle processInformation.Process |> ignore
+
+    if processInformation.Thread <> IntPtr.Zero then
+        CloseHandle processInformation.Thread |> ignore
+
+let private spawnDetachedManaged (executable: string) (arguments: string list) =
+    let startInfo = ProcessStartInfo(executable)
+    startInfo.UseShellExecute <- false
+    startInfo.CreateNoWindow <- true
+    startInfo.RedirectStandardOutput <- true
+    startInfo.RedirectStandardError <- true
+    startInfo.RedirectStandardInput <- true
+    startInfo.WorkingDirectory <- Path.GetDirectoryName executable
+
+    for argument in arguments do
+        startInfo.ArgumentList.Add argument
+
+    let child = Process.Start startInfo
+
+    if isNull child then
+        raise (InvalidOperationException("failed to start " + executable))
+
+    Task.Run(fun () ->
+        try
+            child.StandardOutput.ReadToEnd() |> ignore
+        with _ ->
+            ())
+    |> ignore
+
+    Task.Run(fun () ->
+        try
+            child.StandardError.ReadToEnd() |> ignore
+        with _ ->
+            ())
+    |> ignore
+
+let spawnDetached (executable: string) (arguments: string list) =
+    if isWindows then
+        spawnDetachedWindows executable arguments
+    else
+        spawnDetachedManaged executable arguments

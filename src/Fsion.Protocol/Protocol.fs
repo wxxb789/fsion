@@ -4,7 +4,7 @@ open System
 open System.IO
 open System.Text
 
-let [<Literal>] ProtocolVersion = 2
+let [<Literal>] ProtocolVersion = 3
 
 let [<Literal>] PipeEnvironmentVariable = "FSION_PIPE"
 
@@ -12,9 +12,13 @@ let [<Literal>] IdleTtlEnvironmentVariable = "FSION_IDLE_TTL_MINUTES"
 
 let [<Literal>] PoolSizeEnvironmentVariable = "FSION_POOL_SIZE"
 
+let [<Literal>] SessionTtlEnvironmentVariable = "FSION_SESSION_TTL_MINUTES"
+
 let [<Literal>] OneShotPipeEnvironmentVariable = "FSION_ONESHOT_PIPE"
 
 let [<Literal>] DefaultIdleTtlMinutes = 30.0
+
+let [<Literal>] DefaultSessionTtlMinutes = 15.0
 
 let environmentSnapshot () : (string * string)[] =
     let variables = Environment.GetEnvironmentVariables()
@@ -31,7 +35,10 @@ type ExecuteRequest =
       WorkingDirectory: string
       Args: string[]
       Environment: (string * string)[]
-      IncludeDiagnostics: bool }
+      IncludeDiagnostics: bool
+      SessionId: string option
+      Reset: bool
+      TimeoutMs: int }
 
 type ScriptDiagnostic =
     { Code: string
@@ -48,7 +55,8 @@ type ExecutionResult =
     { ExitCode: int
       StandardOut: string
       StandardError: string
-      Diagnostics: ScriptDiagnostic[] }
+      Diagnostics: ScriptDiagnostic[]
+      TimedOut: bool }
 
 type StatusInfo =
     { Pid: int
@@ -65,7 +73,8 @@ type MetricsInfo =
       Executed: int
       ManagedHeapBytes: int64
       ScriptAssemblies: int
-      AliveDisposedSessions: int }
+      AliveDisposedSessions: int
+      NamedSessions: int }
 
 type Request =
     | Execute of ExecuteRequest
@@ -100,6 +109,14 @@ let private writeRequestPayload (writer: BinaryWriter) (request: Request) =
             writer.Write key
             writer.Write value
         writer.Write payload.IncludeDiagnostics
+        writer.Write payload.SessionId.IsSome
+
+        match payload.SessionId with
+        | Some sessionId -> writer.Write sessionId
+        | None -> ()
+
+        writer.Write payload.Reset
+        writer.Write payload.TimeoutMs
     | GetStatus -> writer.Write 2uy
     | GetMetrics -> writer.Write 5uy
     | Shutdown -> writer.Write 3uy
@@ -113,6 +130,7 @@ let private writeResponsePayload (writer: BinaryWriter) (response: Response) =
         writer.Write result.ExitCode
         writer.Write result.StandardOut
         writer.Write result.StandardError
+        writer.Write result.TimedOut
         writer.Write result.Diagnostics.Length
         for diagnostic in result.Diagnostics do
             writer.Write diagnostic.Code
@@ -141,6 +159,7 @@ let private writeResponsePayload (writer: BinaryWriter) (response: Response) =
         writer.Write metrics.ManagedHeapBytes
         writer.Write metrics.ScriptAssemblies
         writer.Write metrics.AliveDisposedSessions
+        writer.Write metrics.NamedSessions
     | ShuttingDown -> writer.Write 13uy
     | Pong -> writer.Write 14uy
     | Failure message ->
@@ -212,13 +231,20 @@ let parseRequest (payload: byte[]) : Request =
         let environmentCount = reader.ReadInt32()
         let environment = Array.init environmentCount (fun _ -> reader.ReadString(), reader.ReadString())
         let includeDiagnostics = reader.ReadBoolean()
+        let hasSession = reader.ReadBoolean()
+        let sessionId = if hasSession then Some(reader.ReadString()) else None
+        let reset = reader.ReadBoolean()
+        let timeoutMs = reader.ReadInt32()
         Execute
             { Mode = mode
               Source = source
               WorkingDirectory = workingDirectory
               Args = args
               Environment = environment
-              IncludeDiagnostics = includeDiagnostics }
+              IncludeDiagnostics = includeDiagnostics
+              SessionId = sessionId
+              Reset = reset
+              TimeoutMs = timeoutMs }
     | 2uy -> GetStatus
     | 5uy -> GetMetrics
     | 3uy -> Shutdown
@@ -234,6 +260,7 @@ let parseResponse (payload: byte[]) : Response =
         let exitCode = reader.ReadInt32()
         let standardOut = reader.ReadString()
         let standardError = reader.ReadString()
+        let timedOut = reader.ReadBoolean()
         let diagnosticsCount = reader.ReadInt32()
         let diagnostics =
             Array.init diagnosticsCount (fun _ ->
@@ -250,7 +277,8 @@ let parseResponse (payload: byte[]) : Response =
             { ExitCode = exitCode
               StandardOut = standardOut
               StandardError = standardError
-              Diagnostics = diagnostics }
+              Diagnostics = diagnostics
+              TimedOut = timedOut }
     | 12uy ->
         let pid = reader.ReadInt32()
         let endpoint = reader.ReadString()
@@ -273,6 +301,7 @@ let parseResponse (payload: byte[]) : Response =
         let managedHeapBytes = reader.ReadInt64()
         let scriptAssemblies = reader.ReadInt32()
         let aliveDisposedSessions = reader.ReadInt32()
+        let namedSessions = reader.ReadInt32()
         Metrics
             { PoolTarget = poolTarget
               PoolWarm = poolWarm
@@ -280,7 +309,8 @@ let parseResponse (payload: byte[]) : Response =
               Executed = executed
               ManagedHeapBytes = managedHeapBytes
               ScriptAssemblies = scriptAssemblies
-              AliveDisposedSessions = aliveDisposedSessions }
+              AliveDisposedSessions = aliveDisposedSessions
+              NamedSessions = namedSessions }
     | 13uy -> ShuttingDown
     | 14uy -> Pong
     | 15uy -> Failure(reader.ReadString())

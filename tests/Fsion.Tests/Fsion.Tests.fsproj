@@ -12,6 +12,8 @@
     <Compile Include="HygieneTests.fs" />
     <Compile Include="IsolationTests.fs" />
     <Compile Include="JsonTests.fs" />
+    <Compile Include="SessionTests.fs" />
+    <Compile Include="RecoveryTests.fs" />
     <Compile Include="LatencyTests.fs" />
   </ItemGroup>
   <ItemGroup>

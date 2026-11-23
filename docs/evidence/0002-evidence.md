@@ -25,8 +25,8 @@ Recorded run on this tree: **exit code 0**.
 | `dotnet build fsion.slnx -c Release` | Build succeeded, 0 warnings, 0 errors |
 | `dotnet publish src/fsion -c Release -f net10.0` | exit 0, `artifacts/publish/fsion/net10.0/fsion.exe` (4,102,144 bytes) |
 | `dotnet publish src/fsion -c Release -f net11.0` | exit 0, `artifacts/publish/fsion/net11.0/fsion.exe` (4,127,744 bytes) |
-| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 51, Skipped 0, Total 51, 8 m 17 s |
-| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 51, Skipped 0, Total 51, 8 m 7 s |
+| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 52, Skipped 0, Total 52, 8 m 8 s |
+| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 52, Skipped 0, Total 52, 7 m 53 s |
 | `Assert-LineEndings` | `line endings: 40 tracked and 40 non-ignored files clean` |
 
 The only `warning` line anywhere in the gate log is the summary literal `0 Warning(s)`;
@@ -40,8 +40,8 @@ Focused detailed runs, used for the per-clause transcripts below:
 
 | Command (add `tests/Fsion.Tests/Fsion.Tests.fsproj -c Release -f <tfm>`) | Result |
 |---|---|
-| `--filter "FullyQualifiedName~IsolationTests\|FullyQualifiedName~JsonTests\|FullyQualifiedName~LatencyTests" --logger "console;verbosity=detailed"` (net10.0) | exit 0, 16/16, 3 m 24 s |
-| same (net11.0) | exit 0, 16/16, 2 m 57 s |
+| `--filter "FullyQualifiedName~IsolationTests\|FullyQualifiedName~JsonTests\|FullyQualifiedName~LatencyTests" --logger "console;verbosity=detailed"` (net10.0) | exit 0, 17/17, 3 m 5 s |
+| same (net11.0) | exit 0, 17/17, 3 m 6 s |
 
 ## Clause 1 — stateless fission isolation
 
@@ -119,13 +119,13 @@ are disposed synchronously, and the daemon pid survives.
 ## Clause 4 — collectible memory stability
 
 `IsolationTests` `fifty unique scripts keep the daemon post-GC heap bounded and unload script
-assemblies` (Passed [49 s net10.0 / 44 s net11.0]) runs 10 unique scripts, samples `GetMetrics`,
+assemblies` (Passed [45 s net10.0 / 45 s net11.0]) runs 10 unique scripts, samples `GetMetrics`,
 then 40 more unique scripts and samples again. Measured values:
 
 | TFM | post-GC heap before → after | Δ over 40 runs | loaded `FSI-ASSEMBLY` | `AliveDisposedSessions` | `ColdClaims` | `PoolWarm` |
 |---|---|---|---|---|---|---|
-| net10.0 | 114,466,536 → 126,026,800 B | +11,559,464 B | 3 → 3 | 0 | 12 | 3 |
-| net11.0 | 115,598,960 → 114,669,256 B | −929,704 B | 3 → 3 | 0 | 11 | 3 |
+| net10.0 | 114,785,752 → 113,660,280 B | −1,125,472 B | 3 → 3 | 0 | 11 | 3 |
+| net11.0 | 115,852,296 → 114,149,800 B | −1,702,496 B | 3 → 3 | 0 | 12 | 3 |
 
 Assertions in the test: daemon pid unchanged, `Executed` advances by exactly 40, heap growth
 < 64 MiB, post-GC heap < 400 MiB, loaded script assemblies ≤ `PoolTarget + 1`, and
@@ -140,11 +140,12 @@ and the `TcConfigBuilder` callback closure — 30 create/dispose rounds grew the
 
 ## Clause 5 — structured `--json` contract
 
-`JsonTests` (7/7 passed in both detailed runs, 6–9 s each; both TFMs in the gate): success
+`JsonTests` (8/8 passed in both detailed runs, 5–9 s each; both TFMs in the gate): success
 envelope with `stdout`/`stderr`/`elapsedMs`/empty diagnostics; unicode and newline
 round-trip; `FS0001` with exact span; `FS0039`; file-mode error with the script name; runtime
 failure still one valid document; compile warning before a runtime failure executes the script
-once.
+once; a runtime failure whose `stderr` mimics a compiler error executes the script once and
+reports no diagnostics.
 
 Live transcripts (net11.0, endpoint `fsion-evidence-0002-1795399844`):
 
@@ -155,6 +156,7 @@ Live transcripts (net11.0, endpoint `fsion-evidence-0002-1795399844`):
 | `fsion --json -e 'printfn "%d" secret'` | `{"exitCode":1,...,"diagnostics":[{"code":"FS0039","number":39,"severity":"error",...,"file":"eval.fsx","startLine":1,"startColumn":13,"endLine":1,"endColumn":19}]}` | 1 |
 | `fsion --json bad.fsx` | `{"exitCode":1,"stdout":"","diagnostics":[{"code":"FS0001",...,"file":"Q:\\repos\\fsion\\artifacts\\evidence-0002\\bad.fsx","startLine":2,"startColumn":14,"endLine":2,"endColumn":20}]}` | 1 |
 | `fsion --json -e` (appends `"once"` to a marker file, emits a warning, then `failwith "boom"`) | `{"exitCode":1,...,"diagnostics":[]}`; marker file still exactly `once\n` (the script ran once, not twice) | 1 |
+| `fsion --json -e` (appends `"once"` to a marker file, `eprintfn`s a fake `eval.fsx(1,1): error FS0001:` line, then `failwith`s a fake `eval.fsx(2,3): error FS0039:` exception) | `{"exitCode":1,...,"diagnostics":[]}`; marker file still exactly `once\n` (the emitted-type delta proves the script ran once) | 1 |
 
 Notes: `elapsedMs` is client-observed wall time (5658 ms for the auto-started cold daemon
 run and 2224 ms when the run paid a cold session claim in this capture; current warm `-e`
@@ -163,22 +165,26 @@ is FCS's 0-based column (`14`) while the rendered text says `eval.fsx(1,15)`; th
 both. `Utf8JsonWriter` escapes `'` as `\u0027`, which `JsonDocument.Parse` accepts. The
 document is written with no trailing newline, so `--json` stdout is exactly one JSON object.
 For `FS0001`/`FS0039`, the throwing `Eval*` call raises `FsiCompilationException` with
-`ErrorInfos = None` in FCS 43.13.101, and no structured diagnostics come back, so for `--json`
-clients (`ExecuteRequest.IncludeDiagnostics`) whose text contains a `: error FS\d+:` line the
-daemon re-runs the source once through the non-throwing API with console output redirected to a
-discard writer; a compile error never executed user code, and a warning before a runtime failure
-never triggers the re-run.
+`ErrorInfos = None` in FCS 43.13.101, so no structured diagnostics come back from the throwing
+pass. For `--json` clients (`ExecuteRequest.IncludeDiagnostics`) the daemon compares the
+session's `DynamicAssemblies` emitted-type count with the count taken before the run: a failed
+compilation emits no CLR type (`emittedTypeCount () = typesBeforeRun`), while any interaction
+or script that compiled — even a comment-only file — emits its types before executing. Only
+when the count is unchanged does the daemon re-run the source once through the non-throwing API
+with console output redirected to a discard writer; the emitted-type delta proves no user IL
+ever ran, so the re-run can never execute script code twice no matter what the `stderr` text
+contains, and a warning before a runtime failure never triggers the re-run.
 
 ## Clause 6 — warm pool latency
 
 `IsolationTests` `spaced fresh scripts claim warm sessions without cold claims` (Passed
-[19 s net10.0 / 13 s net11.0]) waits until `Metrics.PoolWarm >= 1` before each of 5 freshly
+[14 s net10.0 / 12 s net11.0]) waits until `Metrics.PoolWarm >= 1` before each of 5 freshly
 generated, unseen `-e` scripts:
 
 | TFM | run wall times (ms) | median (ms) | `PoolTarget` | `ColdClaims` | `Executed` |
 |---|---|---|---|---|---|
-| net10.0 | 266.9141, 118.9179, 105.9747, 124.2625, 276.3215 | 124.2625 | 3 | 0 | 5 |
-| net11.0 | 172.9895, 82.1001, 90.5482, 98.0793, 92.5377 | 92.5377 | 3 | 0 | 5 |
+| net10.0 | 183.6247, 86.6131, 82.5087, 87.9193, 89.8781 | 87.9193 | 3 | 0 | 5 |
+| net11.0 | 319.4641, 85.3425, 85.8572, 83.9408, 90.8835 | 85.8572 | 3 | 0 | 5 |
 
 `ColdClaims = 0` proves those runs took pre-warmed sessions from the pool and paid no
 session-creation cost on the caller's critical path. Whole-invocation latency against
@@ -186,8 +192,8 @@ session-creation cost on the caller's critical path. Whole-invocation latency ag
 
 | TFM | fsion median (ms) | `dotnet fsi` median (ms) | speedup | floor asserted by the test |
 |---|---|---|---|---|
-| net10.0 | 416.1275 | 3628.799 | 8.72x | 5x |
-| net11.0 | 538.0204 | 4047.2505 | 7.52x | 5x |
+| net10.0 | 381.4946 | 3387.6518 | 8.88x | 5x |
+| net11.0 | 563.7276 | 3691.8155 | 6.55x | 5x |
 
 Pool watermark configuration is live-verified (`fsiond` + `fsion daemon status`):
 
@@ -203,11 +209,11 @@ Pool watermark configuration is live-verified (`fsiond` + `fsion daemon status`)
   `AsyncLocal` clearing, and a Gen-0 finalizer sweep on the caller's critical path; the
   checker-cache clearing, session dispose, handler removal, and full `GC.Collect(2, ...)`
   sweep now run on the background replenisher (`GetMetrics` drains them synchronously), so the
-  clause-6 spaced `-e` medians are 92.5–124.3 ms here versus ~350–515 ms before the split.
+  clause-6 spaced `-e` medians are 85.9–87.9 ms here versus ~350–515 ms before the split.
   Back-to-back `LatencyTests` rounds outpace the single replenisher (each round queues one
   cleanup batch, and a cold claim can wait for the drain plus a new session), so those medians
-  stay 416–538 ms. The formal `>= 20x` benchmark gate remains Goal 0005; this goal's asserted
-  floor is 5x, measured 7.52–8.72x.
+  stay 381.5–563.7 ms. The formal `>= 20x` benchmark gate remains Goal 0005; this goal's asserted
+  floor is 5x, measured 6.55–8.88x.
 - Rapid back-to-back runs can still claim cold sessions while the single replenisher refills
   (`ColdClaims = 11–12` across the 50-run loop); spaced runs claim warm (clause 6). A run never
   stalls behind replenishment by design.

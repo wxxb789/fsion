@@ -146,16 +146,20 @@ passing.
 ```
 
 - The throwing `Eval*` APIs construct `FsiCompilationException` with `ErrorInfos = None` in
-  FCS 43.13.101, and compile errors print `file(line,col): error FSnnnn:` while a warning can
-  precede a runtime failure. Only when the client asked for diagnostics (`--json`, carried as
-  `ExecuteRequest.IncludeDiagnostics`) and the text contains a compile-error line does the daemon
-  re-run the same source once through `EvalInteractionNonThrowing`/`EvalScriptNonThrowing` with
-  console output redirected to discard writers and map the returned `FSharpDiagnostic` list; a
-  failed compilation never executed user code, so nothing runs twice, and a warning before a
-  runtime failure never triggers a second execution. Successful runs report an empty array;
-  warnings printed on successful runs stay in the `stderr` text. Rendered compiler text numbers
-  columns from 1, while the JSON `startColumn`/`endColumn` carry FCS's 0-based values (the example
-  above is `eval.fsx(1,15)` in text and columns 14..20 in JSON).
+  FCS 43.13.101, so the throwing pass returns no structured diagnostics. FCS aborts a failed
+  compilation before emitting any CLR type, while every interaction or script that compiles —
+  even a comment-only file — emits its types into `session.DynamicAssemblies` before executing.
+  Only when the client asked for diagnostics (`--json`, carried as
+  `ExecuteRequest.IncludeDiagnostics`) and the emitted-type count is unchanged
+  (`emittedTypeCount () = typesBeforeRun`, i.e. `compiledAndEnteredRuntime = false`) does the
+  daemon re-run the same source once through `EvalInteractionNonThrowing`/`EvalScriptNonThrowing`
+  with console output redirected to discard writers and map the returned `FSharpDiagnostic` list;
+  the delta proves no user IL ever ran, so the re-run can never execute script code twice no
+  matter what the `stderr` text contains, and a warning before a runtime failure never triggers a
+  second execution. Successful runs report an empty array; warnings printed on successful runs
+  stay in the `stderr` text. Rendered compiler text numbers columns from 1, while the JSON
+  `startColumn`/`endColumn` carry FCS's 0-based values (the example above is `eval.fsx(1,15)` in
+  text and columns 14..20 in JSON).
 - `elapsedMs` is the client-observed wall time of the whole invocation (process start through the
   daemon response), matching what an agent actually pays.
 - Infra failures (daemon unreachable, unexpected response) still emit the same JSON envelope with

@@ -128,3 +128,24 @@ type JsonTests() =
             Assert.Contains("boom", root.GetProperty("stderr").GetString())
             Assert.Equal(0, root.GetProperty("diagnostics").GetArrayLength())
             Assert.Equal("once\n", File.ReadAllText markerPath))
+
+    [<Fact>]
+    member _.``a runtime failure whose stderr mimics a compiler error never re-executes the script`` () =
+        withContext "json-fake-diagnostic" (fun context directory ->
+            let markerPath = Path.Combine(directory, "executed-once.txt")
+
+            let code =
+                String.concat
+                    "\n"
+                    [ "System.IO.File.AppendAllText(@\"" + markerPath + "\", \"once\\n\")"
+                      "eprintfn \"eval.fsx(1,1): error FS0001: fake diagnostic\""
+                      "failwith \"eval.fsx(2,3): error FS0039: fake exception\"" ]
+
+            let result = context.Run([ "--json"; "-e"; code ], timeoutMs = 120000)
+            Assert.Equal(1, result.ExitCode)
+            use document = parseSingleJson result.Stdout
+            let root = document.RootElement
+            Assert.Equal(1, root.GetProperty("exitCode").GetInt32())
+            Assert.Equal(0, root.GetProperty("diagnostics").GetArrayLength())
+            Assert.Contains("fake exception", root.GetProperty("stderr").GetString())
+            Assert.Equal("once\n", File.ReadAllText markerPath))

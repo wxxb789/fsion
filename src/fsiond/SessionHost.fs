@@ -8,7 +8,6 @@ open System.IO
 open System.Reflection
 open System.Runtime.Loader
 open System.Text
-open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
 open FSharp.Compiler.Diagnostics
@@ -55,7 +54,6 @@ type private WarmSession() =
     member val ProcessExitHandlers: Delegate[] = [||] with get, set
     member val UnmanagedDllHandlers: Delegate[] = [||] with get, set
     member val AssemblyResolveHandlers: Delegate[] = [||] with get, set
-    member val ScriptAssemblies: Assembly[] = [||] with get, set
 
 [<NoComparison; NoEquality>]
 type private CleanupWork =
@@ -164,11 +162,6 @@ let private scriptAssemblies () =
         let name = assembly.FullName
         not (isNull name) && name.StartsWith("FSI-", StringComparison.Ordinal))
 
-let private addedAssemblies (before: Assembly[]) (after: Assembly[]) =
-    after
-    |> Array.filter (fun candidate ->
-        not (before |> Array.exists (fun existing -> Object.ReferenceEquals(existing, candidate))))
-
 // FSI emits one collectible FSI-ASSEMBLY dynamic assembly per session. Static fields on its
 // FSI_000n types hold top-level bindings and leaked@ closures; a top-level
 // `let reader = new StreamReader(...)` keeps its Windows file handle locked until the binding is
@@ -252,13 +245,7 @@ let private scriptDiagnostic (diagnostic: FSharpDiagnostic) =
 
 // The throwing Eval* APIs print diagnostics to the session's error writer but construct
 // FsiCompilationException with ErrorInfos = None; only the non-throwing APIs return the
-// diagnostics. A compile error prints "file(line,col): error FSnnnn:" while a warning can
-// precede a runtime failure, so matching errors only keeps the diagnostics re-run from
-// executing user code twice (a failed compilation never ran); clients that did not ask for
-// structured diagnostics skip the re-run entirely.
-let private compileDiagnosticText =
-    Regex(@"(?m)^[^\r\n]*\(\d+,\d+\)[^\r\n]*: error FS\d+:", RegexOptions.CultureInvariant)
-
+// diagnostics. Clients that did not ask for structured diagnostics skip the re-run entirely.
 let private sessionArguments =
     [| "fsion"
        "--nologo"
@@ -380,7 +367,6 @@ type SessionHost(options: SessionHostOptions) =
         let processExitBefore = processExitSnapshot ()
         let unmanagedDllBefore = unmanagedDllSnapshot ()
         let assemblyResolveBefore = assemblyResolveSnapshot ()
-        let assembliesBefore = scriptAssemblies ()
         let settings = Settings()
         let config = FsiEvaluationSession.GetDefaultConfiguration(settings, false)
 
@@ -397,7 +383,6 @@ type SessionHost(options: SessionHostOptions) =
         let processExitHandlers = addedHandlers processExitBefore (processExitSnapshot ())
         let unmanagedDllHandlers = addedHandlers unmanagedDllBefore (unmanagedDllSnapshot ())
         let assemblyResolveHandlers = addedHandlers assemblyResolveBefore (assemblyResolveSnapshot ())
-        let ownAssemblies = addedAssemblies assembliesBefore (scriptAssemblies ())
         let exitMarker = "@@FSION-EXIT-" + Guid.NewGuid().ToString("N") + "@@"
         session.EvalInteraction(prelude exitMarker)
         let state =
@@ -417,7 +402,6 @@ type SessionHost(options: SessionHostOptions) =
         warm.ProcessExitHandlers <- processExitHandlers
         warm.UnmanagedDllHandlers <- unmanagedDllHandlers
         warm.AssemblyResolveHandlers <- assemblyResolveHandlers
-        warm.ScriptAssemblies <- ownAssemblies
         warm
 
     let claimSession () : WarmSession =
@@ -495,7 +479,10 @@ type SessionHost(options: SessionHostOptions) =
             creationGate.Release() |> ignore
 
     let releaseSession (claimed: WarmSession) =
-        clearScriptStatics claimed.ScriptAssemblies
+        match claimed.Session with
+        | Some session -> clearScriptStatics session.DynamicAssemblies
+        | None -> ()
+
         clearCompilerAsyncLocals ()
         sweepTransientFinalizers ()
 
@@ -513,7 +500,6 @@ type SessionHost(options: SessionHostOptions) =
         claimed.ProcessExitHandlers <- [||]
         claimed.UnmanagedDllHandlers <- [||]
         claimed.AssemblyResolveHandlers <- [||]
-        claimed.ScriptAssemblies <- [||]
 
     let evaluate
         (claimed: WarmSession)
@@ -541,6 +527,14 @@ type SessionHost(options: SessionHostOptions) =
         let sourceExists = request.Mode = "file" && File.Exists sourcePath
         let escapedSource = request.Source.Replace("\"", "\"\"")
         let mutable checkedSource = false
+
+        let emittedTypeCount () =
+            session.DynamicAssemblies
+            |> Array.sumBy (fun assembly ->
+                try
+                    assembly.GetTypes().Length
+                with _ ->
+                    0)
 
         let run () =
             if request.Mode = "file" then
@@ -590,6 +584,8 @@ type SessionHost(options: SessionHostOptions) =
 
                 diagnostics |> Array.map scriptDiagnostic
 
+        let typesBeforeRun = emittedTypeCount ()
+
         try
             run ()
             0, [||]
@@ -602,10 +598,21 @@ type SessionHost(options: SessionHostOptions) =
                     errWriter.GetStringBuilder().Length <- markerIndex
 
                 claimed.ExitCodeProperty.Value.GetValue state :?> int, [||]
-            elif request.IncludeDiagnostics && compileDiagnosticText.IsMatch(errWriter.ToString()) then
-                1, compileDiagnostics ()
             else
-                1, [||]
+                // A failed compilation emits no CLR types; every compiled interaction or script
+                // (even a comment-only one) emits its types before executing, so the emitted-type
+                // delta proves user IL never ran without sniffing the diagnostic text.
+                let compiledAndEnteredRuntime = emittedTypeCount () > typesBeforeRun
+
+                if
+                    request.IncludeDiagnostics
+                    && not compiledAndEnteredRuntime
+                    && checkedSource
+                    && not (request.Mode = "file" && not sourceExists)
+                then
+                    1, compileDiagnostics ()
+                else
+                    1, [||]
 
     let replenish () =
         while not stopped do

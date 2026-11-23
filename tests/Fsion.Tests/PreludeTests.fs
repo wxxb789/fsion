@@ -276,13 +276,18 @@ type PreludeTests(output: ITestOutputHelper) =
         withContext "prelude-broken-unload" (fun context directory ->
             let brokenPath = Path.Combine(directory, "broken-prelude.fsx")
             let counterPath = Path.Combine(directory, "broken-attempts.txt")
+            let gatePath = Path.Combine(directory, "prelude-ready.txt")
 
             writeFile
                 directory
                 "broken-prelude.fsx"
                 ("System.IO.File.AppendAllText(@\""
                  + counterPath.Replace("\"", "\"\"")
-                 + "\", \"attempt\\n\")\nfailwith \"prelude-boom\"\n")
+                 + "\", \"attempt\\n\")\n"
+                 + "if not (System.IO.File.Exists(@\""
+                 + gatePath.Replace("\"", "\"\"")
+                 + "\")) then failwith \"prelude-boom\"\n"
+                 + "let recoveredValue () = 42\n")
 
             let failed =
                 context.Run([ "--prelude"; brokenPath; "-e"; "1" ], timeoutMs = 120000)
@@ -309,11 +314,23 @@ type PreludeTests(output: ITestOutputHelper) =
             Assert.Equal(0, settled.PoolWarm)
             Assert.Equal(0, settled.AliveDisposedSessions)
             Assert.Equal(0, settled.ScriptAssemblies)
-            writeFile directory "broken-prelude.fsx" "let recoveredValue () = 42\n"
+
+            writeFile directory "prelude-ready.txt" "ready"
 
             let recovered =
                 context.Run([ "--prelude"; brokenPath; "-e"; "printfn \"%d\" (recoveredValue())" ], timeoutMs = 120000)
 
             Assert.Equal(0, recovered.ExitCode)
             Assert.Equal("42" + Environment.NewLine, recovered.Stdout)
+
+            let refillDeadline = DateTime.UtcNow.AddSeconds 30.0
+            let mutable refilled = false
+
+            while not refilled && DateTime.UtcNow < refillDeadline do
+                if context.MetricsOrFail().PoolWarm >= 1 then
+                    refilled <- true
+                else
+                    System.Threading.Thread.Sleep 100
+
+            Assert.True(refilled, "warm pool did not resume replenishing after transient prelude recovery")
             Assert.Equal(daemonPid, context.DaemonPid()))

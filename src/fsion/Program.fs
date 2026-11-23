@@ -471,7 +471,7 @@ let private statusLine (status: StatusInfo) =
 let private runWarmup (options: Options) (endpoint: Endpoint) : int =
     let stream = ensureDaemon options endpoint
     try
-        match sendAndReceive stream None Ping with
+        match sendAndReceive stream None (Ping(options.PreludePath, options.NoPrelude)) with
         | Delivered Pong ->
             match fetchStatus endpoint with
             | Some status ->

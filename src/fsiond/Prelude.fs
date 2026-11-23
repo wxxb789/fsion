@@ -71,3 +71,11 @@ let specOfRequest (request: ExecuteRequest) : Spec =
         Spec.File(normalizePath request.PreludePath.Value)
     else
         Spec.Builtin
+
+let specOfOptions (preludePath: string option) (noPrelude: bool) : Spec =
+    if noPrelude then
+        Spec.Bare
+    elif preludePath.IsSome then
+        Spec.File(normalizePath preludePath.Value)
+    else
+        Spec.Builtin

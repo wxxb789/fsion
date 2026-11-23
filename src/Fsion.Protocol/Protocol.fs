@@ -88,7 +88,7 @@ type Request =
     | GetStatus
     | GetMetrics
     | Shutdown
-    | Ping
+    | Ping of preludePath: string option * noPrelude: bool
 
 type Response =
     | Executed of ExecutionResult
@@ -133,7 +133,14 @@ let private writeRequestPayload (writer: BinaryWriter) (request: Request) =
     | GetStatus -> writer.Write 2uy
     | GetMetrics -> writer.Write 5uy
     | Shutdown -> writer.Write 3uy
-    | Ping -> writer.Write 4uy
+    | Ping (preludePath, noPrelude) ->
+        writer.Write 4uy
+        writer.Write noPrelude
+        writer.Write preludePath.IsSome
+
+        match preludePath with
+        | Some path -> writer.Write path
+        | None -> ()
 
 let private writeResponsePayload (writer: BinaryWriter) (response: Response) =
     writer.Write ProtocolVersion
@@ -266,7 +273,11 @@ let parseRequest (payload: byte[]) : Request =
     | 2uy -> GetStatus
     | 5uy -> GetMetrics
     | 3uy -> Shutdown
-    | 4uy -> Ping
+    | 4uy ->
+        let noPrelude = reader.ReadBoolean()
+        let hasPrelude = reader.ReadBoolean()
+        let preludePath = if hasPrelude then Some(reader.ReadString()) else None
+        Ping(preludePath, noPrelude)
     | kind -> failwith ("unknown request kind " + string kind)
 
 let parseResponse (payload: byte[]) : Response =

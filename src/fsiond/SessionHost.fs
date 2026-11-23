@@ -560,6 +560,10 @@ type SessionHost(options: SessionHostOptions) =
             if not succeeded then
                 releaseSession warm
                 replenishSignal.Release() |> ignore
+    let desiredGate = obj ()
+    let mutable desiredSpec = options.Prelude
+    let mutable failedTag: Prelude.Tag option = None
+
     let rec claimSession (tag: Prelude.Tag) (cancelToken: CancellationToken) : WarmSession =
         match pool.TryDequeue() with
         | true, warm when warm.Prelude = tag -> warm
@@ -570,10 +574,24 @@ type SessionHost(options: SessionHostOptions) =
             Interlocked.Increment(&coldClaims.contents) |> ignore
             creationGate.Wait(cancelToken)
 
-            try
-                createWarmSession (Prelude.specOfTag tag)
-            finally
-                creationGate.Release() |> ignore
+            let created =
+                try
+                    createWarmSession (Prelude.specOfTag tag)
+                finally
+                    creationGate.Release() |> ignore
+
+            let cleared =
+                lock desiredGate (fun () ->
+                    if failedTag.IsSome then
+                        failedTag <- None
+                        true
+                    else
+                        false)
+
+            if cleared then
+                replenishSignal.Release() |> ignore
+
+            created
 
     let removeHandlers (work: CleanupWork) =
         removeProcessExit work.ProcessExitHandlers
@@ -856,10 +874,6 @@ type SessionHost(options: SessionHostOptions) =
                     finally
                         entry.Gate.Release() |> ignore
 
-    let desiredGate = obj ()
-    let mutable desiredSpec = options.Prelude
-    let mutable failedTag: Prelude.Tag option = None
-
     let setDesiredSpec (spec: Prelude.Spec) =
         let changed =
             lock desiredGate (fun () ->
@@ -950,8 +964,15 @@ type SessionHost(options: SessionHostOptions) =
             )
             |> ignore
 
-    member _.EnsureWarm() =
+    member _.DesiredSpec = lock desiredGate (fun () -> desiredSpec)
+
+    member _.EnsureWarm(spec: Prelude.Spec) =
+        lock desiredGate (fun () ->
+            desiredSpec <- spec
+            failedTag <- None)
+
         if targetPoolSize > 0 then
+            recycleStalePoolSessions ()
             drainCleanups ()
             replenishSignal.Release() |> ignore
             let deadline = Environment.TickCount64 + 60000L

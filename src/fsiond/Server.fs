@@ -22,7 +22,7 @@ type Options =
       Prelude: Prelude.Spec }
 
 type [<NoEquality; NoComparison>] private Hooks =
-    { EnsureWarm: unit -> unit
+    { EnsureWarm: Prelude.Spec -> unit
       Execute: ExecuteRequest -> CancellationToken -> ExecutionReport
       Status: unit -> StatusInfo
       Metrics: unit -> MetricsInfo
@@ -90,8 +90,8 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
 
                 if options.Oneshot && not report.Wedged then
                     hooks.Stop ()
-            | Ping ->
-                hooks.EnsureWarm ()
+            | Ping (preludePath, noPrelude) ->
+                hooks.EnsureWarm (Prelude.specOfOptions preludePath noPrelude)
                 sendResponse connection Pong
             | GetStatus -> sendResponse connection (Status(hooks.Status ()))
             | GetMetrics -> sendResponse connection (Metrics(hooks.Metrics ()))
@@ -163,7 +163,7 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
                       "--idle-ttl"; options.IdleTtlMinutes.ToString(CultureInfo.InvariantCulture)
                       "--session-ttl"; options.SessionTtlMinutes.ToString(CultureInfo.InvariantCulture)
                       "--pool-size"; string options.PoolSize ]
-                    @ (match options.Prelude with
+                    @ (match session.DesiredSpec with
                        | Prelude.Spec.Bare -> [ "--no-prelude" ]
                        | Prelude.Spec.Builtin -> []
                        | Prelude.Spec.File path -> [ "--prelude"; path ])
@@ -179,8 +179,8 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
 
     let hooks =
         { EnsureWarm =
-            fun () ->
-                session.EnsureWarm ()
+            fun spec ->
+                session.EnsureWarm spec
                 lastActivity.Value <- DateTime.UtcNow
           Execute =
             fun request disconnectToken ->

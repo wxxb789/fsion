@@ -1053,6 +1053,9 @@ type SessionHost(options: SessionHostOptions) =
                 if mayMutateCompilerDirectory code then
                     claimed.CompilerDirectory <- ""
 
+                // Windows `dotnet fsi` strips the directory from diagnostic headers when `sourcePath`
+                // shares the process drive (`file.fsx(l,c):`), whereas Linux/macOS `dotnet fsi` prints
+                // the full `/path/to/file.fsx(l,c):` header emitted by FCS (verified on 3-OS CI).
                 if OperatingSystem.IsWindows() && request.Mode = "file" && prepared.SourceExists then
                     let fileName = Path.GetFileName prepared.SourcePath
 

@@ -71,9 +71,9 @@ eng/gate.ps1` (build, NativeAOT publish for both TFMs, black-box tests for both 
 `pwsh -NoProfile -File eng/package.ps1 -Framework net10.0` (fresh-temp smoke test) → upload the
 archive.
 
-Residual risk (recorded, not hidden): this workflow has **not** run on GitHub runners from this host
-(no push is authorized in this run); the local win-x64 path it mirrors is verified above. Linux/macOS
-behavior of `eng/gate.ps1`, `eng/package.ps1`, and the F# tests is code-reviewed only.
+Verified on GitHub Actions (`PR #5`, run `45285361941`): `ubuntu-latest` (`70/70` `net10.0`, `70/70`
+`net11.0`, `PACKAGE OK`) and `macos-latest` (`70/70` `net10.0`, `70/70` `net11.0`, `PACKAGE OK`), plus
+`windows-latest` (`70/70` `net10.0`, `70/70` `net11.0`, `* text=auto eol=lf` in `.gitattributes`).
 
 ## Clause 3 — Unseen-Script Benchmark Harness and AC-07
 
@@ -197,10 +197,9 @@ than the live queue depth, and in steady state the wait ran on nearly every turn
 
 ## Known Limits
 
-- The GitHub Actions workflow has not executed on GitHub-hosted runners from this host; Linux/macOS
-  packaging, AOT publishing, and test execution are review-only here.
-- Only the `win-x64` bundle was built on this host; `linux-x64` and `osx-arm64` bundles require those
-  hosts (NativeAOT cannot cross-compile OS targets) and are covered by the CI matrix when it runs.
+- Only the `win-x64` bundle was built locally on this Windows host; `linux-x64` and `osx-arm64`
+  NativeAOT bundles and `70/70` test suites are built and smoke-verified by the 3-OS GitHub Actions CI
+  matrix (`.github/workflows/ci.yml`).
 - The benchmark is a Windows-host measurement. `bun` is path-sensitive on this host (`Q:\tmp` costs it
   ~50 ms) while the other runtimes are not; the committed run uses the repo-local work directory,
   which is the fair carrier, and the literal bun-class bar fails there.

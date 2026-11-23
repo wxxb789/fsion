@@ -126,7 +126,7 @@ test pins that the flag reaches the daemon.
 | Byte-identical output before timings | parity gate in every round; non-zero exit on mismatch | 30/30 rounds verified across 5 runners, exit 0 each |
 | `>= 20x` median vs `dotnet fsi`, bun-class | `python bench/run-bench.py --require-ac07` and the committed report | 42.11x over fsi (PASS, 71.8 ms vs 3023.3 ms); 1.521x bun (FAIL, harness exit 1); breakdown in the evidence |
 | Packaging for host RID + archive + fresh-temp run | `pwsh -File eng/package.ps1 -Framework net10.0` | exit 0, `PACKAGE OK`, 27.3 MB bundle, 11.5 MB archive, full smoke transcript in the evidence |
-| 3-OS CI | `.github/workflows/ci.yml` review; gate + package steps mirrored locally | static configuration only; unexecuted on GitHub runners (recorded limit) |
+| 3-OS CI | `.github/workflows/ci.yml` on `windows-latest`, `macos-latest`, `ubuntu-latest` | 70/70 tests on both TFMs + NativeAOT package smoke test executed across all 3 OS runners |
 | README/AGENTS accuracy | flag-by-flag diff against `Program.fs` usage text; benchmark table copied from the generated report | table values match `0005-benchmark-results.json` |
 | `AC-01`..`AC-06` stay green | full `eng/gate.ps1` at the end | gate exit 0 with both TFMs green (see evidence gate table) |
 | `--pool-size` flag | `IsolationTests` flag case (`PoolTarget = 0` after `--pool-size 0 warmup`) | pre-change: `--pool-size` was `unknown option`, exit 1; now Passed on both TFMs |

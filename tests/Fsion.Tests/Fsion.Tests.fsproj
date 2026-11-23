@@ -10,6 +10,8 @@
     <Compile Include="ParityTests.fs" />
     <Compile Include="FaultTests.fs" />
     <Compile Include="HygieneTests.fs" />
+    <Compile Include="IsolationTests.fs" />
+    <Compile Include="JsonTests.fs" />
     <Compile Include="LatencyTests.fs" />
   </ItemGroup>
   <ItemGroup>

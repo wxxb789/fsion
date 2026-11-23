@@ -25,15 +25,21 @@ let ``file mode matches dotnet fsi byte for byte`` () =
         assertSameOutput expected actual
 
         let multiScript =
-            "let full = System.IO.Path.Combine(__SOURCE_DIRECTORY__, __SOURCE_FILE__)\n"
+            "let ``a;;b`` = 41\n"
+            + "#if FOO\n"
+            + "let skipped = 1\n"
+            + ";;\n"
+            + "#endif\n"
+            + "let full = System.IO.Path.Combine(__SOURCE_DIRECTORY__, __SOURCE_FILE__)\n"
             + "eprintfn \"%s(\" full;;\n"
-            + "printfn \"after-semi\"\n"
+            + "printfn \"after-semi=%d\" (``a;;b`` + 1)\n"
             + "exit 7\n"
 
         writeFile directory "multi.fsx" multiScript
         let expectedMulti = runFsi directory [ "multi.fsx" ] None
         let actualMulti = context.Run [ "multi.fsx" ]
         assertSameOutput expectedMulti actualMulti
+
         let sameLineErrScript = "printfn \"a\";; let y : int = \"nope\"\n"
         writeFile directory "sameline.fsx" sameLineErrScript
         let expectedSame = runFsi directory [ "sameline.fsx" ] None

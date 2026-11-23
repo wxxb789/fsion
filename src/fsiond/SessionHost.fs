@@ -12,6 +12,7 @@ open System.Threading
 open System.Threading.Tasks
 open FSharp.Compiler.Diagnostics
 open FSharp.Compiler.Interactive.Shell
+open FSharp.Compiler.Tokenization
 open Fsion.Protocol
 open Fsiond.Ambient
 
@@ -352,18 +353,11 @@ let private mayMutateCompilerDirectory (text: string) =
     || text.IndexOf("#silentCd", StringComparison.Ordinal) >= 0
     || text.IndexOf("#load", StringComparison.Ordinal) >= 0
 
-type private InteractionScan =
-    | InteractionCode
-    | InteractionLineComment
-    | InteractionBlockComment of int
-    | InteractionNormalString
-    | InteractionVerbatimString
-    | InteractionTripleString
-
 // EvalInteraction stops at the first top-level `;;` terminator, whereas `dotnet fsi` executes every
-// `;;`-delimited chunk in a script file. Split on top-level `;;` outside strings/comments and pad
-// subsequent chunks with leading `\n` equal to their starting line offset so diagnostic line
-// numbers and column offsets remain exact.
+// `;;`-delimited interaction in a script. Use FCS's own `FSharpSourceTokenizer` to find top-level
+// `SEMICOLON_SEMICOLON` tokens outside strings/comments/backtick identifiers/inactive `#if` blocks
+// and outside active `#if`..`#endif` regions or interpolated `{...}` holes, and pad subsequent chunks
+// with leading `\n` + spaces so diagnostic line and column numbers remain exact.
 let private firstLineMinIndent (text: string) =
     let mutable idx = 0
     let mutable col = 0
@@ -403,16 +397,34 @@ let private appendTrailingUnit (padded: string) =
         let unitIndent = firstLineMinIndent padded
         padded + "\n" + (if unitIndent > 0 then String(' ', unitIndent) else "") + "()"
 
-let private splitInteractions (source: string) : string[] =
+let private splitInteractions (source: string) (scriptName: string) : string[] =
     if source.IndexOf(";;", StringComparison.Ordinal) < 0 then
         [| appendTrailingUnit source |]
     else
         let chunks = ResizeArray<string>()
         let length = source.Length
-        let mutable state = InteractionCode
-        let mutable i = 0
-        let mutable lineCount = 0
-        let mutable lineStart = 0
+        let lineStarts = ResizeArray<int>()
+        let lineEnds = ResizeArray<int>()
+        let mutable scanIdx = 0
+        let mutable curStart = 0
+
+        while scanIdx < length do
+            if source.[scanIdx] = '\n' then
+                lineStarts.Add curStart
+                let lineEnd = if scanIdx > curStart && source.[scanIdx - 1] = '\r' then scanIdx - 1 else scanIdx
+                lineEnds.Add lineEnd
+                curStart <- scanIdx + 1
+
+            scanIdx <- scanIdx + 1
+
+        lineStarts.Add curStart
+        let finalEnd = if length > curStart && source.[length - 1] = '\r' then length - 1 else length
+        lineEnds.Add finalEnd
+
+        let tokenizer = FSharpSourceTokenizer([ "INTERACTIVE" ], Some scriptName, None)
+        let mutable lexState = FSharpTokenizerLexState.Initial
+        let mutable hashIfDepth = 0
+        let mutable interpDepth = 0
         let mutable chunkStart = 0
         let mutable chunkStartLines = 0
         let mutable chunkStartCols = 0
@@ -440,100 +452,45 @@ let private splitInteractions (source: string) : string[] =
             chunkStartLines <- nextLines
             chunkStartCols <- nextCols
 
-        let advanceNewline nextIndex =
-            lineCount <- lineCount + 1
-            lineStart <- nextIndex
-            i <- nextIndex
+        for lineIdx = 0 to lineStarts.Count - 1 do
+            let lStart = lineStarts.[lineIdx]
+            let lEnd = lineEnds.[lineIdx]
+            let lineText = source.Substring(lStart, lEnd - lStart)
+            let lineTokenizer = tokenizer.CreateLineTokenizer lineText
 
-        while i < length do
-            let c = source.[i]
+            let rec scanLine state =
+                match lineTokenizer.ScanToken state with
+                | Some tok, nextState ->
+                    match tok.TokenName with
+                    | "HASH_IF" ->
+                        let slice = lineText.Substring tok.LeftColumn
 
-            match state with
-            | InteractionCode ->
-                if c = '\n' then
-                    advanceNewline (i + 1)
-                elif c = '/' && i + 1 < length && source.[i + 1] = '/' then
-                    state <- InteractionLineComment
-                    i <- i + 2
-                elif c = '(' && i + 1 < length && source.[i + 1] = '*' then
-                    state <- InteractionBlockComment 1
-                    i <- i + 2
-                elif c = '"' then
-                    if i + 2 < length && source.[i + 1] = '"' && source.[i + 2] = '"' then
-                        state <- InteractionTripleString
-                        i <- i + 3
-                    else
-                        state <- InteractionNormalString
-                        i <- i + 1
-                elif c = '@' && i + 1 < length && source.[i + 1] = '"' then
-                    state <- InteractionVerbatimString
-                    i <- i + 2
-                elif c = '\'' && i + 2 < length && source.[i + 1] <> '\\' && source.[i + 2] = '\'' then
-                    i <- i + 3
-                elif c = '\'' && i + 3 < length && source.[i + 1] = '\\' && source.[i + 3] = '\'' then
-                    i <- i + 4
-                elif c = ';' && i + 1 < length && source.[i + 1] = ';' then
-                    let nextIndex = i + 2
-                    emitChunk i nextIndex lineCount (nextIndex - lineStart)
-                    i <- nextIndex
-                else
-                    i <- i + 1
-            | InteractionLineComment ->
-                if c = '\n' then
-                    state <- InteractionCode
-                    advanceNewline (i + 1)
-                else
-                    i <- i + 1
-            | InteractionBlockComment depth ->
-                if c = '\n' then
-                    advanceNewline (i + 1)
-                elif c = '(' && i + 1 < length && source.[i + 1] = '*' then
-                    state <- InteractionBlockComment(depth + 1)
-                    i <- i + 2
-                elif c = '*' && i + 1 < length && source.[i + 1] = ')' then
-                    state <- if depth = 1 then InteractionCode else InteractionBlockComment(depth - 1)
-                    i <- i + 2
-                else
-                    i <- i + 1
-            | InteractionNormalString ->
-                if c = '\\' && i + 1 < length then
-                    if source.[i + 1] = '\n' then
-                        advanceNewline (i + 2)
-                    else
-                        i <- i + 2
-                elif c = '"' then
-                    state <- InteractionCode
-                    i <- i + 1
-                elif c = '\n' then
-                    state <- InteractionCode
-                    advanceNewline (i + 1)
-                else
-                    i <- i + 1
-            | InteractionVerbatimString ->
-                if c = '"' then
-                    if i + 1 < length && source.[i + 1] = '"' then
-                        i <- i + 2
-                    else
-                        state <- InteractionCode
-                        i <- i + 1
-                elif c = '\n' then
-                    advanceNewline (i + 1)
-                else
-                    i <- i + 1
-            | InteractionTripleString ->
-                if c = '"' && i + 2 < length && source.[i + 1] = '"' && source.[i + 2] = '"' then
-                    state <- InteractionCode
-                    i <- i + 3
-                elif c = '\n' then
-                    advanceNewline (i + 1)
-                else
-                    i <- i + 1
+                        if slice.StartsWith("#if", StringComparison.Ordinal) then
+                            hashIfDepth <- hashIfDepth + 1
+                        elif slice.StartsWith("#endif", StringComparison.Ordinal) then
+                            hashIfDepth <- max 0 (hashIfDepth - 1)
+                    | "INTERP_STRING_BEGIN_PART"
+                    | "INTERP_STRING_PART" ->
+                        interpDepth <- interpDepth + 1
+                    | "INTERP_STRING_END" ->
+                        interpDepth <- max 0 (interpDepth - 1)
+                    | "SEMICOLON_SEMICOLON" when hashIfDepth = 0 && interpDepth = 0 ->
+                        let semiStart = lStart + tok.LeftColumn
+                        let nextStart = lStart + tok.RightColumn + 1
+                        emitChunk semiStart nextStart lineIdx (tok.RightColumn + 1)
+                    | _ -> ()
+
+                    scanLine nextState
+                | None, nextState -> nextState
+
+            lexState <- scanLine lexState
 
         if chunkStart < length || chunks.Count = 0 then
-            emitChunk length length lineCount (chunkStart - lineStart)
+            let lastLine = lineStarts.Count - 1
+            let tailCols = if chunkStart >= lineStarts.[lastLine] then chunkStart - lineStarts.[lastLine] else 0
+            emitChunk length length lastLine tailCols
 
         chunks.ToArray()
-
 // The throwing Eval* APIs print diagnostics to the session's error writer but construct
 // FsiCompilationException with ErrorInfos = None; only the non-throwing APIs return the
 // diagnostics. Clients that did not ask for structured diagnostics skip the re-run entirely.
@@ -1004,8 +961,8 @@ type SessionHost(options: SessionHostOptions) =
         let mutable typesBeforeCurrentEval = 0
         let mutable precheckedDiagnostics: ScriptDiagnostic[] option = None
 
-        let evalCode (code: string) (scriptName: string) =
-            let chunks = splitInteractions code
+        let evalCode (code: string) (scriptName: string) (normalizeWindowsHeader: bool) =
+            let chunks = splitInteractions code scriptName
 
             try
                 for chunk in chunks do
@@ -1056,22 +1013,23 @@ type SessionHost(options: SessionHostOptions) =
                 // Windows `dotnet fsi` strips the directory from diagnostic headers when `sourcePath`
                 // shares the process drive (`file.fsx(l,c):`), whereas Linux/macOS `dotnet fsi` prints
                 // the full `/path/to/file.fsx(l,c):` header emitted by FCS (verified on 3-OS CI).
-                if OperatingSystem.IsWindows() && request.Mode = "file" && prepared.SourceExists then
+                if normalizeWindowsHeader && OperatingSystem.IsWindows() then
                     let fileName = Path.GetFileName prepared.SourcePath
 
                     if not (String.Equals(prepared.SourcePath, fileName, StringComparison.Ordinal)) then
                         errWriter.ReplaceDiagnosticSource(prepared.SourcePath, fileName)
+
         let run () =
             match prepared.Rewritten with
             | Some (referenceBlock, rewrittenSource) ->
                 changeDirectory prepared.ScriptDirectory
                 session.EvalInteraction(referenceBlock, "fsion-nuget-refs.fsx")
-                evalCode rewrittenSource checkedSourceName
+                evalCode rewrittenSource checkedSourceName (request.Mode = "file" && prepared.SourceExists)
             | None ->
                 if request.Mode = "file" then
                     if prepared.SourceExists then
                         changeDirectory prepared.ScriptDirectory
-                        evalCode (defaultArg prepared.LoadedText "") checkedSourceName
+                        evalCode (defaultArg prepared.LoadedText "") checkedSourceName true
                     else
                         changeDirectory request.WorkingDirectory
                         checkedSource <- true
@@ -1090,7 +1048,8 @@ type SessionHost(options: SessionHostOptions) =
                             claimed.CompilerDirectory <- ""
                 else
                     changeDirectory request.WorkingDirectory
-                    evalCode (defaultArg prepared.LoadedText "") prepared.SourceName
+                    evalCode (defaultArg prepared.LoadedText "") prepared.SourceName false
+
         let compileDiagnostics () =
             if not checkedSource || (request.Mode = "file" && not prepared.SourceExists) then
                 [||]
@@ -1144,6 +1103,7 @@ type SessionHost(options: SessionHostOptions) =
                     match precheckedDiagnostics with
                     | Some _ -> false
                     | None -> typesBeforeCurrentEval = Int32.MinValue || emittedTypeCount () > typesBeforeCurrentEval
+
                 if
                     request.IncludeDiagnostics
                     && not compiledAndEnteredRuntime
@@ -1153,7 +1113,6 @@ type SessionHost(options: SessionHostOptions) =
                     1, compileDiagnostics ()
                 else
                     1, [||]
-
     let sessionTtlMs = int64 (max 0.0 options.SessionTtlMinutes * 60000.0)
     let namedGate = obj ()
     let namedSessions = Dictionary<string, NamedSessionEntry>()

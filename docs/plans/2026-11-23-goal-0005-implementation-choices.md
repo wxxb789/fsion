@@ -55,9 +55,10 @@ is part of the design. Five avoidable per-invocation costs were eliminated in `S
 to **54.4 ms**):
 
 1. File-mode scripts now read UTF-8 source directly and evaluate via `EvalInteraction(chunk, sourcePath)`
-   (splitting top-level `;;` chunks with exact line and column offset preservation and normalizing
-   Windows `file.fsx(line,col): ` diagnostic headers to `Path.GetFileName` for byte parity with
-   `dotnet fsi`), avoiding `EvalScript`'s ~25–30 ms synthetic `#load` module wrapper.
+   (using FCS's `FSharpSourceTokenizer` to split top-level `;;` interactions with exact line and column
+   offset preservation and normalizing Windows `file.fsx(line,col): ` diagnostic headers to
+   `Path.GetFileName` for byte parity with `dotnet fsi`), avoiding `EvalScript`'s ~25–30 ms synthetic
+   `#load` module wrapper.
 2. `Settings` sets `ShowDeclarationValues/ShowIEnumerable/ShowProperties = false` so FSI never spends
    reflection formatting cycles on bound values that `--quiet` discards.
 3. `WarmSession.CompilerDirectory` tracks the session's compiler directory to skip redundant `#cd`

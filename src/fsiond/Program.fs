@@ -6,13 +6,17 @@ open System.IO
 open System.Threading
 open Fsion.Ipc
 open Fsion.Protocol
+open Fsiond.Ambient
 open Fsiond.Server
 
 type private Options =
     { Endpoint: Endpoint
       IdleTtlMinutes: float
       Oneshot: bool
+      PoolSize: int
       LogPath: string option }
+
+let private defaultPoolSize = 3
 
 let private parse (argv: string[]) =
     let mutable endpointName = defaultEndpointName ()
@@ -20,6 +24,8 @@ let private parse (argv: string[]) =
     let mutable idleTtlMinutes = DefaultIdleTtlMinutes
     let mutable idleTtlSet = false
     let mutable oneshot = false
+    let mutable poolSize = defaultPoolSize
+    let mutable poolSizeSet = false
     let mutable logPath = None
     let mutable index = 0
     let mutable valid = true
@@ -34,6 +40,13 @@ let private parse (argv: string[]) =
             | true, value ->
                 idleTtlMinutes <- value
                 idleTtlSet <- true
+                index <- index + 2
+            | _ -> valid <- false
+        | "--pool-size" when index + 1 < argv.Length ->
+            match Int32.TryParse(argv.[index + 1], NumberStyles.Integer, CultureInfo.InvariantCulture) with
+            | true, value when value >= 0 ->
+                poolSize <- value
+                poolSizeSet <- true
                 index <- index + 2
             | _ -> valid <- false
         | "--oneshot" ->
@@ -64,10 +77,21 @@ let private parse (argv: string[]) =
                     match Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture) with
                     | true, parsed -> parsed
                     | _ -> idleTtlMinutes
+        let envPoolSize =
+            if poolSizeSet then
+                poolSize
+            else
+                match Environment.GetEnvironmentVariable PoolSizeEnvironmentVariable with
+                | null | "" -> poolSize
+                | value ->
+                    match Int32.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture) with
+                    | true, parsed when parsed >= 0 -> parsed
+                    | _ -> poolSize
         Some
             { Endpoint = { Name = envEndpoint }
               IdleTtlMinutes = envTtl
               Oneshot = oneshot
+              PoolSize = envPoolSize
               LogPath = logPath }
 
 let private runDaemon (options: Options) =
@@ -75,13 +99,14 @@ let private runDaemon (options: Options) =
         { Endpoint = options.Endpoint
           IdleTtlMs = int64 (TimeSpan.FromMinutes(options.IdleTtlMinutes).TotalMilliseconds)
           Oneshot = options.Oneshot
+          PoolSize = options.PoolSize
           LogPath = options.LogPath }
     let listener = createListener options.Endpoint
     Server.run serverOptions listener
 
 [<EntryPoint>]
 let main argv =
-    Console.SetIn TextReader.Null
+    Ambient.install ()
     match parse argv with
     | None -> 1
     | Some options when options.Oneshot -> runDaemon options

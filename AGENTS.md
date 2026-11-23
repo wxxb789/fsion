@@ -15,7 +15,7 @@ Fast, Windows-first F# script execution (`fsion` NativeAOT thin CLI + `fsiond` C
 |---|---|---|
 | `src/Fsion.Protocol` | F# library, `net10.0;net11.0` | Wire framing/DTOs (`Protocol.fs`) and local IPC (`Ipc.fs`: Windows named pipe, Unix domain socket). Shared by both executables; keep AOT-clean. |
 | `src/fsion` | NativeAOT exe | Thin CLI: arg parsing, daemon discovery/auto-start, IPC client, stdout/stderr/exit passthrough. Never use F# `printf`/`sprintf`/`failwithf` here (AOT `MakeGenericMethod` trap). |
-| `src/fsiond` | CoreCLR exe | Reactor: endpoint listener, one warm `FsiEvaluationSession`, per-run console/cwd routing, prelude `exit` shadowing. |
+| `src/fsiond` | CoreCLR exe | Reactor: endpoint listener, background-replenished collectible `FsiEvaluationSession` pool and process-state gate (`SessionHost.fs`), `AsyncLocal` console routing (`Ambient.fs`), prelude `exit` shadowing. |
 | `tests/Fsion.Tests` | xunit, `net10.0;net11.0` | Black-box tests driving the published `fsion` binary over real IPC against `dotnet fsi`; per-test `FSION_PIPE`/`FSIOND_PATH` isolation and per-test daemon shutdown. |
 | `eng/gate.ps1` | script | The runnable repository gate. |
 | `docs/evidence/` | docs | Per-goal measured evidence records. |
@@ -38,8 +38,15 @@ Fast, Windows-first F# script execution (`fsion` NativeAOT thin CLI + `fsiond` C
 ## Windows IPC & Process Hazards
 
 - `fsion` spawns `fsiond` on Windows via Win32 `CreateProcessW` with `bInheritHandles=false` and `CREATE_NO_WINDOW | DETACHED_PROCESS` (`spawnDaemonWindows` in `src/fsion/Program.fs`). `Process.Start` sets `bInheritHandles=TRUE`, so a long-lived `fsiond` would inherit the caller's `stdout`/`stderr` pipe write ends and any redirected `ReadToEnd`/`capture_output` would block forever after `fsion` exits. Do not revert the Windows path to `Process.Start`.
-- Daemon sessions serialize runs with a semaphore; `exit <n>` is shadowed in the prelude and surfaces as the client exit code without terminating `fsiond`.
+- Daemon `Execute` runs are stateless: each claims a pooled collectible session and releases it before the response (`releaseSession` disposes `IDisposable` static bindings, clears the diagnostics `AsyncLocal`s, and runs a Gen-0 finalizer sweep synchronously; the remaining unload drains on the replenisher thread). Runs that share a (working directory, environment) execute concurrently through `ProcessStateGate`; a different epoch serializes behind active runs. `exit <n>` is shadowed in the prelude and surfaces as the client exit code without terminating `fsiond`.
 - Windows Named Pipe names (`--pipe` / `FSION_PIPE`) must be single-segment names without `\` or `/`; `resolveEndpoint` rejects path separators in `src/fsion/Program.fs` and `validateEndpointName` in `src/Fsion.Protocol/Ipc.fs` enforces it at connect/listen time.
+
+## Daemon Pool & Isolation Invariants
+
+- `src/fsiond/Ambient.fs` installs `AsyncLocal`-routed `Console.Out`/`Console.Error`/`Console.In` writers once at daemon startup; runs set their per-run `StringWriter`s in the ambient context. Never `Console.SetOut`/`SetError` a shared session per run.
+- `src/fsiond/SessionHost.fs` owns the warm pool (default watermark 3; `fsiond --pool-size <n>` or `FSION_POOL_SIZE`, `0` disables warm sessions so every run claims cold), the `ProcessStateGate` cwd/env epochs, `--json` diagnostic collection, and the prelude `exit` shadowing. `fsion --json` emits one `Utf8JsonWriter` document (`exitCode`, `stdout`, `stderr`, `elapsedMs`, `diagnostics[]`); default mode stays raw stream/exit passthrough.
+- FCS collectible sessions install process-wide GC roots that must be removed when the session is released: `AppDomain.ProcessExit`, `AssemblyLoadContext.Default.ResolvingUnmanagedDll`, the static `AssemblyLoadContext.AssemblyResolve` field, the `diagnosticsLogger`/`buildPhase` `AsyncLocal`s, and the `TcConfigBuilder` `tryGetMetadataSnapshot` callback closure. `releaseSession` runs on the request thread and must dispose `IDisposable` `FSI-ASSEMBLY` static bindings (top-level `let r = new StreamReader(...)` handles are otherwise locked until assembly unload) and run a Gen-0 sweep; the full unload — removing only the delegates its own creation added (under `creationGate`), severing the callback, clearing checker caches, disposing the session, and the full Gen-2 sweep — is queued as `CleanupWork` and drained by the background replenisher (which also runs with `--pool-size 0`) and synchronously by `GetMetrics` before sampling, so undisposed script file handles cannot keep Windows file locks and `AliveDisposedSessions` stays 0.
+- `ExecuteRequest` carries the client's full environment snapshot; the daemon applies and restores it around each run. `GetMetrics` (`PoolTarget`/`PoolWarm`/`ColdClaims`/`Executed`/`ManagedHeapBytes`/`ScriptAssemblies`/`AliveDisposedSessions`) is the black-box probe for pool and unload tests.
 
 ## Goal Close Ritual
 

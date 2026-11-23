@@ -6,6 +6,8 @@ open System.IO
 open System.Text
 open System.Text.RegularExpressions
 open System.Threading
+open Fsion
+open Fsion.Protocol
 
 [<assembly: Xunit.CollectionBehavior(DisableTestParallelization = true)>]
 do ()
@@ -163,6 +165,20 @@ type FsionContext(workingDirectory: string) =
     member _.Run(args: string list, ?stdin: string, ?timeoutMs: int, ?extraEnv: (string * string) list) =
         let environment = baseEnvironment @ (defaultArg extraEnv [])
         runProcess fsionBinary args workingDirectory environment stdin (defaultArg timeoutMs 90000)
+
+    member _.Metrics(timeoutMs: int) : MetricsInfo option =
+        match Ipc.tryConnect { Name = endpoint } (TimeSpan.FromMilliseconds(float timeoutMs)) with
+        | None -> None
+        | Some stream ->
+            use connection = stream
+            sendRequest connection GetMetrics
+
+            match tryReceiveFrame connection with
+            | Some payload ->
+                match parseResponse payload with
+                | Metrics metrics -> Some metrics
+                | _ -> None
+            | None -> None
 
     member _.DaemonPid() : int option =
         let result = runProcess fsionBinary [ "daemon"; "status" ] workingDirectory baseEnvironment None 30000

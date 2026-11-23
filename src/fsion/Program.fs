@@ -7,6 +7,7 @@ open System.Globalization
 open System.IO
 open System.Runtime.InteropServices
 open System.Text
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Fsion.Ipc
@@ -74,7 +75,8 @@ type private Input =
 type private Options =
     { NoDaemon: bool
       PipeName: string option
-      IdleTtlMinutes: float option }
+      IdleTtlMinutes: float option
+      Json: bool }
 
 let private usage =
     "fsion " + version + " - fast F# script runner\n"
@@ -88,6 +90,7 @@ let private usage =
     + "\n"
     + "Options:\n"
     + "  --no-daemon           run a single-shot daemon for this invocation only\n"
+    + "  --json                emit a structured JSON result instead of raw streams\n"
     + "  --pipe <name>         daemon endpoint name (env: FSION_PIPE)\n"
     + "  --idle-ttl <minutes>  auto-started daemon idle TTL (env: FSION_IDLE_TTL_MINUTES, default 30)\n"
     + "  -h, --help            show this help\n"
@@ -97,7 +100,8 @@ let private parse (argv: string[]) : Result<Options * Input, string> =
     let mutable options =
         { NoDaemon = false
           PipeName = None
-          IdleTtlMinutes = None }
+          IdleTtlMinutes = None
+          Json = false }
     let mutable outcome: Result<Options * Input, string> option = None
     let mutable index = 0
     while outcome.IsNone && index < argv.Length do
@@ -108,6 +112,9 @@ let private parse (argv: string[]) : Result<Options * Input, string> =
         | "--version" -> outcome <- Some(Ok(options, ShowVersion))
         | "--no-daemon" ->
             options <- { options with NoDaemon = true }
+            index <- index + 1
+        | "--json" ->
+            options <- { options with Json = true }
             index <- index + 1
         | "--pipe" when index + 1 < argv.Length ->
             let name = argv.[index + 1]
@@ -346,24 +353,65 @@ let private executeOneShot (options: Options) (endpoint: Endpoint) (request: Exe
     finally
         stream.Dispose()
 
-let private emit (response: Response) : int =
-    match response with
-    | Executed (exitCode, standardOut, standardError) ->
-        if standardOut.Length > 0 then
-            Console.Out.Write standardOut
-        if standardError.Length > 0 then
-            Console.Error.Write standardError
-        Console.Out.Flush()
-        Console.Error.Flush()
-        exitCode
-    | Failure message ->
+let private writeJsonResult (elapsedMs: float) (result: ExecutionResult) =
+    use stream = Console.OpenStandardOutput()
+    use writer = new Utf8JsonWriter(stream, JsonWriterOptions(Indented = false))
+    writer.WriteStartObject()
+    writer.WriteNumber("exitCode", result.ExitCode)
+    writer.WriteString("stdout", result.StandardOut)
+    writer.WriteString("stderr", result.StandardError)
+    writer.WriteNumber("elapsedMs", elapsedMs)
+    writer.WriteStartArray("diagnostics")
+
+    for diagnostic in result.Diagnostics do
+        writer.WriteStartObject()
+        writer.WriteString("code", diagnostic.Code)
+        writer.WriteNumber("number", diagnostic.Number)
+        writer.WriteString("severity", diagnostic.Severity)
+        writer.WriteString("message", diagnostic.Message)
+        writer.WriteString("file", diagnostic.File)
+        writer.WriteNumber("startLine", diagnostic.StartLine)
+        writer.WriteNumber("startColumn", diagnostic.StartColumn)
+        writer.WriteNumber("endLine", diagnostic.EndLine)
+        writer.WriteNumber("endColumn", diagnostic.EndColumn)
+        writer.WriteEndObject()
+
+    writer.WriteEndArray()
+    writer.WriteEndObject()
+    writer.Flush()
+
+let private emitFailure (options: Options) (elapsedMs: float) (message: string) : int =
+    if options.Json then
+        writeJsonResult
+            elapsedMs
+            { ExitCode = 1
+              StandardOut = ""
+              StandardError = "fsion: " + message + Environment.NewLine
+              Diagnostics = [||] }
+    else
         Console.Error.Write("fsion: " + message + Environment.NewLine)
         Console.Error.Flush()
-        1
-    | _ ->
-        Console.Error.Write("fsion: unexpected daemon response" + Environment.NewLine)
-        Console.Error.Flush()
-        1
+
+    1
+
+let private emit (options: Options) (elapsedMs: float) (response: Response) : int =
+    match response with
+    | Executed result ->
+        if options.Json then
+            writeJsonResult elapsedMs result
+        else
+            if result.StandardOut.Length > 0 then
+                Console.Out.Write result.StandardOut
+
+            if result.StandardError.Length > 0 then
+                Console.Error.Write result.StandardError
+
+            Console.Out.Flush()
+            Console.Error.Flush()
+
+        result.ExitCode
+    | Failure message -> emitFailure options elapsedMs message
+    | _ -> emitFailure options elapsedMs "unexpected daemon response"
 
 let private fetchStatus (endpoint: Endpoint) : StatusInfo option =
     match tryConnect endpoint (TimeSpan.FromMilliseconds 250.0) with
@@ -466,18 +514,26 @@ let rec private runDaemonCommand (options: Options) (endpoint: Endpoint) (input:
             runDaemonCommand options endpoint DaemonStart
     | _ -> 1
 
-let private executeInput (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) : int =
-    if options.NoDaemon then
-        emit (executeOneShot options endpoint request)
-    else
-        emit (executeOverDaemon options endpoint request)
+let private executeInput (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) (elapsedMs: unit -> float) : int =
+    let response =
+        if options.NoDaemon then
+            executeOneShot options endpoint request
+        else
+            executeOverDaemon options endpoint request
+
+    emit options (elapsedMs ()) response
 
 [<EntryPoint>]
 let main argv =
+    let started = Stopwatch.StartNew()
+
     try
         Console.OutputEncoding <- UTF8Encoding(false)
     with _ ->
         ()
+
+    let elapsedMs () = started.Elapsed.TotalMilliseconds
+
     match parse argv with
     | Error message ->
         Console.Error.Write("fsion: " + message + Environment.NewLine + usage)
@@ -502,7 +558,10 @@ let main argv =
                     { Mode = "file"
                       Source = path
                       WorkingDirectory = Directory.GetCurrentDirectory()
-                      Args = Array.append [| path |] args }
+                      Args = Array.append [| path |] args
+                      Environment = environmentSnapshot ()
+                      IncludeDiagnostics = options.Json }
+                    elapsedMs
             | RunEval (code, args) ->
                 executeInput
                     options
@@ -510,7 +569,10 @@ let main argv =
                     { Mode = "eval"
                       Source = code
                       WorkingDirectory = Directory.GetCurrentDirectory()
-                      Args = Array.append [| "eval.fsx" |] args }
+                      Args = Array.append [| "eval.fsx" |] args
+                      Environment = environmentSnapshot ()
+                      IncludeDiagnostics = options.Json }
+                    elapsedMs
             | RunStdin args ->
                 executeInput
                     options
@@ -518,13 +580,14 @@ let main argv =
                     { Mode = "stdin"
                       Source = readAllStdin ()
                       WorkingDirectory = Directory.GetCurrentDirectory()
-                      Args = Array.append [| "stdin.fsx" |] args }
+                      Args = Array.append [| "stdin.fsx" |] args
+                      Environment = environmentSnapshot ()
+                      IncludeDiagnostics = options.Json }
+                    elapsedMs
             | Warmup -> runWarmup options endpoint
             | DaemonStart
             | DaemonStop
             | DaemonRestart
             | DaemonStatus -> runDaemonCommand options endpoint input
         with ex ->
-            Console.Error.Write("fsion: " + ex.Message + Environment.NewLine)
-            Console.Error.Flush()
-            1
+            emitFailure options (elapsedMs ()) ex.Message

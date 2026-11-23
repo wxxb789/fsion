@@ -27,40 +27,35 @@
       "id": "fsion",
       "kind": "fsion",
       "ext": "fsx",
-      "enabled": true,
-      "description": "warm fsion NativeAOT client against a warm fsiond pool"
+      "enabled": true
     },
     {
       "id": "dotnet-fsi",
       "kind": "fsi",
       "command": ["dotnet", "fsi", "--nologo"],
       "ext": "fsx",
-      "enabled": true,
-      "description": "dotnet fsi, one fresh process per round"
+      "enabled": true
     },
     {
       "id": "bun",
       "kind": "node",
       "command": ["bun", "run"],
       "ext": "ts",
-      "enabled": true,
-      "description": "bun running TypeScript"
+      "enabled": true
     },
     {
       "id": "node",
       "kind": "node",
       "command": ["node"],
       "ext": "js",
-      "enabled": true,
-      "description": "node running JavaScript"
+      "enabled": true
     },
     {
       "id": "python",
       "kind": "python",
       "command": ["python"],
       "ext": "py",
-      "enabled": true,
-      "description": "CPython"
+      "enabled": true
     }
   ]
 }

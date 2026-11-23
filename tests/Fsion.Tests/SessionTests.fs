@@ -1,6 +1,7 @@
 module Fsion.Tests.SessionTests
 
 open System
+open System.IO
 open System.Threading
 open Xunit
 open Xunit.Abstractions
@@ -9,7 +10,7 @@ open Fsion.Tests.TestInfra
 type SessionTests(output: ITestOutputHelper) =
     [<Fact>]
     member _.``named sessions preserve bindings across turns and stay isolated from stateless and other ids`` () =
-        withContext "session-continuity" (fun context _ ->
+        withContext "session-continuity" (fun context directory ->
             let define = context.Run([ "--session"; "alpha"; "-e"; "let data = [1 .. 1000]" ], timeoutMs = 120000)
             Assert.Equal(0, define.ExitCode)
             let daemonPid = context.DaemonPid()
@@ -20,6 +21,19 @@ type SessionTests(output: ITestOutputHelper) =
 
             Assert.Equal(0, second.ExitCode)
             Assert.Equal("500500" + Environment.NewLine, second.Stdout)
+
+            writeFile (Path.Combine(directory, "sub")) "only_in_sub.fsx" ("printfn \"sub\"" + Environment.NewLine)
+
+            let changeDir =
+                context.Run([ "--session"; "alpha"; "-e"; "#cd \"sub\"" ], timeoutMs = 60000)
+
+            Assert.Equal(0, changeDir.ExitCode)
+
+            let escapedLoad =
+                context.Run([ "--session"; "alpha"; "-e"; "#load \"only_in_sub.fsx\"" ], timeoutMs = 60000)
+
+            Assert.Equal(1, escapedLoad.ExitCode)
+            Assert.Contains("FS0078", escapedLoad.Stderr)
 
             let stateless = context.Run([ "-e"; "printfn \"%d\" (List.sum data)" ], timeoutMs = 60000)
             Assert.Equal(1, stateless.ExitCode)

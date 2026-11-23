@@ -95,6 +95,14 @@ type private WarmSession() =
     member val UnmanagedDllHandlers: Delegate[] = [||] with get, set
     member val AssemblyResolveHandlers: Delegate[] = [||] with get, set
 
+type private PreparedSource =
+    { SourceName: string
+      SourcePath: string
+      SourceExists: bool
+      ScriptDirectory: string
+      LoadedText: string option
+      Rewritten: (string * string) option }
+
 [<NoComparison; NoEquality>]
 type private CleanupWork =
     { Session: FsiEvaluationSession option
@@ -267,8 +275,7 @@ let private sweepFinalizers () =
 // Top-level IDisposable bindings are disposed by clearScriptStatics; this Gen-0 sweep finalizes
 // throwaway streams created inside functions so their Windows handles close before the response
 // while the collectible unload (checker caches, session dispose, full sweep) stays off the
-// request's critical path. The wait is skipped when the collection left nothing on the
-// finalization queue, which is the common case for scripts that allocate no finalizable objects.
+// request's critical path.
 let private sweepTransientFinalizers () =
     GC.Collect(0, GCCollectionMode.Forced, true, false)
 
@@ -342,7 +349,7 @@ module Fsion =
           typeof<System.Linq.Enumerable> ]
         |> List.map (fun warmType -> warmType.Assembly.GetName().Name)
 
-    let private warmCompilerPaths =
+    let private warmTypicalJsonPipeline =
         let root = (System.Text.Json.JsonDocument.Parse "[{\"a\":1,\"b\":\"x\",\"ok\":true}]").RootElement
         root.EnumerateArray()
         |> Seq.filter (fun item -> item.GetProperty("ok").GetBoolean())
@@ -472,7 +479,16 @@ type SessionHost(options: SessionHostOptions) =
                 session.EvalInteraction(plan.RewrittenSource + "\n()", path)
             | None -> session.EvalInteraction(text + "\n()", path)
 
-            Prelude.Tag.File(path, contentHash), directory
+            let trackedDirectory =
+                if
+                    text.IndexOf("#cd", StringComparison.Ordinal) >= 0
+                    || text.IndexOf("#load", StringComparison.Ordinal) >= 0
+                then
+                    ""
+                else
+                    directory
+
+            Prelude.Tag.File(path, contentHash), trackedDirectory
     let releaseSession (claimed: WarmSession) =
         match claimed.Session with
         | Some session -> clearScriptStatics session.DynamicAssemblies
@@ -682,7 +698,7 @@ type SessionHost(options: SessionHostOptions) =
         use reader = new StreamReader(stream, Encoding.UTF8, true)
         reader.ReadToEnd()
 
-    let prepareExecution (request: ExecuteRequest) : string option * (string * string) option =
+    let prepareExecution (request: ExecuteRequest) : PreparedSource =
         let sourceName = if request.Mode = "stdin" then "stdin.fsx" else "eval.fsx"
 
         let sourcePath =
@@ -701,38 +717,34 @@ type SessionHost(options: SessionHostOptions) =
             else
                 request.WorkingDirectory
 
+        let loadedText =
+            if request.Mode = "file" then
+                if sourceExists then Some(readUtf8File sourcePath) else None
+            else
+                Some(stripLeadingBom request.Source)
+
         let containsNuget (text: string) = text.IndexOf("nuget:", StringComparison.OrdinalIgnoreCase) >= 0
 
-        if request.Mode = "file" then
-            if sourceExists then
-                let text = stripLeadingBom (readUtf8File sourcePath)
+        let rewritten =
+            match loadedText with
+            | Some text when containsNuget text ->
+                let directiveSource =
+                    if request.Mode = "file" && sourceExists then sourcePath else sourceName
 
-                let rewritten =
-                    if containsNuget text then
-                        NugetCache.prepare text scriptDirectory sourcePath
-                        |> Option.map (fun plan -> NugetCache.referenceBlock plan, plan.RewrittenSource)
-                    else
-                        None
+                NugetCache.prepare text scriptDirectory directiveSource
+                |> Option.map (fun plan -> NugetCache.referenceBlock plan, plan.RewrittenSource)
+            | _ -> None
 
-                Some text, rewritten
-            else
-                None, None
-        else
-            let text = stripLeadingBom request.Source
-
-            let rewritten =
-                if containsNuget text then
-                    NugetCache.prepare text scriptDirectory sourceName
-                    |> Option.map (fun plan -> NugetCache.referenceBlock plan, plan.RewrittenSource)
-                else
-                    None
-
-            Some text, rewritten
+        { SourceName = sourceName
+          SourcePath = sourcePath
+          SourceExists = sourceExists
+          ScriptDirectory = scriptDirectory
+          LoadedText = loadedText
+          Rewritten = rewritten }
     let evaluate
         (claimed: WarmSession)
         (request: ExecuteRequest)
-        (loadedText: string option)
-        (rewritten: (string * string) option)
+        (prepared: PreparedSource)
         (outWriter: RunTextWriter)
         (errWriter: RunTextWriter)
         (cancellationToken: CancellationToken)
@@ -748,15 +760,6 @@ type SessionHost(options: SessionHostOptions) =
                 session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
                 claimed.CompilerDirectory <- directory
 
-        let sourceName = if request.Mode = "stdin" then "stdin.fsx" else "eval.fsx"
-
-        let sourcePath =
-            if Path.IsPathRooted request.Source then
-                request.Source
-            else
-                Path.Combine(request.WorkingDirectory, request.Source)
-
-        let sourceExists = request.Mode = "file" && File.Exists sourcePath
         let escapedSource = request.Source.Replace("\"", "\"\"")
         let mutable checkedSource = false
 
@@ -768,22 +771,14 @@ type SessionHost(options: SessionHostOptions) =
                 with _ ->
                     0)
 
-        let scriptDirectory =
-            if request.Mode = "file" && sourceExists then
-                match Path.GetDirectoryName sourcePath with
-                | null | "" -> request.WorkingDirectory
-                | directory -> directory
-            else
-                request.WorkingDirectory
-
         let checkedSourceName =
-            if request.Mode = "file" && sourceExists then
-                sourcePath
+            if request.Mode = "file" && prepared.SourceExists then
+                prepared.SourcePath
             else
-                sourceName
+                prepared.SourceName
 
         let mutable attemptedCode = ""
-        let mutable attemptedScriptName = sourceName
+        let mutable attemptedScriptName = prepared.SourceName
 
         let evalCode (code: string) (scriptName: string) =
             checkedSource <- true
@@ -794,38 +789,50 @@ type SessionHost(options: SessionHostOptions) =
             try
                 session.EvalInteraction(wrapped, scriptName, cancellationToken = cancellationToken)
             finally
-                if request.Mode = "file" && sourceExists then
-                    let fileName = Path.GetFileName sourcePath
+                if
+                    code.IndexOf("#cd", StringComparison.Ordinal) >= 0
+                    || code.IndexOf("#load", StringComparison.Ordinal) >= 0
+                then
+                    claimed.CompilerDirectory <- ""
 
-                    if not (String.Equals(sourcePath, fileName, StringComparison.Ordinal)) then
-                        errWriter.ReplaceInBuilder(sourcePath + "(", fileName + "(")
+                if request.Mode = "file" && prepared.SourceExists then
+                    let fileName = Path.GetFileName prepared.SourcePath
+
+                    if not (String.Equals(prepared.SourcePath, fileName, StringComparison.Ordinal)) then
+                        errWriter.ReplaceInBuilder(prepared.SourcePath + "(", fileName + "(")
 
         let run () =
-            match rewritten with
+            match prepared.Rewritten with
             | Some (referenceBlock, rewrittenSource) ->
-                changeDirectory scriptDirectory
+                changeDirectory prepared.ScriptDirectory
                 session.EvalInteraction(referenceBlock, "fsion-nuget-refs.fsx")
                 evalCode rewrittenSource checkedSourceName
             | None ->
                 if request.Mode = "file" then
-                    if sourceExists then
-                        changeDirectory scriptDirectory
-                        evalCode (defaultArg loadedText "") checkedSourceName
+                    if prepared.SourceExists then
+                        changeDirectory prepared.ScriptDirectory
+                        evalCode (defaultArg prepared.LoadedText "") checkedSourceName
                     else
                         changeDirectory request.WorkingDirectory
                         checkedSource <- true
 
                         try
-                            session.EvalInteraction("#load @\"" + escapedSource + "\"", "stdin")
-                        with :? FsiCompilationException ->
-                            // dotnet fsi reports the synthetic #load location as stdin(0,1); FCS uses stdin(1,1).
-                            errWriter.ReplaceInBuilder("stdin(1,1): error FS0078", "stdin(0,1): error FS0078")
-                            reraise ()
+                            try
+                                session.EvalInteraction("#load @\"" + escapedSource + "\"", "stdin")
+                            with :? FsiCompilationException ->
+                                // dotnet fsi reports the synthetic #load location as stdin(0,1); FCS uses stdin(1,1).
+                                errWriter.ReplaceInBuilder("stdin(1,1): error FS0078", "stdin(0,1): error FS0078")
+                                reraise ()
+                        finally
+                            // The loaded file is not read here, so a `#cd` inside it cannot be
+                            // detected; invalidate the tracked directory so the next turn re-applies
+                            // `#cd` if the load changed FCS's compiler directory.
+                            claimed.CompilerDirectory <- ""
                 else
                     changeDirectory request.WorkingDirectory
-                    evalCode (defaultArg loadedText "") sourceName
+                    evalCode (defaultArg prepared.LoadedText "") prepared.SourceName
         let compileDiagnostics () =
-            if not checkedSource || (request.Mode = "file" && not sourceExists) then
+            if not checkedSource || (request.Mode = "file" && not prepared.SourceExists) then
                 [||]
             else
                 // The non-throwing APIs suppress the formatted diagnostics but still write
@@ -871,7 +878,7 @@ type SessionHost(options: SessionHostOptions) =
                     request.IncludeDiagnostics
                     && not compiledAndEnteredRuntime
                     && checkedSource
-                    && not (request.Mode = "file" && not sourceExists)
+                    && not (request.Mode = "file" && not prepared.SourceExists)
                 then
                     1, compileDiagnostics ()
                 else
@@ -1141,7 +1148,7 @@ type SessionHost(options: SessionHostOptions) =
                         | _ -> ()
 
                         try
-                            let loadedText, rewritten = prepareExecution request
+                            let prepared = prepareExecution request
                             disconnectToken.ThrowIfCancellationRequested()
                             Volatile.Write(&evaluationStarted.contents, 1)
 
@@ -1164,7 +1171,7 @@ type SessionHost(options: SessionHostOptions) =
                                         Unchecked.defaultof<Timer>
 
                                 let exitCode, diagnostics =
-                                    evaluate claimed request loadedText rewritten outWriter errWriter runCts.Token
+                                    evaluate claimed request prepared outWriter errWriter runCts.Token
 
                                 Interlocked.Increment(&executed.contents) |> ignore
 

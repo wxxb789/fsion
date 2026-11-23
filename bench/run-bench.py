@@ -20,6 +20,7 @@ import argparse
 import datetime as _datetime
 import hashlib
 import json
+import math
 import os
 import platform
 import secrets
@@ -64,13 +65,11 @@ def _fsiond_binary(tfm: str) -> Path:
 
 
 class Runner:
-    def __init__(self, entry: dict, command: list[str], resolved: str | None):
+    def __init__(self, entry: dict, command: list[str]):
         self.id: str = entry["id"]
         self.kind: str = entry["kind"]
         self.ext: str = entry["ext"]
         self.command: list[str] = command
-        self.resolved: str | None = resolved
-        self.description: str = entry.get("description", "")
 
 
 def _discover_runners(data: dict, tfm: str, only: list[str] | None) -> tuple[list[Runner], list[str]]:
@@ -87,14 +86,14 @@ def _discover_runners(data: dict, tfm: str, only: list[str] | None) -> tuple[lis
             if not binary.is_file():
                 missing.append(f"{entry['id']}: {binary} (publish fsion first: pwsh -File eng/gate.ps1)")
                 continue
-            runners.append(Runner(entry, [str(binary)], str(binary)))
+            runners.append(Runner(entry, [str(binary)]))
         else:
             command = list(entry["command"])
             resolved = _executable(command[0])
             if resolved is None:
                 missing.append(f"{entry['id']}: {command[0]} not found on PATH")
                 continue
-            runners.append(Runner(entry, [resolved] + command[1:], resolved))
+            runners.append(Runner(entry, [resolved] + command[1:]))
     return runners, missing
 
 
@@ -252,7 +251,6 @@ def _run_command(command: list[str], work_dir: Path, env: dict, timeout: float) 
             "exit": completed.returncode,
             "stdout": completed.stdout,
             "stderr": completed.stderr,
-            "command": command,
         }
     except subprocess.TimeoutExpired:
         elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -261,8 +259,6 @@ def _run_command(command: list[str], work_dir: Path, env: dict, timeout: float) 
             "exit": None,
             "stdout": b"",
             "stderr": f"timed out after {timeout} s".encode("utf-8"),
-            "command": command,
-            "timeout": True,
         }
 
 
@@ -273,7 +269,7 @@ def _run_once(runner: Runner, script: Path, work_dir: Path, env: dict, timeout: 
 def _percentile(sorted_values: list[float], fraction: float) -> float:
     if not sorted_values:
         return 0.0
-    index = max(0, min(len(sorted_values) - 1, int(len(sorted_values) * fraction + 0.999999) - 1))
+    index = max(0, min(len(sorted_values) - 1, math.ceil(len(sorted_values) * fraction) - 1))
     return sorted_values[index]
 
 
@@ -463,8 +459,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--work-dir",
         default=None,
-        help="directory for the generated scripts (default bench/.work/run-<salt> inside the repository; "
-        "all runners share it so no runtime pays a path-specific penalty)",
+        help="parent directory for the harness-owned run-<salt> script directory (default bench/.work/ "
+        "inside the repository; all runners share the generated scripts so no runtime pays a "
+        "path-specific penalty)",
     )
     parser.add_argument("--dry-run", action="store_true", help="render round 1 sources and exit")
     return parser.parse_args(argv)
@@ -503,7 +500,11 @@ def main(argv: list[str]) -> int:
         return 0
 
     salt = secrets.token_hex(4)
-    work_dir = Path(args.work_dir).resolve() if args.work_dir else (BENCH_DIR / ".work" / f"run-{salt}")
+    work_dir = (
+        (Path(args.work_dir).resolve() / f"run-{salt}")
+        if args.work_dir
+        else (BENCH_DIR / ".work" / f"run-{salt}")
+    )
     work_dir.mkdir(parents=True, exist_ok=True)
     config_dir = work_dir / ".fsion-config"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -540,7 +541,7 @@ def main(argv: list[str]) -> int:
             measured_round = round_index >= warmup_rounds
             round_number = round_index - warmup_rounds + 1
             order = runners[round_index % len(runners) :] + runners[: round_index % len(runners)]
-            round_entry = {"round": round_number if measured_round else None, "warmup": not measured_round, "workloads": {}}
+            round_entry = {"round": round_number, "workloads": {}} if measured_round else None
             for workload in workloads:
                 nonce, seed = _nonce(salt, round_index + 1, workload)
                 rows = _typical_rows(data, nonce, seed)
@@ -572,15 +573,15 @@ def main(argv: list[str]) -> int:
                     for runner_id, value in timings.items():
                         totals[workload][runner_id].append(value)
                     fsion_per_round[workload].append(timings["fsion"])
-                round_entry["workloads"][workload] = {
-                    "nonce": nonce,
-                    "fsharpSourceSha256": hashlib.sha256(
-                        _render_source(fsion_runner, workload, nonce, seed, rows).encode("utf-8")
-                    ).hexdigest(),
-                    "outputSha256": hashlib.sha256(expected_bytes).hexdigest(),
-                    "verified": True,
-                    "timingsMs": timings if measured_round else {},
-                }
+                    round_entry["workloads"][workload] = {
+                        "nonce": nonce,
+                        "fsharpSourceSha256": hashlib.sha256(
+                            _render_source(fsion_runner, workload, nonce, seed, rows).encode("utf-8")
+                        ).hexdigest(),
+                        "outputSha256": hashlib.sha256(expected_bytes).hexdigest(),
+                        "verified": True,
+                        "timingsMs": timings,
+                    }
             if measured_round:
                 measured += 1
                 rounds_detail.append(round_entry)

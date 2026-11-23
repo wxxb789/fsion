@@ -179,3 +179,38 @@ type NugetCacheTests(output: ITestOutputHelper) =
             finally
                 purgeDependencyManagerCache packageId
                 tryDeleteDirectory cacheDirectory)
+
+    [<Fact>]
+    member _.``a short --timeout on a cold nuget cache miss neither drains the daemon nor fails fast typical code`` () =
+        withContext "nuget-cold-timeout" (fun context directory ->
+            let cacheDirectory = createTempDir "nuget-timeout-cache"
+            let packageId = uniquePackageId "fsiontimeout"
+            let packagesDirectory = Path.Combine(directory, "packages")
+            let environment = [ "FSION_CACHE_DIR", cacheDirectory; "NUGET_PACKAGES", packagesDirectory ]
+
+            try
+                let feed = createTinyPackage directory packageId
+                writeNugetConfig directory feed
+
+                let warmup = context.Run([ "warmup" ], timeoutMs = 180000, extraEnv = environment)
+                Assert.Equal(0, warmup.ExitCode)
+                let daemonPid = context.DaemonPid()
+                Assert.True(daemonPid.IsSome, "daemon was not reported as running")
+
+                writeFile
+                    directory
+                    "timed-nuget.fsx"
+                    ("#r \"nuget: "
+                     + packageId
+                     + ", 1.0.0\"\n"
+                     + "printfn \"%s\" (FsionTinyPkgNs.Greeter.Hello())\n")
+
+                let result =
+                    context.Run([ "--timeout"; "500"; "timed-nuget.fsx" ], timeoutMs = 240000, extraEnv = environment)
+
+                Assert.Equal(0, result.ExitCode)
+                Assert.Equal("tiny-package-ok" + Environment.NewLine, result.Stdout)
+                Assert.Equal(daemonPid, context.DaemonPid())
+            finally
+                purgeDependencyManagerCache packageId
+                tryDeleteDirectory cacheDirectory)

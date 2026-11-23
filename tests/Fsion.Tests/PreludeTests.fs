@@ -270,3 +270,32 @@ type PreludeTests(output: ITestOutputHelper) =
             Assert.Equal(1, oldBindingGone.ExitCode)
             Assert.Contains("FS0039", oldBindingGone.Stderr)
             Assert.Equal(daemonPid, context.DaemonPid()))
+
+    [<Fact>]
+    member _.``a broken configured prelude unloads its aborted session and stops pool churn until fixed`` () =
+        withContext "prelude-broken-unload" (fun context directory ->
+            let brokenPath = Path.Combine(directory, "broken-prelude.fsx")
+            writeFile directory "broken-prelude.fsx" "let brokenPrelude : int = \"not-an-int\"\n"
+
+            let failed =
+                context.Run([ "--prelude"; brokenPath; "-e"; "1" ], timeoutMs = 120000)
+
+            Assert.Equal(1, failed.ExitCode)
+            Assert.Contains("configured prelude did not compile", failed.Stderr)
+            let daemonPid = context.DaemonPid()
+            Assert.True(daemonPid.IsSome, "daemon was not reported as running")
+
+            System.Threading.Thread.Sleep 800
+            let settled = context.MetricsOrFail()
+            Assert.Equal(0, settled.PoolWarm)
+            Assert.Equal(0, settled.AliveDisposedSessions)
+            Assert.Equal(0, settled.ScriptAssemblies)
+
+            writeFile directory "broken-prelude.fsx" "let recoveredValue () = 42\n"
+
+            let recovered =
+                context.Run([ "--prelude"; brokenPath; "-e"; "printfn \"%d\" (recoveredValue())" ], timeoutMs = 120000)
+
+            Assert.Equal(0, recovered.ExitCode)
+            Assert.Equal("42" + Environment.NewLine, recovered.Stdout)
+            Assert.Equal(daemonPid, context.DaemonPid()))

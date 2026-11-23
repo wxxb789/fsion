@@ -25,8 +25,8 @@ Recorded run on this tree: **exit code 0** (`GATE PASSED`).
 | `dotnet build fsion.slnx -c Release` | Build succeeded, 0 warnings, 0 errors |
 | `dotnet publish src/fsion -c Release -f net10.0` | exit 0, `artifacts/publish/fsion/net10.0/fsion.exe` (4,129,280 bytes, 0 trim/AOT warnings) |
 | `dotnet publish src/fsion -c Release -f net11.0` | exit 0, `artifacts/publish/fsion/net11.0/fsion.exe` (4,154,880 bytes, 0 trim/AOT warnings) |
-| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 67, Skipped 0, Total 67, 11 m 30 s |
-| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 67, Skipped 0, Total 67, 11 m 6 s |
+| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 69, Skipped 0, Total 69 |
+| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 69, Skipped 0, Total 69 |
 | `Assert-LineEndings` | `line endings: 51 tracked and 51 non-ignored files clean` |
 
 Focused detailed run (prior to the full gate, non-concurrent):
@@ -55,6 +55,7 @@ Baseline observed on `c65d63f` before Goal 0004:
   - A custom UTF-8-with-BOM `prelude.fsx` containing `#r "nuget: fsiontiny..., 1.0.0"` and a side-effecting `File.AppendAllText(preloadCountPath, "1\n")` is evaluated **during `fsion warmup` pool creation** (`preloadCountPath` already contains `>= PoolWarm` lines BEFORE the first script run ever executes!).
   - First one-shot script `printfn "%s|%s" (preludeGreeting()) (FsionTinyPkgNs.Greeter.Hello())` prints `first|tiny-package-ok` at warm-pool speed (`ColdClaims` unchanged), and sequential turns in `--session alpha` observe a `let mutable preludeTurns` binding defined in `prelude-a.fsx` increment `1 -> 2` (proving the prelude is not re-evaluated per run).
   - Editing `prelude.fsx` on disk to return `"edited"` causes the next one-shot run to print `edited|tiny-package-ok` while `context.DaemonPid()` remains identical; switching `--prelude` from `prelude-a` to `prelude-b` on `--session alpha` rebuilds the session so `onlyInPreludeA()` fails with `FS0039` (proving genuine session recycle rather than in-place shadowing).
+  - `a broken configured prelude unloads its aborted session and stops pool churn until fixed` verifies that when `createWarmSession` fails on an uncompilable/unreadable prelude, `try/finally` releases and unloads the partial `FsiEvaluationSession` (`AliveDisposedSessions = 0`, `ScriptAssemblies = 0`) and records `failedTag` so the replenisher stops retrying until the prelude file hash changes or a new spec arrives.
 ## Clause 3 — Persistent `#r "nuget: ..."` Resolution Cache
 
 - **Official `DependencyProvider` + lexical scanner**:
@@ -65,6 +66,7 @@ Baseline observed on `c65d63f` before Goal 0004:
     - **Run 1 (`first.fsx`, cache miss — full official NuGet DependencyManager resolution)**: **`6,346 ms`**, prints `first=tiny-package-ok`, persists JSON cache entry under `FSION_CACHE_DIR`.
     - Daemon is stopped (`fsion daemon stop`), FCS's own `~/.packagemanagement/nuget` cache is purged, the local NuGet feed directory is moved away, and `NUGET_PACKAGES` is pointed at a brand-new empty directory (`packages-second`).
     - **Run 2 (`second.fsx`, distinct unseen script with re-spaced `#r "nuget:  <pkg>,1.0.0"` on a fresh daemon generation — persistent cache hit)**: **`452 ms`** (**`14.0x` faster**, `7.1%` of first-run latency!), prints `second=tiny-package-ok`, and `packages-second` does not even exist on disk (proving zero MSBuild/NuGet restore ran).
+  - `a short --timeout on a cold nuget cache miss neither drains the daemon nor fails fast typical code` verifies that `prepareRewrittenSource` resolves cold `#r "nuget: ..."` misses before arming `timeoutTimer` / setting `evaluationStarted`, so first-run package resolution never triggers a false `Wedged = true` daemon drain.
 
 ## Known Limits
 

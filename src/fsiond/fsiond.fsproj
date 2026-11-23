@@ -7,6 +7,8 @@
   <ItemGroup>
     <Compile Include="Log.fs" />
     <Compile Include="Ambient.fs" />
+    <Compile Include="Prelude.fs" />
+    <Compile Include="NugetCache.fs" />
     <Compile Include="SessionHost.fs" />
     <Compile Include="Server.fs" />
     <Compile Include="Program.fs" />

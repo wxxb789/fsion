@@ -26,9 +26,11 @@ type ExecutionReport =
     { Outcome: RunOutcome
       Wedged: bool }
 
+[<NoComparison>]
 type SessionHostOptions =
     { PoolSize: int
-      SessionTtlMinutes: float }
+      SessionTtlMinutes: float
+      Prelude: Prelude.Spec }
 
 type private RunTextWriter() =
     inherit TextWriter()
@@ -87,6 +89,7 @@ type private WarmSession() =
     member val ExitCodeProperty: PropertyInfo option = None with get, set
     member val CancellationTokenProperty: PropertyInfo option = None with get, set
     member val ExitMarker: string = "" with get, set
+    member val Prelude: Prelude.Tag = Prelude.Tag.Builtin with get, set
     member val ProcessExitHandlers: Delegate[] = [||] with get, set
     member val UnmanagedDllHandlers: Delegate[] = [||] with get, set
     member val AssemblyResolveHandlers: Delegate[] = [||] with get, set
@@ -323,6 +326,33 @@ let private prelude (exitMarker: string) =
           "    raise (FsionExit code)\n" ]
     )
 
+let private builtinPrelude =
+    """
+module Fsion =
+    let private warmAssemblies =
+        [ typeof<System.IO.File>
+          typeof<System.Text.StringBuilder>
+          typeof<System.Text.Json.JsonDocument>
+          typeof<System.Text.RegularExpressions.Regex>
+          typeof<System.Net.Http.HttpClient>
+          typeof<System.Linq.Enumerable> ]
+        |> List.map (fun warmType -> warmType.Assembly.GetName().Name)
+
+    let cwd () : string = System.IO.Directory.GetCurrentDirectory()
+    let path (rel: string) : string = System.IO.Path.GetFullPath rel
+    let env (name: string) : string option =
+        match System.Environment.GetEnvironmentVariable name with
+        | null -> None
+        | value -> Some value
+    let envOr (name: string) (fallback: string) : string =
+        match System.Environment.GetEnvironmentVariable name with
+        | null -> fallback
+        | value -> value
+    let readText (path: string) : string = System.IO.File.ReadAllText path
+    let writeText (path: string) (content: string) : unit = System.IO.File.WriteAllText(path, content)
+    let json (text: string) : System.Text.Json.JsonDocument = System.Text.Json.JsonDocument.Parse text
+"""
+
 let private environmentComparer =
     if OperatingSystem.IsWindows() then
         StringComparer.OrdinalIgnoreCase
@@ -413,7 +443,48 @@ type SessionHost(options: SessionHostOptions) =
     let mutable pendingCreations = 0
     let mutable stopped = false
 
-    let createWarmSession () : WarmSession =
+    let evaluateUserPrelude (session: FsiEvaluationSession) (path: string) : Prelude.Tag =
+        match Prelude.readAndHashFile path with
+        | None -> failwith ("configured prelude file could not be read: " + path)
+        | Some (text, contentHash) ->
+            let directory =
+                match Path.GetDirectoryName path with
+                | null | "" -> AppContext.BaseDirectory
+                | directory -> directory
+
+            session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
+            match NugetCache.prepare text directory path with
+            | Some plan ->
+                session.EvalInteraction(NugetCache.referenceBlock plan, "fsion-prelude-refs.fsx")
+                session.EvalInteraction(plan.RewrittenSource + "\n()", path)
+            | None -> session.EvalInteraction(text + "\n()", path)
+
+            Prelude.Tag.File(path, contentHash)
+    let releaseSession (claimed: WarmSession) =
+        match claimed.Session with
+        | Some session -> clearScriptStatics session.DynamicAssemblies
+        | None -> ()
+
+        clearCompilerAsyncLocals ()
+        sweepTransientFinalizers ()
+
+        pendingCleanups.Enqueue
+            { Session = claimed.Session
+              ProcessExitHandlers = claimed.ProcessExitHandlers
+              UnmanagedDllHandlers = claimed.UnmanagedDllHandlers
+              AssemblyResolveHandlers = claimed.AssemblyResolveHandlers }
+
+        claimed.Session <- None
+        claimed.State <- None
+        claimed.CommandLineArgsProperty <- None
+        claimed.ExitedProperty <- None
+        claimed.ExitCodeProperty <- None
+        claimed.CancellationTokenProperty <- None
+        claimed.ProcessExitHandlers <- [||]
+        claimed.UnmanagedDllHandlers <- [||]
+        claimed.AssemblyResolveHandlers <- [||]
+
+    let createWarmSession (spec: Prelude.Spec) : WarmSession =
         let processExitBefore = processExitSnapshot ()
         let unmanagedDllBefore = unmanagedDllSnapshot ()
         let assemblyResolveBefore = assemblyResolveSnapshot ()
@@ -433,39 +504,96 @@ type SessionHost(options: SessionHostOptions) =
         let processExitHandlers = addedHandlers processExitBefore (processExitSnapshot ())
         let unmanagedDllHandlers = addedHandlers unmanagedDllBefore (unmanagedDllSnapshot ())
         let assemblyResolveHandlers = addedHandlers assemblyResolveBefore (assemblyResolveSnapshot ())
-        let exitMarker = "@@FSION-EXIT-" + Guid.NewGuid().ToString("N") + "@@"
-        session.EvalInteraction(prelude exitMarker)
-        let state =
-            match session.TryFindBoundValue "fsionFsiState" with
-            | Some bound -> bound.Value.ReflectionValue
-            | None -> failwith "fsion prelude did not expose fsionFsiState"
-
-        let stateType = state.GetType()
-        clearCompilerAsyncLocals ()
         let warm = WarmSession()
         warm.Session <- Some session
-        warm.State <- Some state
-        warm.CommandLineArgsProperty <- Some(stateType.GetProperty "CommandLineArgs")
-        warm.ExitedProperty <- Some(stateType.GetProperty "Exited")
-        warm.ExitCodeProperty <- Some(stateType.GetProperty "ExitCode")
-        warm.CancellationTokenProperty <- Some(stateType.GetProperty "CancellationToken")
-        warm.ExitMarker <- exitMarker
         warm.ProcessExitHandlers <- processExitHandlers
         warm.UnmanagedDllHandlers <- unmanagedDllHandlers
         warm.AssemblyResolveHandlers <- assemblyResolveHandlers
-        warm
+        let mutable succeeded = false
 
-    let claimSession (cancelToken: CancellationToken) : WarmSession =
+        try
+            let exitMarker = "@@FSION-EXIT-" + Guid.NewGuid().ToString("N") + "@@"
+            let creationOut = new StringWriter()
+            let creationErr = new StringWriter()
+            Ambient.set { Out = creationOut; Error = creationErr; In = TextReader.Null }
+            let mutable preludeTag = Prelude.Tag.Builtin
+
+            try
+                try
+                    match spec with
+                    | Prelude.Spec.Bare ->
+                        session.EvalInteraction(prelude exitMarker)
+                        preludeTag <- Prelude.Tag.Bare
+                    | Prelude.Spec.Builtin ->
+                        session.EvalInteraction(prelude exitMarker + builtinPrelude)
+                        preludeTag <- Prelude.Tag.Builtin
+                    | Prelude.Spec.File path ->
+                        session.EvalInteraction(prelude exitMarker + builtinPrelude)
+                        preludeTag <- evaluateUserPrelude session path
+                with :? FsiCompilationException ->
+                    let diagnostics = creationErr.ToString()
+
+                    if diagnostics.Trim().Length = 0 then
+                        reraise ()
+                    else
+                        failwith ("configured prelude did not compile:" + Environment.NewLine + diagnostics)
+            finally
+                Ambient.clear ()
+
+            let state =
+                match session.TryFindBoundValue "fsionFsiState" with
+                | Some bound -> bound.Value.ReflectionValue
+                | None -> failwith "fsion prelude did not expose fsionFsiState"
+
+            let stateType = state.GetType()
+            clearCompilerAsyncLocals ()
+            warm.State <- Some state
+            warm.CommandLineArgsProperty <- Some(stateType.GetProperty "CommandLineArgs")
+            warm.ExitedProperty <- Some(stateType.GetProperty "Exited")
+            warm.ExitCodeProperty <- Some(stateType.GetProperty "ExitCode")
+            warm.CancellationTokenProperty <- Some(stateType.GetProperty "CancellationToken")
+            warm.ExitMarker <- exitMarker
+            warm.Prelude <- preludeTag
+            succeeded <- true
+            warm
+        finally
+            if not succeeded then
+                releaseSession warm
+                replenishSignal.Release() |> ignore
+    let desiredGate = obj ()
+    let mutable desiredSpec = options.Prelude
+    let mutable failedTag: Prelude.Tag option = None
+    let mutable failedError: string option = None
+
+    let rec claimSession (tag: Prelude.Tag) (cancelToken: CancellationToken) : WarmSession =
         match pool.TryDequeue() with
-        | true, warm -> warm
+        | true, warm when warm.Prelude = tag -> warm
+        | true, warm ->
+            releaseSession warm
+            claimSession tag cancelToken
         | _ ->
             Interlocked.Increment(&coldClaims.contents) |> ignore
             creationGate.Wait(cancelToken)
 
-            try
-                createWarmSession ()
-            finally
-                creationGate.Release() |> ignore
+            let created =
+                try
+                    createWarmSession (Prelude.specOfTag tag)
+                finally
+                    creationGate.Release() |> ignore
+
+            let cleared =
+                lock desiredGate (fun () ->
+                    if failedTag.IsSome then
+                        failedTag <- None
+                        failedError <- None
+                        true
+                    else
+                        false)
+
+            if cleared then
+                replenishSignal.Release() |> ignore
+
+            created
 
     let removeHandlers (work: CleanupWork) =
         removeProcessExit work.ProcessExitHandlers
@@ -512,7 +640,7 @@ type SessionHost(options: SessionHostOptions) =
 
     // Handler removal and collectible-session disposal need creationGate so delegate adds and
     // removes never interleave, but a run must not stall behind a slow background session
-    // creation. The replenisher drains this queue right after it wakes (it runs with
+    // creation. The replenisher drains this queue after refilling the warm pool (it runs with
     // --pool-size 0 too), and Metrics drains it before sampling.
     let drainCleanups () =
         if creationGate.Wait 0 then
@@ -529,33 +657,48 @@ type SessionHost(options: SessionHostOptions) =
         finally
             creationGate.Release() |> ignore
 
-    let releaseSession (claimed: WarmSession) =
-        match claimed.Session with
-        | Some session -> clearScriptStatics session.DynamicAssemblies
-        | None -> ()
+    let prepareRewrittenSource (request: ExecuteRequest) : (string * string) option =
+        let sourceName = if request.Mode = "stdin" then "stdin.fsx" else "eval.fsx"
 
-        clearCompilerAsyncLocals ()
-        sweepTransientFinalizers ()
+        let sourcePath =
+            if Path.IsPathRooted request.Source then
+                request.Source
+            else
+                Path.Combine(request.WorkingDirectory, request.Source)
 
-        pendingCleanups.Enqueue
-            { Session = claimed.Session
-              ProcessExitHandlers = claimed.ProcessExitHandlers
-              UnmanagedDllHandlers = claimed.UnmanagedDllHandlers
-              AssemblyResolveHandlers = claimed.AssemblyResolveHandlers }
+        let sourceExists = request.Mode = "file" && File.Exists sourcePath
 
-        claimed.Session <- None
-        claimed.State <- None
-        claimed.CommandLineArgsProperty <- None
-        claimed.ExitedProperty <- None
-        claimed.ExitCodeProperty <- None
-        claimed.CancellationTokenProperty <- None
-        claimed.ProcessExitHandlers <- [||]
-        claimed.UnmanagedDllHandlers <- [||]
-        claimed.AssemblyResolveHandlers <- [||]
+        let scriptDirectory =
+            if request.Mode = "file" && sourceExists then
+                match Path.GetDirectoryName sourcePath with
+                | null | "" -> request.WorkingDirectory
+                | directory -> directory
+            else
+                request.WorkingDirectory
+
+        let containsNuget (text: string) = text.IndexOf("nuget:", StringComparison.OrdinalIgnoreCase) >= 0
+
+        if request.Mode = "file" then
+            if sourceExists then
+                let text = File.ReadAllText sourcePath
+
+                if containsNuget text then
+                    NugetCache.prepare text scriptDirectory sourcePath
+                    |> Option.map (fun plan -> NugetCache.referenceBlock plan, plan.RewrittenSource)
+                else
+                    None
+            else
+                None
+        elif containsNuget request.Source then
+            NugetCache.prepare request.Source scriptDirectory sourceName
+            |> Option.map (fun plan -> NugetCache.referenceBlock plan, plan.RewrittenSource)
+        else
+            None
 
     let evaluate
         (claimed: WarmSession)
         (request: ExecuteRequest)
+        (rewritten: (string * string) option)
         (outWriter: RunTextWriter)
         (errWriter: RunTextWriter)
         (cancellationToken: CancellationToken)
@@ -567,7 +710,7 @@ type SessionHost(options: SessionHostOptions) =
         claimed.ExitCodeProperty.Value.SetValue(state, box 0)
 
         let changeDirectory (directory: string) =
-            session.EvalInteraction("#cd @\"" + directory.Replace("\"", "\"\"") + "\"")
+            session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
 
         let sourceName = if request.Mode = "stdin" then "stdin.fsx" else "eval.fsx"
 
@@ -589,30 +732,51 @@ type SessionHost(options: SessionHostOptions) =
                 with _ ->
                     0)
 
+        let scriptDirectory =
+            if request.Mode = "file" && sourceExists then
+                match Path.GetDirectoryName sourcePath with
+                | null | "" -> request.WorkingDirectory
+                | directory -> directory
+            else
+                request.WorkingDirectory
+
+        let checkedSourceName =
+            if request.Mode = "file" && sourceExists then
+                sourcePath
+            else
+                sourceName
+
         let run () =
-            if request.Mode = "file" then
-                if sourceExists then
-                    let directory = Path.GetDirectoryName sourcePath
+            match rewritten with
+            | Some (referenceBlock, rewrittenSource) ->
+                changeDirectory scriptDirectory
+                checkedSource <- true
+                session.EvalInteraction(referenceBlock, "fsion-nuget-refs.fsx")
+                session.EvalInteraction(rewrittenSource + "\n()", checkedSourceName, cancellationToken = cancellationToken)
+            | None ->
+                if request.Mode = "file" then
+                    if sourceExists then
+                        let directory = Path.GetDirectoryName sourcePath
 
-                    if not (String.IsNullOrEmpty directory) then
-                        changeDirectory directory
+                        if not (String.IsNullOrEmpty directory) then
+                            changeDirectory directory
 
-                    checkedSource <- true
-                    session.EvalScript(Path.GetFileName sourcePath)
+                        checkedSource <- true
+                        session.EvalScript(Path.GetFileName sourcePath)
+                    else
+                        changeDirectory request.WorkingDirectory
+                        checkedSource <- true
+
+                        try
+                            session.EvalInteraction("#load @\"" + escapedSource + "\"", "stdin")
+                        with :? FsiCompilationException ->
+                            // dotnet fsi reports the synthetic #load location as stdin(0,1); FCS uses stdin(1,1).
+                            errWriter.ReplaceInBuilder("stdin(1,1): error FS0078", "stdin(0,1): error FS0078")
+                            reraise ()
                 else
                     changeDirectory request.WorkingDirectory
                     checkedSource <- true
-
-                    try
-                        session.EvalInteraction("#load @\"" + escapedSource + "\"", "stdin")
-                    with :? FsiCompilationException ->
-                        // dotnet fsi reports the synthetic #load location as stdin(0,1); FCS uses stdin(1,1).
-                        errWriter.ReplaceInBuilder("stdin(1,1): error FS0078", "stdin(0,1): error FS0078")
-                        reraise ()
-            else
-                changeDirectory request.WorkingDirectory
-                checkedSource <- true
-                session.EvalInteraction(request.Source + "\n()", sourceName, cancellationToken = cancellationToken)
+                    session.EvalInteraction(request.Source + "\n()", sourceName, cancellationToken = cancellationToken)
 
         let compileDiagnostics () =
             if not checkedSource || (request.Mode = "file" && not sourceExists) then
@@ -626,10 +790,14 @@ type SessionHost(options: SessionHostOptions) =
 
                 let diagnostics =
                     try
-                        if request.Mode = "file" then
-                            snd (session.EvalScriptNonThrowing(Path.GetFileName sourcePath))
-                        else
-                            snd (session.EvalInteractionNonThrowing(request.Source + "\n()", sourceName))
+                        match rewritten with
+                        | Some (_, rewrittenSource) ->
+                            snd (session.EvalInteractionNonThrowing(rewrittenSource + "\n()", checkedSourceName))
+                        | None ->
+                            if request.Mode = "file" then
+                                snd (session.EvalScriptNonThrowing(Path.GetFileName sourcePath))
+                            else
+                                snd (session.EvalInteractionNonThrowing(request.Source + "\n()", sourceName))
                     finally
                         Ambient.set saved
 
@@ -708,15 +876,51 @@ type SessionHost(options: SessionHostOptions) =
                     finally
                         entry.Gate.Release() |> ignore
 
+    let setDesiredSpec (spec: Prelude.Spec) =
+        let changed =
+            lock desiredGate (fun () ->
+                if desiredSpec = spec then
+                    false
+                else
+                    desiredSpec <- spec
+                    failedTag <- None
+                    failedError <- None
+                    true)
+
+        if changed then
+            replenishSignal.Release() |> ignore
+
+    let recycleStalePoolSessions () =
+        let current = lock desiredGate (fun () -> Prelude.tagOfSpec desiredSpec)
+        let retained = ResizeArray<WarmSession>()
+        let mutable warm = Unchecked.defaultof<WarmSession>
+
+        while pool.TryDequeue(&warm) do
+            if warm.Prelude = current then
+                retained.Add warm
+            else
+                try
+                    releaseSession warm
+                with ex ->
+                    Log.error None ("replenisher failed to release a stale warm session: " + ex.Message)
+
+        for warm in retained do
+            pool.Enqueue warm
+
     let replenish () =
         while not stopped do
             replenishSignal.Wait 250 |> ignore
-            drainCleanups ()
+            recycleStalePoolSessions ()
 
             let mutable working = true
 
             while working && not stopped do
-                if pool.Count + pendingCreations < targetPoolSize then
+                let spec, currentTag, skipBroken =
+                    lock desiredGate (fun () ->
+                        let tag = Prelude.tagOfSpec desiredSpec
+                        desiredSpec, tag, failedTag = Some tag)
+
+                if not skipBroken && pool.Count + pendingCreations < targetPoolSize then
                     pendingCreations <- pendingCreations + 1
 
                     let created =
@@ -725,26 +929,41 @@ type SessionHost(options: SessionHostOptions) =
                                 creationGate.Wait()
 
                                 try
-                                    Some(createWarmSession ())
+                                    let warm = createWarmSession spec
+
+                                    lock desiredGate (fun () ->
+                                        if failedTag = Some currentTag then
+                                            failedTag <- None
+                                            failedError <- None)
+
+                                    Some warm
                                 finally
                                     creationGate.Release() |> ignore
                             with ex ->
                                 Log.error None ("replenisher could not create a warm session: " + ex.Message)
-                                Thread.Sleep 200
+
+                                lock desiredGate (fun () ->
+                                    failedTag <- Some currentTag
+                                    failedError <- Some ex.Message)
+
                                 None
                         finally
                             pendingCreations <- pendingCreations - 1
 
                     match created with
                     | Some warm -> pool.Enqueue warm
-                    | None -> ()
+                    | None -> working <- false
                 else
                     working <- false
 
+            if not pendingCleanups.IsEmpty && (pendingCleanups.Count >= 4 || pool.Count >= targetPoolSize || (lock desiredGate (fun () -> failedTag.IsSome))) then
+                try
+                    drainCleanups ()
+                with ex ->
+                    Log.error None ("replenisher failed to drain cleanups: " + ex.Message)
     do
         Task.Factory.StartNew(replenish, TaskCreationOptions.LongRunning) |> ignore
         replenishSignal.Release() |> ignore
-
         if sessionTtlMs > 0L then
             let sweepIntervalMs = max 250 (min 5000 (int (sessionTtlMs / 4L)))
 
@@ -757,22 +976,57 @@ type SessionHost(options: SessionHostOptions) =
             )
             |> ignore
 
-    member _.EnsureWarm() =
+    member _.DesiredSpec = lock desiredGate (fun () -> desiredSpec)
+
+    member _.EnsureWarm(spec: Prelude.Spec) =
+        lock desiredGate (fun () ->
+            desiredSpec <- spec
+            failedTag <- None
+            failedError <- None)
+
         if targetPoolSize > 0 then
+            recycleStalePoolSessions ()
             drainCleanups ()
             replenishSignal.Release() |> ignore
             let deadline = Environment.TickCount64 + 60000L
             let mutable filling = true
 
             while filling do
+                let broken =
+                    lock desiredGate (fun () -> failedTag = Some(Prelude.tagOfSpec desiredSpec))
+
                 filling <-
                     not stopped
-                    && pool.Count + pendingCreations < targetPoolSize
+                    && not broken
+                    && pool.Count < targetPoolSize
                     && Environment.TickCount64 < deadline
-
                 if filling then
                     Thread.Sleep 5
 
+            let failure =
+                lock desiredGate (fun () ->
+                    if failedTag = Some(Prelude.tagOfSpec desiredSpec) then
+                        Some(defaultArg failedError "configured prelude failed during warmup")
+                    else
+                        None)
+
+            match failure with
+            | Some message -> failwith message
+            | None -> ()
+        else
+            match spec with
+            | Prelude.Spec.File _ ->
+                creationGate.Wait()
+
+                let probe =
+                    try
+                        createWarmSession spec
+                    finally
+                        creationGate.Release() |> ignore
+
+                releaseSession probe
+                replenishSignal.Release() |> ignore
+            | _ -> ()
     member _.IsWarm = pool.Count > 0
 
     member _.ExecutedCount = executed.Value
@@ -843,6 +1097,8 @@ type SessionHost(options: SessionHostOptions) =
                         | _ -> ()
 
                         try
+                            let rewritten = prepareRewrittenSource request
+                            disconnectToken.ThrowIfCancellationRequested()
                             Volatile.Write(&evaluationStarted.contents, 1)
 
                             try
@@ -863,7 +1119,9 @@ type SessionHost(options: SessionHostOptions) =
                                     else
                                         Unchecked.defaultof<Timer>
 
-                                let exitCode, diagnostics = evaluate claimed request outWriter errWriter runCts.Token
+                                let exitCode, diagnostics =
+                                    evaluate claimed request rewritten outWriter errWriter runCts.Token
+
                                 Interlocked.Increment(&executed.contents) |> ignore
 
                                 { ExitCode = exitCode
@@ -897,11 +1155,15 @@ type SessionHost(options: SessionHostOptions) =
               TimedOut = false }
 
         let work () =
+            let targetSpec = Prelude.specOfRequest request
+            setDesiredSpec targetSpec
+            let expectedTag = Prelude.tagOfSpec targetSpec
+
             let outcome =
                 try
                     match request.SessionId with
                     | None ->
-                        let claimed = claimSession disconnectToken
+                        let claimed = claimSession expectedTag disconnectToken
 
                         try
                             runInSession claimed true
@@ -925,8 +1187,14 @@ type SessionHost(options: SessionHostOptions) =
                               TimedOut = true }
                         | Some entry ->
                             try
+                                match entry.Session with
+                                | Some warm when warm.Prelude <> expectedTag ->
+                                    releaseSession warm
+                                    entry.Session <- None
+                                | _ -> ()
+
                                 if entry.Session.IsNone then
-                                    entry.Session <- Some(claimSession disconnectToken)
+                                    entry.Session <- Some(claimSession expectedTag disconnectToken)
 
                                 let outcome =
                                     try
@@ -960,7 +1228,7 @@ type SessionHost(options: SessionHostOptions) =
         else
             let completedInGrace =
                 try
-                    worker.Wait 150
+                    worker.Wait 1500
                 with :? AggregateException ->
                     true
 

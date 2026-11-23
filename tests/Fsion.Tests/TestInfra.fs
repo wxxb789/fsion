@@ -158,7 +158,8 @@ type FsionContext(workingDirectory: string) =
 
     let baseEnvironment =
         [ "FSION_PIPE", endpoint
-          "FSIOND_PATH", fsiondBinary ]
+          "FSIOND_PATH", fsiondBinary
+          "FSION_CONFIG_DIR", Path.Combine(workingDirectory, ".fsion-config") ]
 
     let mutable disposed = false
 
@@ -181,6 +182,10 @@ type FsionContext(workingDirectory: string) =
                 | Metrics metrics -> Some metrics
                 | _ -> None
             | None -> None
+
+    member this.MetricsOrFail(?timeoutMs: int) : MetricsInfo =
+        this.Metrics(defaultArg timeoutMs 30000)
+        |> Option.defaultWith (fun () -> failwith "fsiond did not answer GetMetrics")
 
     member _.DaemonPid() : int option =
         let result = runProcess fsionBinary [ "daemon"; "status" ] workingDirectory baseEnvironment None 30000
@@ -231,3 +236,74 @@ let withContext (prefix: string) (body: FsionContext -> string -> unit) =
     finally
         (context :> IDisposable).Dispose()
         tryDeleteDirectory workingDirectory
+
+let uniquePackageId (prefix: string) =
+    prefix + Guid.NewGuid().ToString("N").Substring(0, 12)
+
+let writeNugetConfig (directory: string) (feed: string) =
+    writeFile
+        directory
+        "nuget.config"
+        ("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+         + "<configuration>\n"
+         + "  <packageSources>\n"
+         + "    <clear />\n"
+         + "    <add key=\"fsiontests\" value=\""
+         + feed
+         + "\" />\n"
+         + "  </packageSources>\n"
+         + "</configuration>\n")
+
+let createTinyPackage (directory: string) (packageId: string) : string =
+    let sourceDirectory = Path.Combine(directory, "package-source")
+    Directory.CreateDirectory sourceDirectory |> ignore
+
+    writeFile
+        sourceDirectory
+        (packageId + ".csproj")
+        ("<Project Sdk=\"Microsoft.NET.Sdk\">\n"
+         + "  <PropertyGroup>\n"
+         + "    <TargetFramework>net10.0</TargetFramework>\n"
+         + "    <PackageId>"
+         + packageId
+         + "</PackageId>\n"
+         + "    <Version>1.0.0</Version>\n"
+         + "  </PropertyGroup>\n"
+         + "</Project>\n")
+
+    writeFile
+        sourceDirectory
+        "Tiny.cs"
+        ("namespace FsionTinyPkgNs;\n\n"
+         + "public static class Greeter\n"
+         + "{\n"
+         + "    public static string Hello() => \"tiny-package-ok\";\n"
+         + "}\n")
+
+    let feed = Path.Combine(directory, "nuget-feed")
+
+    let pack =
+        runProcess
+            "dotnet"
+            [ "pack"; Path.Combine(sourceDirectory, packageId + ".csproj"); "-c"; "Release"; "-o"; feed ]
+            directory
+            []
+            None
+            180000
+
+    if pack.ExitCode <> 0 then
+        failwith ("dotnet pack failed: " + pack.Stdout + pack.Stderr)
+
+    feed
+
+let purgeDependencyManagerCache (packageId: string) =
+    let cacheDirectory =
+        Path.Combine(Environment.GetFolderPath Environment.SpecialFolder.UserProfile, ".packagemanagement", "nuget", "Cache")
+
+    if Directory.Exists cacheDirectory then
+        for file in Directory.EnumerateFiles cacheDirectory do
+            try
+                if File.ReadAllText(file).IndexOf(packageId, StringComparison.OrdinalIgnoreCase) >= 0 then
+                    File.Delete file
+            with _ ->
+                ()

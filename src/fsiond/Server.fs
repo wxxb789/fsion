@@ -8,18 +8,21 @@ open System.Threading
 open System.Threading.Tasks
 open Fsion.Ipc
 open Fsion.Protocol
+open Fsiond.Prelude
 open Fsiond.SessionHost
 
+[<NoComparison>]
 type Options =
     { Endpoint: Endpoint
       IdleTtlMinutes: float
       SessionTtlMinutes: float
       Oneshot: bool
       PoolSize: int
-      LogPath: string option }
+      LogPath: string option
+      Prelude: Prelude.Spec }
 
 type [<NoEquality; NoComparison>] private Hooks =
-    { EnsureWarm: unit -> unit
+    { EnsureWarm: Prelude.Spec -> unit
       Execute: ExecuteRequest -> CancellationToken -> ExecutionReport
       Status: unit -> StatusInfo
       Metrics: unit -> MetricsInfo
@@ -87,8 +90,8 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
 
                 if options.Oneshot && not report.Wedged then
                     hooks.Stop ()
-            | Ping ->
-                hooks.EnsureWarm ()
+            | Ping (preludePath, noPrelude) ->
+                hooks.EnsureWarm (Prelude.specOfOptions preludePath noPrelude)
                 sendResponse connection Pong
             | GetStatus -> sendResponse connection (Status(hooks.Status ()))
             | GetMetrics -> sendResponse connection (Metrics(hooks.Metrics ()))
@@ -106,7 +109,8 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
     let session =
         new SessionHost(
             { PoolSize = options.PoolSize
-              SessionTtlMinutes = options.SessionTtlMinutes }
+              SessionTtlMinutes = options.SessionTtlMinutes
+              Prelude = options.Prelude }
         )
 
     let startedAt = DateTime.UtcNow
@@ -127,6 +131,8 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
             with _ ->
                 ()
 
+            releaseOwnership ()
+
     // The drained generation keeps no endpoint and no in-flight script can return. A hard
     // self-kill bounds the leak even if managed shutdown handlers would block on the wedged
     // session's process-wide FSI cleanup.
@@ -145,7 +151,6 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
 
     let retire () =
         stop ()
-        releaseOwnership ()
         scheduleSelfTermination ()
 
     let respawn () =
@@ -158,6 +163,10 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
                       "--idle-ttl"; options.IdleTtlMinutes.ToString(CultureInfo.InvariantCulture)
                       "--session-ttl"; options.SessionTtlMinutes.ToString(CultureInfo.InvariantCulture)
                       "--pool-size"; string options.PoolSize ]
+                    @ (match session.DesiredSpec with
+                       | Prelude.Spec.Bare -> [ "--no-prelude" ]
+                       | Prelude.Spec.Builtin -> []
+                       | Prelude.Spec.File path -> [ "--prelude"; path ])
                     @ (match options.LogPath with
                        | Some path -> [ "--log"; path ]
                        | None -> [])
@@ -170,8 +179,8 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
 
     let hooks =
         { EnsureWarm =
-            fun () ->
-                session.EnsureWarm ()
+            fun spec ->
+                session.EnsureWarm spec
                 lastActivity.Value <- DateTime.UtcNow
           Execute =
             fun request disconnectToken ->

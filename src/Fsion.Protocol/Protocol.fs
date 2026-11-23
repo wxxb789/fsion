@@ -4,7 +4,7 @@ open System
 open System.IO
 open System.Text
 
-let [<Literal>] ProtocolVersion = 3
+let [<Literal>] ProtocolVersion = 4
 
 let [<Literal>] PipeEnvironmentVariable = "FSION_PIPE"
 
@@ -43,7 +43,9 @@ type ExecuteRequest =
       IncludeDiagnostics: bool
       SessionId: string option
       Reset: bool
-      TimeoutMs: int }
+      TimeoutMs: int
+      PreludePath: string option
+      NoPrelude: bool }
 
 type ScriptDiagnostic =
     { Code: string
@@ -86,7 +88,7 @@ type Request =
     | GetStatus
     | GetMetrics
     | Shutdown
-    | Ping
+    | Ping of preludePath: string option * noPrelude: bool
 
 type Response =
     | Executed of ExecutionResult
@@ -122,10 +124,23 @@ let private writeRequestPayload (writer: BinaryWriter) (request: Request) =
 
         writer.Write payload.Reset
         writer.Write payload.TimeoutMs
+        writer.Write payload.NoPrelude
+        writer.Write payload.PreludePath.IsSome
+
+        match payload.PreludePath with
+        | Some preludePath -> writer.Write preludePath
+        | None -> ()
     | GetStatus -> writer.Write 2uy
     | GetMetrics -> writer.Write 5uy
     | Shutdown -> writer.Write 3uy
-    | Ping -> writer.Write 4uy
+    | Ping (preludePath, noPrelude) ->
+        writer.Write 4uy
+        writer.Write noPrelude
+        writer.Write preludePath.IsSome
+
+        match preludePath with
+        | Some path -> writer.Write path
+        | None -> ()
 
 let private writeResponsePayload (writer: BinaryWriter) (response: Response) =
     writer.Write ProtocolVersion
@@ -240,6 +255,9 @@ let parseRequest (payload: byte[]) : Request =
         let sessionId = if hasSession then Some(reader.ReadString()) else None
         let reset = reader.ReadBoolean()
         let timeoutMs = reader.ReadInt32()
+        let noPrelude = reader.ReadBoolean()
+        let hasPrelude = reader.ReadBoolean()
+        let preludePath = if hasPrelude then Some(reader.ReadString()) else None
         Execute
             { Mode = mode
               Source = source
@@ -249,11 +267,17 @@ let parseRequest (payload: byte[]) : Request =
               IncludeDiagnostics = includeDiagnostics
               SessionId = sessionId
               Reset = reset
-              TimeoutMs = timeoutMs }
+              TimeoutMs = timeoutMs
+              PreludePath = preludePath
+              NoPrelude = noPrelude }
     | 2uy -> GetStatus
     | 5uy -> GetMetrics
     | 3uy -> Shutdown
-    | 4uy -> Ping
+    | 4uy ->
+        let noPrelude = reader.ReadBoolean()
+        let hasPrelude = reader.ReadBoolean()
+        let preludePath = if hasPrelude then Some(reader.ReadString()) else None
+        Ping(preludePath, noPrelude)
     | kind -> failwith ("unknown request kind " + string kind)
 
 let parseResponse (payload: byte[]) : Response =

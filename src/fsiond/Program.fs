@@ -6,16 +6,20 @@ open System.IO
 open System.Threading
 open Fsion.Ipc
 open Fsion.Protocol
+open Fsion.PreludeConfig
 open Fsiond.Ambient
+open Fsiond.Prelude
 open Fsiond.Server
 
+[<NoComparison>]
 type private Options =
     { Endpoint: Endpoint
       IdleTtlMinutes: float
       SessionTtlMinutes: float
       Oneshot: bool
       PoolSize: int
-      LogPath: string option }
+      LogPath: string option
+      Prelude: Spec }
 
 let private defaultPoolSize = 3
 
@@ -30,6 +34,8 @@ let private parse (argv: string[]) =
     let mutable poolSize = defaultPoolSize
     let mutable poolSizeSet = false
     let mutable logPath = None
+    let mutable preludePath = None
+    let mutable noPrelude = false
     let mutable index = 0
     let mutable valid = true
     while valid && index < argv.Length do
@@ -62,11 +68,17 @@ let private parse (argv: string[]) =
         | "--oneshot" ->
             oneshot <- true
             index <- index + 1
+        | "--prelude" when index + 1 < argv.Length ->
+            preludePath <- Some argv.[index + 1]
+            index <- index + 2
+        | "--no-prelude" ->
+            noPrelude <- true
+            index <- index + 1
         | "--log" when index + 1 < argv.Length ->
             logPath <- Some argv.[index + 1]
             index <- index + 2
         | _ -> valid <- false
-    if not valid && argv.Length > 0 then
+    if (not valid || (noPrelude && preludePath.IsSome)) && argv.Length > 0 then
         Log.error logPath ("invalid arguments: " + String.Join(" ", argv))
         None
     else
@@ -107,13 +119,27 @@ let private parse (argv: string[]) =
                     match Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture) with
                     | true, parsed when parsed > 0.0 -> parsed
                     | _ -> sessionTtlMinutes
+        let configuredPrelude =
+            if preludePath.IsSome then
+                preludePath
+            else
+                configuredPreludePath ()
+        let prelude =
+            if noPrelude then
+                Spec.Bare
+            else
+                match configuredPrelude |> Option.orElseWith userPreludePath with
+                | Some path -> Spec.File(Path.GetFullPath path)
+                | None -> Spec.Builtin
+
         Some
             { Endpoint = { Name = envEndpoint }
               IdleTtlMinutes = envTtl
               SessionTtlMinutes = envSessionTtl
               Oneshot = oneshot
               PoolSize = envPoolSize
-              LogPath = logPath }
+              LogPath = logPath
+              Prelude = prelude }
 
 let private runDaemon (options: Options) (releaseOwnership: unit -> unit) =
     let serverOptions: Server.Options =
@@ -122,7 +148,8 @@ let private runDaemon (options: Options) (releaseOwnership: unit -> unit) =
           SessionTtlMinutes = options.SessionTtlMinutes
           Oneshot = options.Oneshot
           PoolSize = options.PoolSize
-          LogPath = options.LogPath }
+          LogPath = options.LogPath
+          Prelude = options.Prelude }
     let listener = createListener options.Endpoint
     Server.run serverOptions listener releaseOwnership
 
@@ -136,19 +163,32 @@ let main argv =
     | Some options ->
         if isWindows then
             let ownershipName = "Local\\fsion-endpoint-" + sanitizeName options.Endpoint.Name
-            let mutable createdNew = false
-            let ownership = new Semaphore(1, 1, ownershipName, &createdNew)
+            let ownership = new Semaphore(1, 1, ownershipName)
+            let acquired = ownership.WaitOne(TimeSpan.FromSeconds 2.0)
 
-            if not createdNew then
+            if not acquired then
                 ownership.Dispose()
                 Log.info options.LogPath "another fsiond owns this endpoint; exiting"
                 0
             else
-                runDaemon options (fun () ->
-                    try
-                        ownership.Dispose()
-                    with _ ->
-                        ())
+                let mutable released = 0
+
+                let release () =
+                    if Interlocked.Exchange(&released, 1) = 0 then
+                        try
+                            ownership.Release() |> ignore
+                        with _ ->
+                            ()
+
+                        try
+                            ownership.Dispose()
+                        with _ ->
+                            ()
+
+                try
+                    runDaemon options release
+                finally
+                    release ()
         else
             let path = socketPath options.Endpoint
             let ownedByOther =

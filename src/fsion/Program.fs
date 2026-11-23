@@ -33,7 +33,13 @@ type private Options =
       SessionId: string option
       Reset: bool
       TimeoutMs: int option
+      PreludePath: string option
+      NoPrelude: bool
       Json: bool }
+
+type private PreludeSelection =
+    { NoPrelude: bool
+      Path: string option }
 
 let private usage =
     "fsion " + version + " - fast F# script runner\n"
@@ -54,6 +60,8 @@ let private usage =
     + "  --reset               discard the named session before this run (requires --session)\n"
     + "  --session-ttl <min>   auto-started daemon named-session idle TTL (env: FSION_SESSION_TTL_MINUTES, default 15)\n"
     + "  --timeout <ms>        cancel after this deadline; scripts observe fsionFsiState.CancellationToken; exit 124\n"
+    + "  --prelude <path>      evaluate this prelude.fsx in warm sessions (env: FSION_PRELUDE)\n"
+    + "  --no-prelude          do not load the Fsion module or the user prelude\n"
     + "  -h, --help            show this help\n"
     + "  --version             show version\n"
 
@@ -66,6 +74,8 @@ let private parse (argv: string[]) : Result<Options * Input, string> =
           SessionId = None
           Reset = false
           TimeoutMs = None
+          PreludePath = None
+          NoPrelude = false
           Json = false }
     let mutable outcome: Result<Options * Input, string> option = None
     let mutable index = 0
@@ -117,6 +127,17 @@ let private parse (argv: string[]) : Result<Options * Input, string> =
                 options <- { options with TimeoutMs = Some value }
                 index <- index + 2
             | _ -> outcome <- Some(Error("invalid --timeout value: " + argv.[index + 1]))
+        | "--prelude" when index + 1 < argv.Length ->
+            let prelude = argv.[index + 1]
+
+            if prelude.Trim().Length = 0 then
+                outcome <- Some(Error "--prelude requires a non-empty path")
+            else
+                options <- { options with PreludePath = Some prelude }
+                index <- index + 2
+        | "--no-prelude" ->
+            options <- { options with NoPrelude = true }
+            index <- index + 1
         | "warmup" -> outcome <- Some(Ok(options, Warmup))
         | "daemon" ->
             if index + 1 >= argv.Length then
@@ -143,6 +164,8 @@ let private parse (argv: string[]) : Result<Options * Input, string> =
             Error "--reset requires --session <id>"
         | Ok (parsedOptions, _) when parsedOptions.SessionId.IsSome && parsedOptions.NoDaemon ->
             Error "--no-daemon cannot be combined with --session <id>"
+        | Ok (parsedOptions, _) when parsedOptions.NoPrelude && parsedOptions.PreludePath.IsSome ->
+            Error "--no-prelude cannot be combined with --prelude <path>"
         | _ -> parsed
 
     match outcome with
@@ -186,6 +209,20 @@ let private resolveSessionTtl (options: Options) =
             | true, parsed -> parsed
             | _ -> DefaultSessionTtlMinutes
 
+let private resolvePrelude (options: Options) : Result<string option, string> =
+    if options.NoPrelude then
+        Ok None
+    else
+        match options.PreludePath |> Option.orElseWith PreludeConfig.configuredPreludePath with
+        | Some path ->
+            let fullPath = Path.GetFullPath path
+
+            if File.Exists fullPath then
+                Ok(Some fullPath)
+            else
+                Error("prelude file not found: " + path)
+        | None -> Ok(PreludeConfig.userPreludePath ())
+
 let private findDaemonBinary () =
     match Environment.GetEnvironmentVariable "FSIOND_PATH" with
     | null | "" ->
@@ -197,7 +234,12 @@ let private findDaemonBinary () =
             raise (FileNotFoundException("fsiond was not found next to fsion; set FSIOND_PATH", candidate))
     | path -> path
 
-let private daemonArguments (idleTtlMinutes: float option) (sessionTtlMinutes: float option) (endpoint: Endpoint) =
+let private daemonArguments
+    (idleTtlMinutes: float option)
+    (sessionTtlMinutes: float option)
+    (prelude: PreludeSelection)
+    (endpoint: Endpoint)
+    =
     let modeArguments =
         match idleTtlMinutes with
         | Some minutes -> [ "--idle-ttl"; minutes.ToString(CultureInfo.InvariantCulture) ]
@@ -206,21 +248,33 @@ let private daemonArguments (idleTtlMinutes: float option) (sessionTtlMinutes: f
         match sessionTtlMinutes with
         | Some minutes -> [ "--session-ttl"; minutes.ToString(CultureInfo.InvariantCulture) ]
         | None -> []
+    let preludeArguments =
+        if prelude.NoPrelude then
+            [ "--no-prelude" ]
+        else
+            match prelude.Path with
+            | Some path -> [ "--prelude"; path ]
+            | None -> []
     let logArguments =
         match Environment.GetEnvironmentVariable "FSIOND_LOG" with
         | null | "" -> []
         | logPath -> [ "--log"; logPath ]
-    [ "--endpoint"; endpoint.Name ] @ modeArguments @ sessionArguments @ logArguments
+    [ "--endpoint"; endpoint.Name ] @ modeArguments @ sessionArguments @ preludeArguments @ logArguments
 
-let private spawnDaemon (idleTtlMinutes: float option) (sessionTtlMinutes: float option) (endpoint: Endpoint) =
+let private spawnDaemon
+    (idleTtlMinutes: float option)
+    (sessionTtlMinutes: float option)
+    (prelude: PreludeSelection)
+    (endpoint: Endpoint)
+    =
     let daemonPath = findDaemonBinary ()
-    spawnDetached daemonPath (daemonArguments idleTtlMinutes sessionTtlMinutes endpoint)
+    spawnDetached daemonPath (daemonArguments idleTtlMinutes sessionTtlMinutes prelude endpoint)
 
-let private ensureDaemon (options: Options) (endpoint: Endpoint) : Stream =
+let private ensureDaemon (options: Options) (prelude: PreludeSelection) (endpoint: Endpoint) : Stream =
     match tryConnect endpoint (TimeSpan.FromMilliseconds 250.0) with
     | Some stream -> stream
     | None ->
-        spawnDaemon (Some(resolveIdleTtl options)) (Some(resolveSessionTtl options)) endpoint
+        spawnDaemon (Some(resolveIdleTtl options)) (Some(resolveSessionTtl options)) prelude endpoint
         connect endpoint (TimeSpan.FromSeconds 30.0)
 
 type private Delivery =
@@ -269,9 +323,14 @@ let private responseOf (delivery: Delivery) : Response =
     | DeadlineExpired timeoutMs -> Executed(timeoutResult timeoutMs)
     | NotDelivered -> Failure "fsiond did not accept the request"
 
-let private executeOverDaemon (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) : Response =
+let private executeOverDaemon
+    (options: Options)
+    (prelude: PreludeSelection)
+    (endpoint: Endpoint)
+    (request: ExecuteRequest)
+    : Response =
     let attempt () =
-        let stream = ensureDaemon options endpoint
+        let stream = ensureDaemon options prelude endpoint
         try
             sendAndReceive stream options.TimeoutMs (Execute request)
         finally
@@ -283,7 +342,12 @@ let private executeOverDaemon (options: Options) (endpoint: Endpoint) (request: 
     | NoResponse
     | DeadlineExpired _ -> responseOf first
 
-let private executeOneShot (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) : Response =
+let private executeOneShot
+    (options: Options)
+    (prelude: PreludeSelection)
+    (endpoint: Endpoint)
+    (request: ExecuteRequest)
+    : Response =
     let oneshotEndpoint =
         match options.PipeName with
         | Some _ -> endpoint
@@ -297,7 +361,7 @@ let private executeOneShot (options: Options) (endpoint: Endpoint) (request: Exe
                     + Guid.NewGuid().ToString("N").Substring(0, 8) }
             | name -> { Name = name }
     validateEndpointName oneshotEndpoint.Name
-    spawnDaemon None None oneshotEndpoint
+    spawnDaemon None None prelude oneshotEndpoint
     let stream = connect oneshotEndpoint (TimeSpan.FromSeconds 60.0)
 
     try
@@ -410,8 +474,8 @@ let private readAllStdin () =
 let private statusLine (status: StatusInfo) =
     $"fsiond running (pid={status.Pid}, endpoint={status.Endpoint}, uptimeMs={status.UptimeMs}, idleMs={status.IdleMs}, executed={status.Executed}, warm={status.Warm})"
 
-let private runWarmup (options: Options) (endpoint: Endpoint) : int =
-    let stream = ensureDaemon options endpoint
+let private runWarmup (options: Options) (prelude: PreludeSelection) (endpoint: Endpoint) : int =
+    let stream = ensureDaemon options prelude endpoint
     try
         match sendAndReceive stream None Ping with
         | Delivered Pong ->
@@ -428,7 +492,7 @@ let private runWarmup (options: Options) (endpoint: Endpoint) : int =
     finally
         stream.Dispose()
 
-let rec private runDaemonCommand (options: Options) (endpoint: Endpoint) (input: Input) : int =
+let rec private runDaemonCommand (options: Options) (prelude: PreludeSelection) (endpoint: Endpoint) (input: Input) : int =
     match input with
     | DaemonStatus ->
         match fetchStatus endpoint with
@@ -444,7 +508,7 @@ let rec private runDaemonCommand (options: Options) (endpoint: Endpoint) (input:
             Console.Out.Write($"fsiond already running (pid={status.Pid}, endpoint={status.Endpoint})" + Environment.NewLine)
             0
         | None ->
-            let stream = ensureDaemon options endpoint
+            let stream = ensureDaemon options prelude endpoint
             stream.Dispose()
             match fetchStatus endpoint with
             | Some status ->
@@ -465,10 +529,16 @@ let rec private runDaemonCommand (options: Options) (endpoint: Endpoint) (input:
             Console.Error.Write($"fsion: fsiond did not stop within the timeout (endpoint {endpoint.Name})" + Environment.NewLine)
             1
         else
-            runDaemonCommand options endpoint DaemonStart
+            runDaemonCommand options prelude endpoint DaemonStart
     | _ -> 1
 
-let private describe (options: Options) (mode: string) (source: string) (args: string[]) : ExecuteRequest =
+let private describe
+    (options: Options)
+    (prelude: PreludeSelection)
+    (mode: string)
+    (source: string)
+    (args: string[])
+    : ExecuteRequest =
     { Mode = mode
       Source = source
       WorkingDirectory = Directory.GetCurrentDirectory()
@@ -477,14 +547,22 @@ let private describe (options: Options) (mode: string) (source: string) (args: s
       IncludeDiagnostics = options.Json
       SessionId = options.SessionId
       Reset = options.Reset
-      TimeoutMs = defaultArg options.TimeoutMs 0 }
+      TimeoutMs = defaultArg options.TimeoutMs 0
+      PreludePath = prelude.Path
+      NoPrelude = prelude.NoPrelude }
 
-let private executeInput (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) (elapsedMs: unit -> float) : int =
+let private executeInput
+    (options: Options)
+    (prelude: PreludeSelection)
+    (endpoint: Endpoint)
+    (request: ExecuteRequest)
+    (elapsedMs: unit -> float)
+    : int =
     let response =
         if options.NoDaemon then
-            executeOneShot options endpoint request
+            executeOneShot options prelude endpoint request
         else
-            executeOverDaemon options endpoint request
+            executeOverDaemon options prelude endpoint request
 
     emit options (elapsedMs ()) response
 
@@ -505,39 +583,51 @@ let main argv =
         Console.Error.Flush()
         1
     | Ok (options, input) ->
-        try
-            let endpoint = resolveEndpoint options
-            match input with
-            | ShowHelp ->
-                Console.Out.Write usage
-                Console.Out.Flush()
-                0
-            | ShowVersion ->
-                Console.Out.Write("fsion " + version + Environment.NewLine)
-                Console.Out.Flush()
-                0
-            | RunScript (path, args) ->
-                executeInput
-                    options
-                    endpoint
-                    (describe options "file" path (Array.append [| path |] args))
-                    elapsedMs
-            | RunEval (code, args) ->
-                executeInput
-                    options
-                    endpoint
-                    (describe options "eval" code (Array.append [| "eval.fsx" |] args))
-                    elapsedMs
-            | RunStdin args ->
-                executeInput
-                    options
-                    endpoint
-                    (describe options "stdin" (readAllStdin ()) (Array.append [| "stdin.fsx" |] args))
-                    elapsedMs
-            | Warmup -> runWarmup options endpoint
-            | DaemonStart
-            | DaemonStop
-            | DaemonRestart
-            | DaemonStatus -> runDaemonCommand options endpoint input
-        with ex ->
-            emitFailure options (elapsedMs ()) ex.Message
+        match resolvePrelude options with
+        | Error message ->
+            Console.Error.Write("fsion: " + message + Environment.NewLine)
+            Console.Error.Flush()
+            1
+        | Ok preludePath ->
+            let prelude = { NoPrelude = options.NoPrelude; Path = preludePath }
+
+            try
+                let endpoint = resolveEndpoint options
+
+                match input with
+                | ShowHelp ->
+                    Console.Out.Write usage
+                    Console.Out.Flush()
+                    0
+                | ShowVersion ->
+                    Console.Out.Write("fsion " + version + Environment.NewLine)
+                    Console.Out.Flush()
+                    0
+                | RunScript (path, args) ->
+                    executeInput
+                        options
+                        prelude
+                        endpoint
+                        (describe options prelude "file" path (Array.append [| path |] args))
+                        elapsedMs
+                | RunEval (code, args) ->
+                    executeInput
+                        options
+                        prelude
+                        endpoint
+                        (describe options prelude "eval" code (Array.append [| "eval.fsx" |] args))
+                        elapsedMs
+                | RunStdin args ->
+                    executeInput
+                        options
+                        prelude
+                        endpoint
+                        (describe options prelude "stdin" (readAllStdin ()) (Array.append [| "stdin.fsx" |] args))
+                        elapsedMs
+                | Warmup -> runWarmup options prelude endpoint
+                | DaemonStart
+                | DaemonStop
+                | DaemonRestart
+                | DaemonStatus -> runDaemonCommand options prelude endpoint input
+            with ex ->
+                emitFailure options (elapsedMs ()) ex.Message

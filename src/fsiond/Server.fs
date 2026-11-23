@@ -8,15 +8,18 @@ open System.Threading
 open System.Threading.Tasks
 open Fsion.Ipc
 open Fsion.Protocol
+open Fsiond.Prelude
 open Fsiond.SessionHost
 
+[<NoComparison>]
 type Options =
     { Endpoint: Endpoint
       IdleTtlMinutes: float
       SessionTtlMinutes: float
       Oneshot: bool
       PoolSize: int
-      LogPath: string option }
+      LogPath: string option
+      Prelude: Prelude.Spec }
 
 type [<NoEquality; NoComparison>] private Hooks =
     { EnsureWarm: unit -> unit
@@ -106,7 +109,8 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
     let session =
         new SessionHost(
             { PoolSize = options.PoolSize
-              SessionTtlMinutes = options.SessionTtlMinutes }
+              SessionTtlMinutes = options.SessionTtlMinutes
+              Prelude = options.Prelude }
         )
 
     let startedAt = DateTime.UtcNow
@@ -158,6 +162,10 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
                       "--idle-ttl"; options.IdleTtlMinutes.ToString(CultureInfo.InvariantCulture)
                       "--session-ttl"; options.SessionTtlMinutes.ToString(CultureInfo.InvariantCulture)
                       "--pool-size"; string options.PoolSize ]
+                    @ (match options.Prelude with
+                       | Prelude.Spec.Bare -> [ "--no-prelude" ]
+                       | Prelude.Spec.Builtin -> []
+                       | Prelude.Spec.File path -> [ "--prelude"; path ])
                     @ (match options.LogPath with
                        | Some path -> [ "--log"; path ]
                        | None -> [])

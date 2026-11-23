@@ -141,3 +141,82 @@ type RecoveryTests(output: ITestOutputHelper) =
             finally
                 if not client.HasExited then
                     client.Kill true)
+
+    [<Fact>]
+    member _.``a short --timeout on a freshly auto-started cold daemon runs a fast script without draining the daemon`` () =
+        withContext "recovery-cold-timeout" (fun context _ ->
+            let first =
+                context.Run([ "--timeout"; "500"; "-e"; "printfn \"%d\" (1 + 1)" ], timeoutMs = 120000)
+
+            Assert.Equal(0, first.ExitCode)
+            Assert.Equal("2" + Environment.NewLine, first.Stdout)
+            let pid1 = context.DaemonPid()
+            Assert.True(pid1.IsSome, "daemon was not reported as running")
+
+            let second = context.Run([ "-e"; "printfn \"%d\" (3 + 4)" ], timeoutMs = 120000)
+            Assert.Equal(0, second.ExitCode)
+            Assert.Equal("7" + Environment.NewLine, second.Stdout)
+            Assert.Equal(pid1, context.DaemonPid()))
+
+    [<Fact>]
+    member _.``a --timeout waiting behind a busy named session cancels in place without draining the daemon`` () =
+        withContext "recovery-session-queue" (fun context directory ->
+            let prime = context.Run([ "-e"; "printfn \"prime\"" ], timeoutMs = 120000)
+            Assert.Equal(0, prime.ExitCode)
+            let pid1 = context.DaemonPid()
+            Assert.True(pid1.IsSome, "daemon was not reported as running")
+
+            let marker = Path.Combine(directory, "busy-started.txt")
+
+            let code =
+                "System.IO.File.WriteAllText(@\""
+                + marker.Replace("\\", "\\\\")
+                + "\", \"1\")\nAsync.RunSynchronously(Async.Sleep 3000, cancellationToken = fsionFsiState.CancellationToken)"
+
+            let startInfo = ProcessStartInfo(fsionBinary)
+            startInfo.WorkingDirectory <- directory
+            startInfo.UseShellExecute <- false
+            startInfo.CreateNoWindow <- true
+            startInfo.RedirectStandardOutput <- true
+            startInfo.RedirectStandardError <- true
+            startInfo.RedirectStandardInput <- true
+
+            for key, value in context.Environment do
+                startInfo.Environment.[key] <- value
+
+            for argument in [ "--session"; "alpha"; "-e"; code ] do
+                startInfo.ArgumentList.Add argument
+
+            let busyturn = Process.Start startInfo
+            Assert.False(isNull busyturn, "could not start the busy fsion client")
+
+            try
+                let markerDeadline = DateTime.UtcNow.AddSeconds(60.0)
+                let mutable started = false
+
+                while not started && DateTime.UtcNow < markerDeadline do
+                    started <- File.Exists marker
+
+                    if not started then
+                        Thread.Sleep 200
+
+                Assert.True(started, "the busy named-session turn never started")
+                Thread.Sleep 300
+
+                let queued =
+                    context.Run(
+                        [ "--session"; "alpha"; "--timeout"; "250"; "-e"; "printfn \"queued\"" ],
+                        timeoutMs = 60000
+                    )
+
+                output.WriteLine("queued timeout wall time (ms): " + string queued.DurationMs)
+                Assert.Equal(124, queued.ExitCode)
+                Assert.Contains("timed out after 250 ms", queued.Stderr)
+                Assert.True(queued.DurationMs < 5000.0, "queued timeout took " + string queued.DurationMs + " ms")
+
+                Assert.True(busyturn.WaitForExit 60000, "the busy named-session turn did not finish")
+                Assert.Equal(0, busyturn.ExitCode)
+                Assert.Equal(pid1, context.DaemonPid())
+            finally
+                if not busyturn.HasExited then
+                    busyturn.Kill true)

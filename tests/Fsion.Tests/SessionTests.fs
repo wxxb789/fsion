@@ -83,9 +83,20 @@ type SessionTests(output: ITestOutputHelper) =
 
             Thread.Sleep 1000
 
-            let settled =
+            let settleDeadline = DateTime.UtcNow.AddSeconds(60.0)
+
+            let mutable settled =
                 context.Metrics(30000)
                 |> Option.defaultWith (fun () -> failwith "fsiond did not answer GetMetrics")
+
+            // The evicted session's collectible assembly unloads through the cleanup queue and the
+            // pool must refill to the warm watermark before the exact assembly census is meaningful.
+            while settled.ScriptAssemblies <> settled.PoolTarget && DateTime.UtcNow < settleDeadline do
+                Thread.Sleep 500
+
+                match context.Metrics 30000 with
+                | Some metrics -> settled <- metrics
+                | None -> ()
 
             output.WriteLine(
                 "named sessions after ttl: "
@@ -100,10 +111,7 @@ type SessionTests(output: ITestOutputHelper) =
 
             Assert.Equal(0, settled.NamedSessions)
             Assert.Equal(0, settled.AliveDisposedSessions)
-            Assert.True(
-                settled.ScriptAssemblies <= settled.PoolTarget + 1,
-                "script assemblies still loaded: " + string settled.ScriptAssemblies
-            )
+            Assert.Equal(settled.PoolTarget, settled.ScriptAssemblies)
 
             let gone =
                 context.Run([ "--session"; "alpha"; "-e"; "printfn \"%d\" (List.sum data)" ], timeoutMs = 60000)

@@ -455,12 +455,12 @@ type SessionHost(options: SessionHostOptions) =
         warm.AssemblyResolveHandlers <- assemblyResolveHandlers
         warm
 
-    let claimSession () : WarmSession =
+    let claimSession (cancelToken: CancellationToken) : WarmSession =
         match pool.TryDequeue() with
         | true, warm -> warm
         | _ ->
             Interlocked.Increment(&coldClaims.contents) |> ignore
-            creationGate.Wait()
+            creationGate.Wait(cancelToken)
 
             try
                 createWarmSession ()
@@ -678,27 +678,7 @@ type SessionHost(options: SessionHostOptions) =
                 namedSessions.[sessionId] <- entry
                 entry)
 
-    let rec acquireNamed (sessionId: string) =
-        let entry = getOrCreateNamed sessionId
-        entry.Gate.Wait()
-
-        if entry.Evicted then
-            entry.Gate.Release() |> ignore
-            acquireNamed sessionId
-        else
-            entry
-
-    let acquireNamedReset (sessionId: string) =
-        let entry = acquireNamed sessionId
-
-        match entry.Session with
-        | Some warm -> releaseSession warm
-        | None -> ()
-
-        entry.Session <- None
-        entry
-
-    let sweepNamedSessions () =
+    let rec sweepNamedSessions () =
         if sessionTtlMs > 0L then
             let snapshot =
                 lock namedGate (fun () ->
@@ -801,23 +781,7 @@ type SessionHost(options: SessionHostOptions) =
         let timeoutMs = request.TimeoutMs
         use runCts = new CancellationTokenSource()
         let timeoutFired = ref 0
-
-        use timeoutTimer =
-            if timeoutMs > 0 then
-                new Timer(
-                    (fun _ ->
-                        Volatile.Write(&timeoutFired.contents, 1)
-
-                        try
-                            runCts.Cancel()
-                        with _ ->
-                            ()),
-                    null,
-                    timeoutMs,
-                    Timeout.Infinite
-                )
-            else
-                Unchecked.defaultof<Timer>
+        let evaluationStarted = ref 0
 
         use disconnectRegistration =
             disconnectToken.Register(fun () ->
@@ -832,6 +796,40 @@ type SessionHost(options: SessionHostOptions) =
         let outWriter = new RunTextWriter()
         let errWriter = new RunTextWriter()
 
+        // --timeout is a script execution deadline only. Session acquisition (cold creation, a busy
+        // named session's gate, the process-state transition) is not charged against it, and a
+        // queued turn whose deadline expires before evaluation aborts in place without draining.
+        let gateDeadline =
+            if timeoutMs > 0 then Environment.TickCount64 + int64 timeoutMs else Int64.MaxValue
+
+        let remainingGateMs () =
+            if timeoutMs > 0 then
+                max 0 (int (min (int64 Int32.MaxValue) (gateDeadline - Environment.TickCount64)))
+            else
+                Timeout.Infinite
+
+        let rec acquireNamed (sessionId: string) =
+            let entry = getOrCreateNamed sessionId
+
+            if not (entry.Gate.Wait(remainingGateMs (), disconnectToken)) then
+                None
+            elif entry.Evicted then
+                entry.Gate.Release() |> ignore
+                acquireNamed sessionId
+            else
+                Some entry
+
+        let acquireNamedReset (sessionId: string) =
+            match acquireNamed sessionId with
+            | None -> None
+            | Some entry ->
+                match entry.Session with
+                | Some warm -> releaseSession warm
+                | None -> ()
+
+                entry.Session <- None
+                Some entry
+
         let runInSession (claimed: WarmSession) (stateless: bool) =
             try
                 processState.Enter(request.WorkingDirectory, request.Environment)
@@ -845,14 +843,36 @@ type SessionHost(options: SessionHostOptions) =
                         | _ -> ()
 
                         try
-                            let exitCode, diagnostics = evaluate claimed request outWriter errWriter runCts.Token
-                            Interlocked.Increment(&executed.contents) |> ignore
+                            Volatile.Write(&evaluationStarted.contents, 1)
 
-                            { ExitCode = exitCode
-                              StandardOut = outWriter.SafeText()
-                              StandardError = errWriter.SafeText()
-                              Diagnostics = diagnostics
-                              TimedOut = false }
+                            try
+                                use timeoutTimer =
+                                    if timeoutMs > 0 then
+                                        new Timer(
+                                            (fun _ ->
+                                                Volatile.Write(&timeoutFired.contents, 1)
+
+                                                try
+                                                    runCts.Cancel()
+                                                with _ ->
+                                                    ()),
+                                            null,
+                                            timeoutMs,
+                                            Timeout.Infinite
+                                        )
+                                    else
+                                        Unchecked.defaultof<Timer>
+
+                                let exitCode, diagnostics = evaluate claimed request outWriter errWriter runCts.Token
+                                Interlocked.Increment(&executed.contents) |> ignore
+
+                                { ExitCode = exitCode
+                                  StandardOut = outWriter.SafeText()
+                                  StandardError = errWriter.SafeText()
+                                  Diagnostics = diagnostics
+                                  TimedOut = false }
+                            finally
+                                Volatile.Write(&evaluationStarted.contents, 0)
                         finally
                             match claimed.CancellationTokenProperty, claimed.State with
                             | Some property, Some state -> property.SetValue(state, box CancellationToken.None)
@@ -878,35 +898,48 @@ type SessionHost(options: SessionHostOptions) =
 
         let work () =
             let outcome =
-                match request.SessionId with
-                | None ->
-                    let claimed = claimSession ()
+                try
+                    match request.SessionId with
+                    | None ->
+                        let claimed = claimSession disconnectToken
 
-                    try
-                        runInSession claimed true
-                    with :? OperationCanceledException ->
-                        canceledOutcome ()
-                | Some sessionId ->
-                    let entry =
-                        if request.Reset then
-                            acquireNamedReset sessionId
-                        else
-                            acquireNamed sessionId
+                        try
+                            runInSession claimed true
+                        with :? OperationCanceledException ->
+                            canceledOutcome ()
+                    | Some sessionId ->
+                        let acquired =
+                            if request.Reset then
+                                acquireNamedReset sessionId
+                            else
+                                acquireNamed sessionId
 
-                    try
-                        if entry.Session.IsNone then
-                            entry.Session <- Some(claimSession ())
-
-                        let outcome =
+                        match acquired with
+                        | None ->
+                            // The queued turn spent its whole --timeout budget on the gate: report
+                            // the timeout in place while the daemon stays healthy.
+                            { ExitCode = TimeoutExitCode
+                              StandardOut = ""
+                              StandardError = timeoutMessage timeoutMs
+                              Diagnostics = [||]
+                              TimedOut = true }
+                        | Some entry ->
                             try
-                                runInSession entry.Session.Value false
-                            with :? OperationCanceledException ->
-                                canceledOutcome ()
+                                if entry.Session.IsNone then
+                                    entry.Session <- Some(claimSession disconnectToken)
 
-                        entry.LastUsedMs <- Environment.TickCount64
-                        outcome
-                    finally
-                        entry.Gate.Release() |> ignore
+                                let outcome =
+                                    try
+                                        runInSession entry.Session.Value false
+                                    with :? OperationCanceledException ->
+                                        canceledOutcome ()
+
+                                entry.LastUsedMs <- Environment.TickCount64
+                                outcome
+                            finally
+                                entry.Gate.Release() |> ignore
+                with :? OperationCanceledException ->
+                    canceledOutcome ()
 
             // Classify at the worker's completion point: reading the flag here, before the
             // caller observes the task, makes the timeout outcome deterministic even if the
@@ -942,13 +975,24 @@ type SessionHost(options: SessionHostOptions) =
                     else
                         "fsion: run cancelled after the client disconnected" + Environment.NewLine
 
-                { Outcome =
-                    { ExitCode = TimeoutExitCode
-                      StandardOut = outWriter.SafeText()
-                      StandardError = appendMessage (errWriter.SafeText()) message
-                      Diagnostics = [||]
-                      TimedOut = timedOut }
-                  Wedged = true }
+                if Volatile.Read(&evaluationStarted.contents) = 1 then
+                    // Only a run that entered evaluation can wedge a session. Acquisition waits
+                    // always return here, so they never drain a healthy daemon.
+                    { Outcome =
+                        { ExitCode = TimeoutExitCode
+                          StandardOut = outWriter.SafeText()
+                          StandardError = appendMessage (errWriter.SafeText()) message
+                          Diagnostics = [||]
+                          TimedOut = timedOut }
+                      Wedged = true }
+                else
+                    { Outcome =
+                        { ExitCode = (if timedOut then TimeoutExitCode else 1)
+                          StandardOut = outWriter.SafeText()
+                          StandardError = appendMessage (errWriter.SafeText()) message
+                          Diagnostics = [||]
+                          TimedOut = timedOut }
+                      Wedged = false }
 
     member _.Metrics() : MetricsInfo =
         drainCleanupsBlocking ()

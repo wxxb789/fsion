@@ -242,7 +242,9 @@ let private sendAndReceive (stream: Stream) (timeoutMs: int option) (request: Re
         match timeoutMs with
         | Some timeoutMs when timeoutMs > 0 ->
             let receive = Task.Run(fun () -> tryReceiveFrame stream)
-            if receive.Wait(timeoutMs + 2000) then
+            // Last-resort net only: fsiond enforces --timeout after the session is acquired, so
+            // cold daemon/session creation must not be charged against this client deadline.
+            if receive.Wait(timeoutMs + 30000) then
                 match receive.Result with
                 | Some payload -> Delivered(parseResponse payload)
                 | None -> NoResponse

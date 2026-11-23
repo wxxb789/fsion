@@ -8,7 +8,7 @@ Implementation choices: [../plans/2026-11-23-goal-0003-implementation-choices.md
 | Item | Value |
 |---|---|
 | Host | `CPC-lhan-XF3D0M` (Microsoft Windows 11 Enterprise 10.0.26300.0) |
-| Base commit | `f8854ef12d587278ac146ce23b2acb0a3fa81974` (goal 0003 tree uncommitted on top) |
+| Base commit | `8b939fb791a12fe09087cbc6ebbadaf426bb32d1` (review-fix tree uncommitted on top) |
 | .NET SDK | 11.0.100 |
 | `FSharp.Compiler.Service` (fsiond) | 43.13.101 |
 | FSharp.Core (fsiond / scripts) | 11.0.101 |
@@ -23,11 +23,11 @@ Recorded run on this tree: **exit code 0**.
 | Step | Result |
 |---|---|
 | `dotnet build fsion.slnx -c Release` | Build succeeded, 0 warnings, 0 errors |
-| `dotnet publish src/fsion -c Release -f net10.0` | exit 0, `artifacts/publish/fsion/net10.0/fsion.exe` (4,116,480 bytes) |
-| `dotnet publish src/fsion -c Release -f net11.0` | exit 0, `artifacts/publish/fsion/net11.0/fsion.exe` (4,142,080 bytes) |
-| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 58, Skipped 0, Total 58, 8 m 15 s |
-| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 58, Skipped 0, Total 58, 8 m 29 s |
-| `Assert-LineEndings` | `line endings: 40 tracked and 43 non-ignored files clean` |
+| `dotnet publish src/fsion -c Release -f net10.0` | exit 0, `artifacts/publish/fsion/net10.0/fsion.exe` (4,118,016 bytes) |
+| `dotnet publish src/fsion -c Release -f net11.0` | exit 0, `artifacts/publish/fsion/net11.0/fsion.exe` (4,143,104 bytes) |
+| `dotnet test tests/Fsion.Tests -c Release -f net10.0` | Failed 0, Passed 60, Skipped 0, Total 60, 9 m 46 s |
+| `dotnet test tests/Fsion.Tests -c Release -f net11.0` | Failed 0, Passed 60, Skipped 0, Total 60, 10 m 57 s |
+| `Assert-LineEndings` | `line endings: 44 tracked and 44 non-ignored files clean` |
 
 The only `warning` line anywhere in the gate log is the summary literal `0 Warning(s)`;
 the publish steps printed no IL/trim warning lines.
@@ -38,6 +38,7 @@ Focused detailed runs, used for the per-clause transcripts below:
 |---|---|
 | `--filter "FullyQualifiedName~SessionTests\|FullyQualifiedName~RecoveryTests" --logger "console;verbosity=detailed"` (net11.0) | exit 0, 6/6, 49 s |
 | `--filter "FullyQualifiedName~FaultTests\|FullyQualifiedName~ParityTests"` (net11.0) | exit 0, 20/20, 3 m 1 s |
+| `--filter "FullyQualifiedName~RecoveryTests" --logger "console;verbosity=normal"` (net11.0) | pre-fix exit 1, 3/5 (the two new tests failing); post-fix exit 0, 5/5, 54 s |
 
 Baseline observed before the implementation: every new option failed argument parsing, so no
 session or timeout behavior existed at `f8854ef`.
@@ -114,6 +115,9 @@ through the existing `CleanupWork` drain.
 `RecoveryTests` `cooperative async timeout cancels in place with exit 124 and keeps the daemon alive`
 (Passed [7 s]; both TFMs in the gate). Script:
 `Async.RunSynchronously(Async.Sleep 10000, cancellationToken = fsionFsiState.CancellationToken)`.
+The deadline is armed only after the session is acquired (and immediately before `evaluate`), so a
+cold daemon/session boot is never charged against `--timeout`; the review fix round below covers the
+cold-daemon and busy-gate paths.
 
 Live transcript (net11.0; daemon pid 59504 before and after):
 
@@ -191,6 +195,60 @@ pid3=50072
 
 The connection handler holds a pending 1-byte `ReadAsync` on the connection; EOF cancels the run's
 `CancellationTokenSource`, and an uncooperative disconnect takes the same wedged path as a timeout.
+
+## Review fix round (R-01–R-03)
+
+The review of `8b939fb` found that `--timeout` armed before session acquisition (falsely charging cold
+session boot and draining healthy daemons), that the client deadline (`timeoutMs + 2000`) cut cold
+starts short, and that the TTL test's assembly assertion allowed one leaked `FSI-ASSEMBLY`. All three
+were fixed in this round; the gate above ran after the fix.
+
+### R-01 — the script deadline starts after session acquisition
+
+`SessionHost.Execute` now claims the session first (`claimSession disconnectToken`; `entry.Session <-
+Some(claimSession disconnectToken)` on a named session's first turn), arms the per-evaluation `Timer`
+immediately before `evaluate`, and tracks `evaluationStarted` (set before `evaluate`, reset in its
+`finally`). A busy named session's `entry.Gate.Wait(remaining, disconnectToken)` honors the deadline;
+an expired wait returns exit 124 + `timedOut` in place with `Wedged = false`. Only a run that entered
+evaluation and did not return within the 150 ms grace window is wedged, so acquisition can never
+drain a healthy daemon. The client's `receive.Wait` safety net is now `timeoutMs + 30000` ms because
+`fsiond` itself enforces the script deadline after acquisition.
+
+Observed before/after on a brand-new auto-started daemon with `--timeout 500`:
+
+| Command | Before (pre-fix) | After (fixed) |
+|---|---|---|
+| `fsion --timeout 500 -e 'printfn "%d" (1 + 1)'` (cold daemon) | exit 124; daemon drained and respawned | exit 0, prints `2`; 6,830 ms wall; daemon pid unchanged |
+| second warm call on the same daemon | — | exit 0; 579 ms wall; same pid |
+
+Daemon log for the queued-gate path (`--session alpha` busy with a cooperative 3 s sleep, concurrent
+`--session alpha --timeout 250`):
+
+```
+executed exit=124 timedOut=True wedged=False elapsedMs=262     # queued turn timed out on the gate
+executed exit=0 timedOut=False wedged=False elapsedMs=3084     # busy turn completed normally
+```
+
+Same daemon pid before/after (42164) and zero `replacement` log lines: the queued timeout neither
+drained the daemon nor disturbed the busy turn.
+
+### R-02 — new black-box coverage
+
+Two tests were added to `tests/Fsion.Tests/RecoveryTests.fs` and observed failing before the R-01 fix:
+
+- `a short --timeout on a freshly auto-started cold daemon runs a fast script without draining the
+  daemon`: pre-fix first call exit 124 (expected 0); post-fix exit 0, same daemon pid.
+- `a --timeout waiting behind a busy named session cancels in place without draining the daemon`:
+  pre-fix the queued call returned 124 but the busy turn got exit 1 and the daemon respawned (queued
+  wall 498 ms); post-fix queued exit 124 in 449 ms, busy turn exit 0, same daemon pid.
+
+### R-03 — tightened TTL unload assertion
+
+`SessionTests` TTL now polls for depletion and asserts
+`Assert.Equal(settled.PoolTarget, settled.ScriptAssemblies)` (the previous `<= PoolTarget + 1`
+allowed one leaked `FSI-ASSEMBLY`). The
+tightened assertion already passed against the pre-fix tree (observed 3 = 3) and after the fix, so the
+unload was exact; the test now fails directly on any leak.
 
 ## Known limits
 

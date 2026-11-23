@@ -30,11 +30,15 @@ the deliberately deferred work.
 ## Cooperative cancellation and timeout
 
 - `SessionHost.Execute` creates one `CancellationTokenSource` per invocation. `--timeout <ms>` travels in
-  `ExecuteRequest.TimeoutMs` and arms a `Timer` (`CancelAfter` semantics); the client's connection handler
-  registers a disconnect token (a pending 1-byte `ReadAsync` on the connection) that cancels the same
-  source. The token is set on the session's prelude state as `fsionFsiState.CancellationToken` for the
-  run and passed to `EvalInteraction(..., cancellationToken = ...)`; `EvalScript` has no token overload in
-  FCS 43.13.101, so file-mode scripts rely on the prelude token at runtime.
+  `ExecuteRequest.TimeoutMs` and arms a `Timer` (`CancelAfter` semantics) **only once the session is
+  acquired and immediately before `evaluate` runs**; the client's connection handler registers a
+  disconnect token (a pending 1-byte `ReadAsync` on the connection) that cancels the same source. Cold
+  session creation (`claimSession`), a busy named session's `entry.Gate` wait, and the process-state
+  transition are therefore never charged against the script deadline. `creationGate.Wait(disconnectToken)`
+  and `entry.Gate.Wait(remaining, disconnectToken)` abort a disconnected acquisition in place with
+  `Wedged = false`. The token is set on the session's prelude state as `fsionFsiState.CancellationToken`
+  for the run and passed to `EvalInteraction(..., cancellationToken = ...)`; `EvalScript` has no token
+  overload in FCS 43.13.101, so file-mode scripts rely on the prelude token at runtime.
 - FCS 43.13.101 exposes `EvalInteraction`/`EvalInteractionNonThrowing` with an optional
   `CancellationToken` and no `EvalScript` token overload (checked by reflection before implementing).
   FSharp.Core 11.0.101's `Async.DefaultCancellationToken` is backed by a single process-global
@@ -43,18 +47,25 @@ the deliberately deferred work.
   and permanently poison the daemon. The per-run token is therefore exposed on the prelude state and
   passed explicitly; the documented cooperative pattern is
   `Async.RunSynchronously(Async.Sleep 10000, cancellationToken = fsionFsiState.CancellationToken)`.
+- A named-session turn that queues behind a busy turn (`entry.Gate`) honors `--timeout`: the wait is
+  bounded by the remaining deadline, and if it expires before evaluation starts the daemon returns the
+  timeout result (`ExitCode = 124`, `TimedOut = true`, `fsion: script timed out after <ms> ms`, empty
+  stdout) in place while the busy turn and the daemon continue unaffected (`Wedged = false`).
 - The evaluation runs on a dedicated `LongRunning` task so the connection-handling thread can enforce the
   deadline without stapling itself (and so a wedged run never consumes a thread-pool slot that another
-  run needs). After cancellation the caller waits a **150 ms** grace window for the worker. If the worker
-  returns, the outcome is `ExitCode = 124`, `TimedOut = true` when the deadline (not a disconnect) fired,
+  run needs). `evaluationStarted` is set immediately before `evaluate` and reset in its `finally`; after
+  cancellation the caller waits a **150 ms** grace window for the worker. If the worker returns, the
+  outcome is `ExitCode = 124`, `TimedOut = true` when the deadline (not a disconnect) fired,
   `"timedOut": true` in `--json`, and `fsion: script timed out after <ms> ms` appended to `stderr`; the
   daemon is untouched. A cancellation that races a normal completion does not mark the run timed out
-  (`Task.WaitAny` ordering decides).
+  (`Task.WaitAny` ordering decides). Only a worker that entered evaluation and still did not return
+  within the grace window is reported as `Wedged = true`; acquisition waits can never drain the daemon.
 - `ExecutionResult.TimedOut` is the wire and JSON field. Timeout exit code is **124** (`timeout(1)`
-  convention) in both the daemon response and the client-side deadline fallback. With `--timeout <ms>`
-  set, the client waits up to `timeoutMs + 2000` ms for the response on an open connection and
-  synthesizes the same timeout result if that client deadline expires first; if `fsiond` closes the
-  connection without a frame (`daemon stop` or crash), `NoResponse` still surfaces as exit 1
+  convention) in both the daemon response and the client-side deadline fallback. `fsiond` itself enforces
+  the deadline after session acquisition, so with `--timeout <ms>` set the client's `receive.Wait` uses a
+  generous cold-session cushion of `timeoutMs + 30000` ms as a last-resort net for an OS-level daemon
+  hang, and synthesizes the same timeout result if that client deadline expires first; if `fsiond` closes
+  the connection without a frame (`daemon stop` or crash), `NoResponse` still surfaces as exit 1
   (`fsiond closed the connection without a response`), so daemon death is never masked as a script
   timeout.
 
@@ -99,6 +110,8 @@ the deliberately deferred work.
 | 3. Cooperative timeout in place | `RecoveryTests` cooperative (exit 124, `timedOut`, same daemon pid) | `--timeout` was `unknown option`, exit 1 |
 | 4. Drain-and-respawn | `RecoveryTests` wedge (bounded return, old pid gone, new generation serves) | `--timeout` was `unknown option`; without it the loop wedges the only session forever |
 | 5. Client disconnect cancels in place | `RecoveryTests` disconnect (killed client, daemon pid unchanged, next turn works) | no cancellation token existed at all |
+| 6. `--timeout` is not charged to cold session boot | `RecoveryTests` cold-daemon short timeout (exit 0, same daemon pid) | before the fix the first call returned exit 124 and drained the freshly started daemon |
+| 7. A queued `--session` turn times out on the gate without draining | `RecoveryTests` session-queue (queued exit 124, busy turn exit 0, same pid) | before the fix the drain killed the busy turn (exit 1) and respawned the daemon |
 
 `docs/evidence/0003-evidence.md` records the gate run, per-clause transcripts, and the measured numbers.
 

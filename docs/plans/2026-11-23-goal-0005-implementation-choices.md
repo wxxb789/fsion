@@ -54,10 +54,10 @@ is part of the design. Five avoidable per-invocation costs were eliminated in `S
 `bench/run-bench.py` (cutting `typical` median from 104.4 ms to **71.8 ms** and `hello` from 83.4 ms
 to **54.4 ms**):
 
-1. File-mode scripts now read UTF-8 source directly and evaluate via `EvalInteraction(chunk + "\n()", sourcePath)`
-   (splitting top-level `;;` chunks with line-offset preservation and normalizing line-start file-mode
-   stderr diagnostic prefixes to `Path.GetFileName` for byte parity with `dotnet fsi`), avoiding
-   `EvalScript`'s ~25–30 ms synthetic `#load` module wrapper.
+1. File-mode scripts now read UTF-8 source directly and evaluate via `EvalInteraction(chunk, sourcePath)`
+   (splitting top-level `;;` chunks with exact line and column offset preservation and normalizing
+   Windows `file.fsx(line,col): ` diagnostic headers to `Path.GetFileName` for byte parity with
+   `dotnet fsi`), avoiding `EvalScript`'s ~25–30 ms synthetic `#load` module wrapper.
 2. `Settings` sets `ShowDeclarationValues/ShowIEnumerable/ShowProperties = false` so FSI never spends
    reflection formatting cycles on bound values that `--quiet` discards.
 3. `WarmSession.CompilerDirectory` tracks the session's compiler directory to skip redundant `#cd`
@@ -92,11 +92,11 @@ typechecking + IL emission + Tier-0 execution (`71.8 ms` `fsion` vs `47.2 ms` `b
 
 ## `--pool-size` client flag
 
-The goal's documentation clause lists `--pool-size` among the flags the README must cover, but only
-`fsiond --pool-size` / `FSION_POOL_SIZE` existed. The client gains `--pool-size <n>` (`0` disables
-warm sessions) resolved like `--idle-ttl`/`--session-ttl` and passed to the auto-started daemon and
-its drain-and-respawn replacement; the daemon-side parsing is unchanged. A black-box test pins that
-the flag reaches the daemon.
+To expose warm-pool sizing symmetrically on the `fsion` CLI alongside `FSION_POOL_SIZE` and
+`fsiond --pool-size`, the client gains `--pool-size <n>` (`0` disables warm sessions) resolved like
+`--idle-ttl`/`--session-ttl` and passed to the auto-started daemon, `daemon start|restart`,
+`--no-daemon`, and drain-and-respawn replacements; the daemon-side parsing is unchanged. A black-box
+test pins that the flag reaches the daemon.
 
 ## 3-OS CI (`.github/workflows/ci.yml`)
 

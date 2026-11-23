@@ -27,9 +27,8 @@ let sanitizeName (name: string) =
 let defaultEndpointName () = "fsion-" + sanitizeName Environment.UserName
 
 let validateEndpointName (name: string) =
-    if isWindows && (name.Contains '\\' || name.Contains '/') then
+    if name.Contains '\\' || name.Contains '/' then
         raise (ArgumentException("pipe name must not contain path separators"))
-
 let socketPath (endpoint: Endpoint) =
     if Path.IsPathRooted endpoint.Name then
         endpoint.Name

@@ -50,6 +50,29 @@ type private RunTextWriter() =
             let builder = inner.GetStringBuilder()
             let oldPrefix = sourcePath + "("
             let newPrefix = fileName + "("
+
+            let isLocationHeader (startAfterParen: int) =
+                let mutable pos = startAfterParen
+                let len = builder.Length
+
+                while pos < len && Char.IsDigit builder.[pos] do
+                    pos <- pos + 1
+
+                if pos > startAfterParen && pos < len && builder.[pos] = ',' then
+                    let colStart = pos + 1
+                    pos <- colStart
+
+                    while pos < len && Char.IsDigit builder.[pos] do
+                        pos <- pos + 1
+
+                    pos > colStart
+                    && pos + 3 <= len
+                    && builder.[pos] = ')'
+                    && builder.[pos + 1] = ':'
+                    && builder.[pos + 2] = ' '
+                else
+                    false
+
             let mutable index = 0
 
             while index >= 0 && index <= builder.Length - oldPrefix.Length do
@@ -57,7 +80,10 @@ type private RunTextWriter() =
 
                 if found < 0 then
                     index <- -1
-                elif found = 0 || builder.[found - 1] = '\n' || builder.[found - 1] = '\r' then
+                elif
+                    (found = 0 || builder.[found - 1] = '\n' || builder.[found - 1] = '\r')
+                    && isLocationHeader (found + oldPrefix.Length)
+                then
                     builder.Remove(found, sourcePath.Length).Insert(found, fileName) |> ignore
                     index <- found + newPrefix.Length
                 else
@@ -337,28 +363,87 @@ type private InteractionScan =
 // EvalInteraction stops at the first top-level `;;` terminator, whereas `dotnet fsi` executes every
 // `;;`-delimited chunk in a script file. Split on top-level `;;` outside strings/comments and pad
 // subsequent chunks with leading `\n` equal to their starting line offset so diagnostic line
-// numbers remain exact.
+// numbers and column offsets remain exact.
+let private firstLineMinIndent (text: string) =
+    let mutable idx = 0
+    let mutable col = 0
+    let mutable inIndent = true
+    let mutable minCol = Int32.MaxValue
+
+    while idx < text.Length do
+        let ch = text.[idx]
+
+        if ch = '\n' then
+            col <- 0
+            inIndent <- true
+            idx <- idx + 1
+        elif ch = '\r' then
+            idx <- idx + 1
+        elif inIndent && ch = ' ' then
+            col <- col + 1
+            idx <- idx + 1
+        elif inIndent && ch = '\t' then
+            col <- col + 4
+            idx <- idx + 1
+        elif inIndent then
+            if col < minCol then
+                minCol <- col
+
+            inIndent <- false
+            idx <- idx + 1
+        else
+            idx <- idx + 1
+
+    if minCol = Int32.MaxValue then 0 else minCol
+
+let private appendTrailingUnit (padded: string) =
+    if padded.TrimEnd().EndsWith("=", StringComparison.Ordinal) then
+        padded
+    else
+        let unitIndent = firstLineMinIndent padded
+        padded + "\n" + (if unitIndent > 0 then String(' ', unitIndent) else "") + "()"
+
 let private splitInteractions (source: string) : string[] =
     if source.IndexOf(";;", StringComparison.Ordinal) < 0 then
-        [| source |]
+        [| appendTrailingUnit source |]
     else
         let chunks = ResizeArray<string>()
         let length = source.Length
         let mutable state = InteractionCode
         let mutable i = 0
         let mutable lineCount = 0
+        let mutable lineStart = 0
         let mutable chunkStart = 0
         let mutable chunkStartLines = 0
+        let mutable chunkStartCols = 0
 
-        let emitChunk endExclusive nextStart nextLines =
+        let emitChunk endExclusive nextStart nextLines nextCols =
             let body = source.Substring(chunkStart, endExclusive - chunkStart)
 
             if chunks.Count = 0 || body.Trim().Length > 0 then
-                let prefix = if chunkStartLines > 0 then String('\n', chunkStartLines) else ""
-                chunks.Add(prefix + body)
+                let linePrefix = if chunkStartLines > 0 then String('\n', chunkStartLines) else ""
+
+                let hasCodeOnFirstLine =
+                    let nl = body.IndexOf '\n'
+                    let firstLine = if nl >= 0 then body.Substring(0, nl) else body
+                    firstLine.Trim().Length > 0
+
+                let colPrefix =
+                    if chunkStartCols > 0 && hasCodeOnFirstLine then
+                        String(' ', chunkStartCols)
+                    else
+                        ""
+
+                chunks.Add(appendTrailingUnit (linePrefix + colPrefix + body))
 
             chunkStart <- nextStart
             chunkStartLines <- nextLines
+            chunkStartCols <- nextCols
+
+        let advanceNewline nextIndex =
+            lineCount <- lineCount + 1
+            lineStart <- nextIndex
+            i <- nextIndex
 
         while i < length do
             let c = source.[i]
@@ -366,8 +451,7 @@ let private splitInteractions (source: string) : string[] =
             match state with
             | InteractionCode ->
                 if c = '\n' then
-                    lineCount <- lineCount + 1
-                    i <- i + 1
+                    advanceNewline (i + 1)
                 elif c = '/' && i + 1 < length && source.[i + 1] = '/' then
                     state <- InteractionLineComment
                     i <- i + 2
@@ -389,20 +473,20 @@ let private splitInteractions (source: string) : string[] =
                 elif c = '\'' && i + 3 < length && source.[i + 1] = '\\' && source.[i + 3] = '\'' then
                     i <- i + 4
                 elif c = ';' && i + 1 < length && source.[i + 1] = ';' then
-                    emitChunk i (i + 2) lineCount
-                    i <- i + 2
+                    let nextIndex = i + 2
+                    emitChunk i nextIndex lineCount (nextIndex - lineStart)
+                    i <- nextIndex
                 else
                     i <- i + 1
             | InteractionLineComment ->
                 if c = '\n' then
-                    lineCount <- lineCount + 1
                     state <- InteractionCode
-
-                i <- i + 1
+                    advanceNewline (i + 1)
+                else
+                    i <- i + 1
             | InteractionBlockComment depth ->
                 if c = '\n' then
-                    lineCount <- lineCount + 1
-                    i <- i + 1
+                    advanceNewline (i + 1)
                 elif c = '(' && i + 1 < length && source.[i + 1] = '*' then
                     state <- InteractionBlockComment(depth + 1)
                     i <- i + 2
@@ -414,16 +498,15 @@ let private splitInteractions (source: string) : string[] =
             | InteractionNormalString ->
                 if c = '\\' && i + 1 < length then
                     if source.[i + 1] = '\n' then
-                        lineCount <- lineCount + 1
-
-                    i <- i + 2
+                        advanceNewline (i + 2)
+                    else
+                        i <- i + 2
                 elif c = '"' then
                     state <- InteractionCode
                     i <- i + 1
                 elif c = '\n' then
-                    lineCount <- lineCount + 1
                     state <- InteractionCode
-                    i <- i + 1
+                    advanceNewline (i + 1)
                 else
                     i <- i + 1
             | InteractionVerbatimString ->
@@ -434,8 +517,7 @@ let private splitInteractions (source: string) : string[] =
                         state <- InteractionCode
                         i <- i + 1
                 elif c = '\n' then
-                    lineCount <- lineCount + 1
-                    i <- i + 1
+                    advanceNewline (i + 1)
                 else
                     i <- i + 1
             | InteractionTripleString ->
@@ -443,13 +525,12 @@ let private splitInteractions (source: string) : string[] =
                     state <- InteractionCode
                     i <- i + 3
                 elif c = '\n' then
-                    lineCount <- lineCount + 1
-                    i <- i + 1
+                    advanceNewline (i + 1)
                 else
                     i <- i + 1
 
         if chunkStart < length || chunks.Count = 0 then
-            emitChunk length length lineCount
+            emitChunk length length lineCount (chunkStart - lineStart)
 
         chunks.ToArray()
 
@@ -928,9 +1009,8 @@ type SessionHost(options: SessionHostOptions) =
 
             try
                 for chunk in chunks do
-                    let wrapped = chunk + "\n()"
                     checkedSource <- true
-                    attemptedCode <- wrapped
+                    attemptedCode <- chunk
                     attemptedScriptName <- scriptName
                     typesBeforeCurrentEval <- emittedTypeCount ()
                     precheckedDiagnostics <- None
@@ -941,7 +1021,7 @@ type SessionHost(options: SessionHostOptions) =
                             Ambient.set { Out = TextWriter.Null; Error = TextWriter.Null; In = TextReader.Null }
 
                             try
-                                let _, _, check = session.ParseAndCheckInteraction wrapped
+                                let _, _, check = session.ParseAndCheckInteraction chunk
                                 check
                             finally
                                 Ambient.set saved
@@ -963,17 +1043,17 @@ type SessionHost(options: SessionHostOptions) =
                                             mapped)
                                 )
 
-                            session.EvalInteraction(wrapped, scriptName, cancellationToken = cancellationToken)
+                            session.EvalInteraction(chunk, scriptName, cancellationToken = cancellationToken)
                         else
                             typesBeforeCurrentEval <- Int32.MinValue
-                            session.EvalInteraction(wrapped, scriptName, cancellationToken = cancellationToken)
+                            session.EvalInteraction(chunk, scriptName, cancellationToken = cancellationToken)
                     else
-                        session.EvalInteraction(wrapped, scriptName, cancellationToken = cancellationToken)
+                        session.EvalInteraction(chunk, scriptName, cancellationToken = cancellationToken)
             finally
                 if mayMutateCompilerDirectory code then
                     claimed.CompilerDirectory <- ""
 
-                if request.Mode = "file" && prepared.SourceExists then
+                if OperatingSystem.IsWindows() && request.Mode = "file" && prepared.SourceExists then
                     let fileName = Path.GetFileName prepared.SourcePath
 
                     if not (String.Equals(prepared.SourcePath, fileName, StringComparison.Ordinal)) then

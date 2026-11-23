@@ -174,8 +174,8 @@ than the live queue depth, and in steady state the wait ran on nearly every turn
   `--pool-size`, `-h/--help/--version`) plus the environment variables from `Fsion.Protocol`
   /`Prelude.fs` (`FSION_PIPE`, `FSIOND_PATH`, `FSION_IDLE_TTL_MINUTES`, `FSION_SESSION_TTL_MINUTES`,
   `FSION_POOL_SIZE`, `FSION_PRELUDE`, `FSION_CONFIG_DIR`, `FSION_CACHE_DIR`, `FSIOND_LOG`).
-- `--pool-size` did not exist on the client although the goal's documentation clause lists it; it was
-  added as a pass-through (`src/fsion/Program.fs`, shared `DefaultPoolSize = 3` in
+- `--pool-size` previously existed only on `fsiond` / `FSION_POOL_SIZE`; it was added as a symmetric
+  client pass-through (`src/fsion/Program.fs`, shared `DefaultPoolSize = 3` in
   `src/Fsion.Protocol/Protocol.fs`) and is pinned black-box by
   `IsolationTests.--pool-size reaches the auto-started daemon and zero disables warm sessions`
   (`warm=False`, `PoolTarget = 0`, a subsequent cold claim, and `invalid --pool-size value` for `-1`).

@@ -275,9 +275,6 @@ let private severityText (severity: FSharpDiagnosticSeverity) =
     | FSharpDiagnosticSeverity.Info -> "info"
     | FSharpDiagnosticSeverity.Hidden -> "hidden"
 
-let private timeoutMessage (timeoutMs: int) =
-    "fsion: script timed out after " + string timeoutMs + " ms" + Environment.NewLine
-
 let private appendMessage (text: string) (message: string) =
     if text.Length = 0 || text.EndsWith("\n", StringComparison.Ordinal) then
         text + message
@@ -916,7 +913,7 @@ type SessionHost(options: SessionHostOptions) =
             // deadline and the completion race.
             if Volatile.Read(&timeoutFired.contents) = 1 then
                 { outcome with
-                    ExitCode = 124
+                    ExitCode = TimeoutExitCode
                     TimedOut = true
                     StandardError = appendMessage outcome.StandardError (timeoutMessage timeoutMs) }
             else
@@ -946,7 +943,7 @@ type SessionHost(options: SessionHostOptions) =
                         "fsion: run cancelled after the client disconnected" + Environment.NewLine
 
                 { Outcome =
-                    { ExitCode = 124
+                    { ExitCode = TimeoutExitCode
                       StandardOut = outWriter.SafeText()
                       StandardError = appendMessage (errWriter.SafeText()) message
                       Diagnostics = [||]

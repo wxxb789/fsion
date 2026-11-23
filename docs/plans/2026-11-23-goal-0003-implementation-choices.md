@@ -51,9 +51,12 @@ the deliberately deferred work.
   daemon is untouched. A cancellation that races a normal completion does not mark the run timed out
   (`Task.WaitAny` ordering decides).
 - `ExecutionResult.TimedOut` is the wire and JSON field. Timeout exit code is **124** (`timeout(1)`
-  convention) in both the daemon response and the client-side deadline fallback. The client waits up to
-  `timeoutMs + 2000` ms for the response and then synthesizes the same timeout result, so a daemon that
-  dies mid-run cannot hang `fsion`.
+  convention) in both the daemon response and the client-side deadline fallback. With `--timeout <ms>`
+  set, the client waits up to `timeoutMs + 2000` ms for the response on an open connection and
+  synthesizes the same timeout result if that client deadline expires first; if `fsiond` closes the
+  connection without a frame (`daemon stop` or crash), `NoResponse` still surfaces as exit 1
+  (`fsiond closed the connection without a response`), so daemon death is never masked as a script
+  timeout.
 
 ## Uncooperative drain-and-respawn
 

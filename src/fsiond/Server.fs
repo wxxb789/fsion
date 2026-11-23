@@ -37,16 +37,18 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
             | Execute request ->
                 use monitorCancellation = new CancellationTokenSource()
                 use disconnects = new CancellationTokenSource()
+                let monitorBuffer: byte[] = Array.zeroCreate 1
+                let monitorRead = connection.ReadAsync(monitorBuffer, 0, 1, monitorCancellation.Token)
 
-                Task.Run(fun () ->
-                    try
-                        let buffer: byte[] = Array.zeroCreate 1
-                        let read = connection.ReadAsync(buffer, 0, 1, monitorCancellation.Token)
-
-                        if read.GetAwaiter().GetResult() = 0 then
-                            disconnects.Cancel()
-                    with _ ->
-                        ())
+                monitorRead.ContinueWith(
+                    (fun (completed: Task<int>) ->
+                        if completed.IsCompletedSuccessfully && completed.Result = 0 then
+                            try
+                                disconnects.Cancel()
+                            with _ ->
+                                ()),
+                    TaskScheduler.Default
+                )
                 |> ignore
 
                 let started = Stopwatch.GetTimestamp()
@@ -113,9 +115,13 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
     let stopped = ref false
     let idleTtlMs = int64 (TimeSpan.FromMinutes(options.IdleTtlMinutes).TotalMilliseconds)
 
+    let stopToken = new CancellationTokenSource()
+
     let stop () =
         if not stopped.Value then
             stopped.Value <- true
+            stopToken.Cancel()
+
             try
                 listener.Stop ()
             with _ ->
@@ -210,7 +216,7 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
     let watchdog =
         Task.Run(fun () ->
             while not stopped.Value do
-                Thread.Sleep 250
+                stopToken.Token.WaitHandle.WaitOne 250 |> ignore
                 let idleMs = (DateTime.UtcNow - lastActivity.Value).TotalMilliseconds
                 let uptimeMs = (DateTime.UtcNow - startedAt).TotalMilliseconds
                 if options.Oneshot && activeRequests.Value = 0 && uptimeMs > 60000.0 then
@@ -228,5 +234,5 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
     let drainDeadline = DateTime.UtcNow.AddSeconds 3.0
     while activeRequests.Value > 0 && DateTime.UtcNow < drainDeadline do
         Thread.Sleep 50
-    watchdog.Dispose ()
+    watchdog.Wait 1000 |> ignore
     0

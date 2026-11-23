@@ -20,6 +20,11 @@ let [<Literal>] DefaultIdleTtlMinutes = 30.0
 
 let [<Literal>] DefaultSessionTtlMinutes = 15.0
 
+let [<Literal>] TimeoutExitCode = 124
+
+let timeoutMessage (timeoutMs: int) =
+    "fsion: script timed out after " + string timeoutMs + " ms" + Environment.NewLine
+
 let environmentSnapshot () : (string * string)[] =
     let variables = Environment.GetEnvironmentVariables()
 

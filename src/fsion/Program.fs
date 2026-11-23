@@ -226,10 +226,10 @@ let private ensureDaemon (options: Options) (endpoint: Endpoint) : Stream =
 type private Delivery =
     | NotDelivered
     | NoResponse
-    | DeadlineExpired
+    | DeadlineExpired of timeoutMs: int
     | Delivered of Response
 
-let private sendAndReceive (stream: Stream) (deadlineMs: int option) (request: Request) : Delivery =
+let private sendAndReceive (stream: Stream) (timeoutMs: int option) (request: Request) : Delivery =
     let delivered =
         try
             sendRequest stream request
@@ -239,58 +239,47 @@ let private sendAndReceive (stream: Stream) (deadlineMs: int option) (request: R
     if not delivered then
         NotDelivered
     else
-        match deadlineMs with
-        | Some limit when limit > 0 ->
+        match timeoutMs with
+        | Some timeoutMs when timeoutMs > 0 ->
             let receive = Task.Run(fun () -> tryReceiveFrame stream)
-            if receive.Wait limit then
+            if receive.Wait(timeoutMs + 2000) then
                 match receive.Result with
                 | Some payload -> Delivered(parseResponse payload)
                 | None -> NoResponse
             else
-                DeadlineExpired
+                DeadlineExpired timeoutMs
         | _ ->
             match tryReceiveFrame stream with
             | Some payload -> Delivered(parseResponse payload)
             | None -> NoResponse
 
+let private timeoutResult (timeoutMs: int) : ExecutionResult =
+    { ExitCode = TimeoutExitCode
+      StandardOut = ""
+      StandardError = timeoutMessage timeoutMs
+      Diagnostics = [||]
+      TimedOut = true }
+
 let private responseOf (delivery: Delivery) : Response =
     match delivery with
     | Delivered response -> response
     | NoResponse -> Failure "fsiond closed the connection without a response"
-    | DeadlineExpired -> Failure "fsiond did not respond before the client deadline"
+    | DeadlineExpired timeoutMs -> Executed(timeoutResult timeoutMs)
     | NotDelivered -> Failure "fsiond did not accept the request"
 
-let private timeoutResult (timeoutMs: int) : ExecutionResult =
-    { ExitCode = 124
-      StandardOut = ""
-      StandardError =
-        "fsion: script timed out after "
-        + string timeoutMs
-        + " ms"
-        + Environment.NewLine
-      Diagnostics = [||]
-      TimedOut = true }
-
-let private deadlineResponse (options: Options) =
-    match options.TimeoutMs with
-    | Some timeoutMs -> Executed(timeoutResult timeoutMs)
-    | None -> Failure "fsiond did not respond before the client deadline"
-
 let private executeOverDaemon (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) : Response =
-    let deadline = options.TimeoutMs |> Option.map (fun timeoutMs -> timeoutMs + 2000)
-
     let attempt () =
         let stream = ensureDaemon options endpoint
         try
-            sendAndReceive stream deadline (Execute request)
+            sendAndReceive stream options.TimeoutMs (Execute request)
         finally
             stream.Dispose()
     let first = attempt ()
     match first with
     | Delivered response -> response
-    | DeadlineExpired -> deadlineResponse options
-    | NoResponse -> responseOf first
     | NotDelivered -> attempt () |> responseOf
+    | NoResponse
+    | DeadlineExpired _ -> responseOf first
 
 let private executeOneShot (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) : Response =
     let oneshotEndpoint =
@@ -308,12 +297,9 @@ let private executeOneShot (options: Options) (endpoint: Endpoint) (request: Exe
     validateEndpointName oneshotEndpoint.Name
     spawnDaemon None None oneshotEndpoint
     let stream = connect oneshotEndpoint (TimeSpan.FromSeconds 60.0)
-    let deadline = options.TimeoutMs |> Option.map (fun timeoutMs -> timeoutMs + 2000)
 
     try
-        match sendAndReceive stream deadline (Execute request) with
-        | DeadlineExpired -> deadlineResponse options
-        | delivery -> responseOf delivery
+        sendAndReceive stream options.TimeoutMs (Execute request) |> responseOf
     finally
         stream.Dispose()
 

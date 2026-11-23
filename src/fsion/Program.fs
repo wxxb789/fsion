@@ -480,6 +480,9 @@ let private runWarmup (options: Options) (endpoint: Endpoint) : int =
             | None ->
                 Console.Out.Write("fsiond ready" + Environment.NewLine)
                 0
+        | Delivered (Failure message) ->
+            Console.Error.Write("fsion: " + message + Environment.NewLine)
+            1
         | _ ->
             Console.Error.Write("fsion: fsiond did not answer the warmup ping" + Environment.NewLine)
             1

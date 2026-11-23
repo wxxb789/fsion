@@ -310,6 +310,12 @@ type PreludeTests(output: ITestOutputHelper) =
             let attemptsAfterSecond = File.ReadAllLines(counterPath).Length
             Assert.Equal(attemptsBeforeSecond + 1, attemptsAfterSecond)
 
+
+            let failedWarmup =
+                context.Run([ "--prelude"; brokenPath; "warmup" ], timeoutMs = 120000)
+
+            Assert.Equal(1, failedWarmup.ExitCode)
+            Assert.Contains("prelude-boom", failedWarmup.Stderr)
             let settled = context.MetricsOrFail()
             Assert.Equal(0, settled.PoolWarm)
             Assert.Equal(0, settled.AliveDisposedSessions)

@@ -222,14 +222,21 @@ let private configFingerprint (startDirectory: string) =
         let current = directory.Value
 
         try
-            for file in Directory.EnumerateFiles current.FullName do
-                if Path.GetFileName(file).Equals("nuget.config", StringComparison.OrdinalIgnoreCase) then
-                    paths.Add file
+            if OperatingSystem.IsWindows() then
+                let candidate = Path.Combine(current.FullName, "nuget.config")
+
+                if File.Exists candidate then
+                    paths.Add candidate
+            else
+                for name in [ "nuget.config"; "NuGet.Config"; "NuGet.config" ] do
+                    let candidate = Path.Combine(current.FullName, name)
+
+                    if File.Exists candidate then
+                        paths.Add candidate
         with _ ->
             ()
 
         directory <- if isNull current.Parent then None else Some current.Parent
-
     let userConfig =
         Path.Combine(Environment.GetFolderPath Environment.SpecialFolder.ApplicationData, "NuGet", "NuGet.Config")
 

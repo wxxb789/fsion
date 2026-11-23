@@ -563,6 +563,7 @@ type SessionHost(options: SessionHostOptions) =
     let desiredGate = obj ()
     let mutable desiredSpec = options.Prelude
     let mutable failedTag: Prelude.Tag option = None
+    let mutable failedError: string option = None
 
     let rec claimSession (tag: Prelude.Tag) (cancelToken: CancellationToken) : WarmSession =
         match pool.TryDequeue() with
@@ -584,6 +585,7 @@ type SessionHost(options: SessionHostOptions) =
                 lock desiredGate (fun () ->
                     if failedTag.IsSome then
                         failedTag <- None
+                        failedError <- None
                         true
                     else
                         false)
@@ -638,7 +640,7 @@ type SessionHost(options: SessionHostOptions) =
 
     // Handler removal and collectible-session disposal need creationGate so delegate adds and
     // removes never interleave, but a run must not stall behind a slow background session
-    // creation. The replenisher drains this queue right after it wakes (it runs with
+    // creation. The replenisher drains this queue after refilling the warm pool (it runs with
     // --pool-size 0 too), and Metrics drains it before sampling.
     let drainCleanups () =
         if creationGate.Wait 0 then
@@ -882,6 +884,7 @@ type SessionHost(options: SessionHostOptions) =
                 else
                     desiredSpec <- spec
                     failedTag <- None
+                    failedError <- None
                     true)
 
         if changed then
@@ -927,13 +930,22 @@ type SessionHost(options: SessionHostOptions) =
 
                                 try
                                     let warm = createWarmSession spec
-                                    lock desiredGate (fun () -> if failedTag = Some currentTag then failedTag <- None)
+
+                                    lock desiredGate (fun () ->
+                                        if failedTag = Some currentTag then
+                                            failedTag <- None
+                                            failedError <- None)
+
                                     Some warm
                                 finally
                                     creationGate.Release() |> ignore
                             with ex ->
                                 Log.error None ("replenisher could not create a warm session: " + ex.Message)
-                                lock desiredGate (fun () -> failedTag <- Some currentTag)
+
+                                lock desiredGate (fun () ->
+                                    failedTag <- Some currentTag
+                                    failedError <- Some ex.Message)
+
                                 None
                         finally
                             pendingCreations <- pendingCreations - 1
@@ -969,7 +981,8 @@ type SessionHost(options: SessionHostOptions) =
     member _.EnsureWarm(spec: Prelude.Spec) =
         lock desiredGate (fun () ->
             desiredSpec <- spec
-            failedTag <- None)
+            failedTag <- None
+            failedError <- None)
 
         if targetPoolSize > 0 then
             recycleStalePoolSessions ()
@@ -990,6 +1003,30 @@ type SessionHost(options: SessionHostOptions) =
                 if filling then
                     Thread.Sleep 5
 
+            let failure =
+                lock desiredGate (fun () ->
+                    if failedTag = Some(Prelude.tagOfSpec desiredSpec) then
+                        Some(defaultArg failedError "configured prelude failed during warmup")
+                    else
+                        None)
+
+            match failure with
+            | Some message -> failwith message
+            | None -> ()
+        else
+            match spec with
+            | Prelude.Spec.File _ ->
+                creationGate.Wait()
+
+                let probe =
+                    try
+                        createWarmSession spec
+                    finally
+                        creationGate.Release() |> ignore
+
+                releaseSession probe
+                replenishSignal.Release() |> ignore
+            | _ -> ()
     member _.IsWarm = pool.Count > 0
 
     member _.ExecutedCount = executed.Value

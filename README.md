@@ -27,25 +27,25 @@ process invocation, n = 30:
 
 | Runner | Median | Mean | Stdev | Min | p95 | Max | vs fsion median |
 |---|---|---|---|---|---|---|---|
-| `fsion` (warm pool, unseen script per round) | **73.3** | 87.3 | 41.5 | 67.6 | 209.9 | 214.3 | — |
-| `dotnet fsi` (fresh process per round) | 3075.5 | 3137.8 | 223.1 | 2941.4 | 3372.7 | 4174.2 | **41.9x slower** |
-| `bun` 1.4.5 (`bun run *.ts`) | 49.4 | 70.7 | 50.7 | 43.5 | 190.8 | 192.1 | 1.48x faster |
-| `node` v26.13.1 (`*.js`) | 71.2 | 72.0 | 4.9 | 63.2 | 79.7 | 81.4 | 1.03x faster |
-| `python` 3.15.2 (`*.py`) | 62.5 | 68.3 | 28.9 | 58.5 | 76.8 | 220.2 | 1.17x faster |
+| `fsion` (warm pool, unseen script per round) | **71.8** | 73.6 | 5.6 | 67.9 | 85.5 | 92.9 | — |
+| `dotnet fsi` (fresh process per round) | 3023.3 | 3112.2 | 222.4 | 2955.8 | 3687.2 | 3897.5 | **42.1x slower** |
+| `bun` 1.4.5 (`bun run *.ts`) | 47.2 | 48.2 | 3.5 | 45.4 | 56.4 | 63.0 | 1.52x faster |
+| `node` v26.13.1 (`*.js`) | 71.2 | 73.0 | 7.0 | 67.9 | 85.4 | 103.8 | 1.01x faster |
+| `python` 3.15.2 (`*.py`) | 61.9 | 73.0 | 35.1 | 60.2 | 198.2 | 201.4 | 1.16x faster |
 
-`hello` workload (single formatted write), median / p95, n = 30: `fsion` **54.6** / 85.0
-(`54.1x` faster than `dotnet fsi`), `dotnet fsi` 2950.7 / 3137.7, `bun` 47.9 / 56.1, `node`
-73.4 / 82.3, `python` 44.6 / 52.7.
+`hello` workload (single formatted write), median / p95, n = 30: `fsion` **54.4** / 95.8
+(`52.5x` faster than `dotnet fsi`), `dotnet fsi` 2857.1 / 3197.2, `bun` 46.3 / 66.8, `node`
+71.9 / 100.7, `python` 44.1 / 57.5.
 
 **AC-07 outcome on this host.** The `>= 20x` median speedup over `dotnet fsi` is met with
-wide margin (**41.9x** on `typical`, **54.1x** on `hello`), and warm `fsion` matches `node`
-(73.3 ms vs 71.2 ms on `typical`, and 18.8 ms faster than `node` on `hello`). On `hello`,
-`fsion` is within 6.7 ms (`1.14x`) of `bun`; on `typical`, the strict `<= 1.00x bun` bar is
-**not** met (`fsion` 73.3 ms vs `bun` 49.4 ms, `1.48x`). The measured breakdown of the
-73.3 ms is: ~28 ms Windows process spawn + NativeAOT client + Named Pipe round-trip, ~2 ms
+wide margin (**42.1x** on `typical`, **52.5x** on `hello`), and warm `fsion` matches `node`
+(71.8 ms vs 71.2 ms on `typical`, and 17.5 ms faster than `node` on `hello`). On `hello`,
+`fsion` is within 8.1 ms (`1.18x`) of `bun`; on `typical`, the strict `<= 1.00x bun` bar is
+**not** met (`fsion` 71.8 ms vs `bun` 47.2 ms, `1.52x`). The measured breakdown of the
+71.8 ms is: ~28 ms Windows process spawn + NativeAOT client + Named Pipe round-trip, ~2 ms
 process-state transition, ~32 ms in-memory F# parse + Hindley-Milner typecheck + IL emit +
-Tier-0 execution of the unseen script, and ~6–11 ms `releaseSession` (the Gen-0 finalizer
-sweep that closes handles left open by throwaway scripts). The remaining ~24 ms gap to `bun`
+Tier-0 execution of the unseen script, and ~6–10 ms `releaseSession` (the Gen-0 finalizer
+sweep that closes handles left open by throwaway scripts). The remaining ~25 ms gap to `bun`
 on `typical` is F#'s static Hindley-Milner typecheck + IL emission vs `bun`'s zero-typecheck
 TS type-stripping. The harness reports this verdict itself: `--require-ac07` exits 1 when
 `<= 1.00x bun` is missed, and the committed report records `FAIL` for that sub-bar honestly.
@@ -91,9 +91,12 @@ black-box testing seam are in
 
 ## Install
 
-Requirements: the .NET 10 or .NET 11 SDK (both TFMs are built and tested) and, for the
+Requirements: building the multi-targeted solution (`net10.0;net11.0`) from source requires
+the .NET 11 SDK (plus the .NET 10 runtime when running `net10.0` tests) and, for the
 NativeAOT client, a C/C++ toolchain for the host OS (Visual Studio 2022+/Build Tools on
-Windows, `clang` on Linux, Xcode Command Line Tools on macOS).
+Windows, `clang` + `zlib1g-dev` on Linux, Xcode Command Line Tools on macOS). Running a
+pre-packaged bundle requires only the matching .NET 10 or .NET 11 runtime for `fsiond`
+(`fsion` itself is NativeAOT).
 
 ```powershell
 git clone <this repository>; cd fsion

@@ -22,7 +22,18 @@ let ``file mode matches dotnet fsi byte for byte`` () =
         writeFile directory "probe.fsx" contextScript
         let expected = runFsi directory [ "probe.fsx"; "one"; "two words" ] None
         let actual = context.Run [ "probe.fsx"; "one"; "two words" ]
-        assertSameOutput expected actual)
+        assertSameOutput expected actual
+
+        let multiScript =
+            "let full = System.IO.Path.Combine(__SOURCE_DIRECTORY__, __SOURCE_FILE__)\n"
+            + "eprintfn \"diag=%s(\" full;;\n"
+            + "printfn \"after-semi\"\n"
+            + "exit 7\n"
+
+        writeFile directory "multi.fsx" multiScript
+        let expectedMulti = runFsi directory [ "multi.fsx" ] None
+        let actualMulti = context.Run [ "multi.fsx" ]
+        assertSameOutput expectedMulti actualMulti)
 
 [<Fact>]
 let ``file mode passes quoting-sensitive arguments like dotnet fsi`` () =

@@ -51,29 +51,30 @@ plan, and the deliberately deferred work.
 The contract's `AC-07` bar is measured, not assumed. Pre-work measurement on this host showed cold
 claims (pool drained by back-to-back invocations) at 1.2–3.4 s, so the harness's interleaved spacing
 is part of the design. Five avoidable per-invocation costs were eliminated in `SessionHost.fs` and
-`bench/run-bench.py` (cutting `typical` median from 104.4 ms to **73.3 ms** and `hello` from 83.4 ms
-to **54.6 ms**):
+`bench/run-bench.py` (cutting `typical` median from 104.4 ms to **71.8 ms** and `hello` from 83.4 ms
+to **54.4 ms**):
 
-1. File-mode scripts now read UTF-8 source directly and evaluate via `EvalInteraction(code + "\n()", sourcePath)`
-   (normalizing file-mode stderr diagnostic prefixes to `Path.GetFileName` for byte parity with
-   `dotnet fsi`), avoiding `EvalScript`'s ~25–30 ms synthetic `#load` module wrapper.
+1. File-mode scripts now read UTF-8 source directly and evaluate via `EvalInteraction(chunk + "\n()", sourcePath)`
+   (splitting top-level `;;` chunks with line-offset preservation and normalizing line-start file-mode
+   stderr diagnostic prefixes to `Path.GetFileName` for byte parity with `dotnet fsi`), avoiding
+   `EvalScript`'s ~25–30 ms synthetic `#load` module wrapper.
 2. `Settings` sets `ShowDeclarationValues/ShowIEnumerable/ShowProperties = false` so FSI never spends
    reflection formatting cycles on bound values that `--quiet` discards.
 3. `WarmSession.CompilerDirectory` tracks the session's compiler directory to skip redundant `#cd`
    evaluations (~10 ms saved when matching), and `builtinPrelude` pre-warms `JsonDocument` + `Seq`
    compiler codegen paths during background pool creation.
 4. `runInSession` releases `replenishSignal` *after* `releaseSession` finishes so background warm-up
-   never contends with the active turn's Gen-0 finalizer sweep; `sweepTransientFinalizers` skips
-   `WaitForPendingFinalizers` when `FinalizationPendingCount = 0` (keeping `IsolationTests` file-unlock
-   green).
+   never contends with the active turn's Gen-0 finalizer sweep (`GC.Collect(0)` + unconditional
+   `GC.WaitForPendingFinalizers()`, preserving `IsolationTests` deterministic file-unlock under
+   concurrent GC).
 5. `bench/run-bench.py` resolves runner executables via `shutil.which` once and invokes the resolved
    binary directly (avoiding version-manager shim overhead) using lean `Console.Out.Write` output.
 
 The remaining physical floor is ~28 ms Windows process spawn + IPC plus ~32 ms FCS Hindley-Milner
-typechecking + IL emission + Tier-0 execution (`73.3 ms` `fsion` vs `49.4 ms` `bun` and `71.2 ms`
-`node` on `typical`; `54.6 ms` `fsion` vs `47.9 ms` `bun` and `73.4 ms` `node` on `hello`). The
-`>= 20x` bar passes at **41.94x**, while the strict `<= 1.00x bun` threshold is reported honestly as
-**FAIL** (`1.484x`, `--require-ac07` exit 1).
+typechecking + IL emission + Tier-0 execution (`71.8 ms` `fsion` vs `47.2 ms` `bun` and `71.2 ms`
+`node` on `typical`; `54.4 ms` `fsion` vs `46.3 ms` `bun` and `71.9 ms` `node` on `hello`). The
+`>= 20x` bar passes at **42.11x**, while the strict `<= 1.00x bun` threshold is reported honestly as
+**FAIL** (`1.521x`, `--require-ac07` exit 1).
 
 ## Packaging (`eng/package.ps1`)
 
@@ -123,8 +124,8 @@ the flag reaches the daemon.
 |---|---|---|
 | Fresh unseen source per round with nonces | `python bench/run-bench.py --dry-run` (two runs differ), report `salt` + per-round nonces | per-round nonces and source SHA-256 committed for all 30 rounds |
 | Byte-identical output before timings | parity gate in every round; non-zero exit on mismatch | 30/30 rounds verified across 5 runners, exit 0 each |
-| `>= 20x` median vs `dotnet fsi`, bun-class | `python bench/run-bench.py --require-ac07` and the committed report | 41.94x over fsi (PASS, 73.3 ms vs 3075.5 ms); 1.484x bun (FAIL, harness exit 1); breakdown in the evidence |
-| Packaging for host RID + archive + fresh-temp run | `pwsh -File eng/package.ps1 -Framework net10.0` | exit 0, `PACKAGE OK`, 27.2 MB bundle, 11.4 MB archive, full smoke transcript in the evidence |
+| `>= 20x` median vs `dotnet fsi`, bun-class | `python bench/run-bench.py --require-ac07` and the committed report | 42.11x over fsi (PASS, 71.8 ms vs 3023.3 ms); 1.521x bun (FAIL, harness exit 1); breakdown in the evidence |
+| Packaging for host RID + archive + fresh-temp run | `pwsh -File eng/package.ps1 -Framework net10.0` | exit 0, `PACKAGE OK`, 27.3 MB bundle, 11.5 MB archive, full smoke transcript in the evidence |
 | 3-OS CI | `.github/workflows/ci.yml` review; gate + package steps mirrored locally | static configuration only; unexecuted on GitHub runners (recorded limit) |
 | README/AGENTS accuracy | flag-by-flag diff against `Program.fs` usage text; benchmark table copied from the generated report | table values match `0005-benchmark-results.json` |
 | `AC-01`..`AC-06` stay green | full `eng/gate.ps1` at the end | gate exit 0 with both TFMs green (see evidence gate table) |

@@ -491,6 +491,8 @@ def main(argv: list[str]) -> int:
         raise SystemExit("the fsion runner is required for this benchmark")
 
     if args.dry_run:
+        if args.require_ac07:
+            raise SystemExit("--dry-run cannot satisfy --require-ac07 (no timings or comparisons were measured)")
         salt = secrets.token_hex(4)
         for runner in runners:
             nonce, seed = _nonce(salt, 1, WORKLOAD_TYPICAL)
@@ -499,18 +501,42 @@ def main(argv: list[str]) -> int:
             print(_render_source(runner, WORKLOAD_TYPICAL, nonce, seed, rows))
         return 0
 
-    salt = secrets.token_hex(4)
-    work_dir = (
-        (Path(args.work_dir).resolve() / f"run-{salt}")
-        if args.work_dir
-        else (BENCH_DIR / ".work" / f"run-{salt}")
-    )
-    work_dir.mkdir(parents=True, exist_ok=True)
+    if args.require_ac07:
+        present_ids = {runner.id for runner in runners}
+        missing_ac07: list[str] = []
+        if WORKLOAD_TYPICAL not in workloads:
+            missing_ac07.append("workload 'typical' is required")
+        if rounds < data["defaults"]["rounds"]:
+            missing_ac07.append(f"--rounds must be >= {data['defaults']['rounds']} (got {rounds})")
+        for required_runner in ("fsion", "dotnet-fsi", "bun"):
+            if required_runner not in present_ids:
+                missing_ac07.append(f"runner '{required_runner}' is missing")
+        if missing_ac07:
+            raise SystemExit("--require-ac07 preconditions not met: " + "; ".join(missing_ac07))
+
+    parent_dir = Path(args.work_dir).resolve() if args.work_dir else (BENCH_DIR / ".work")
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    salt = ""
+    work_dir = parent_dir
+    for _ in range(16):
+        candidate_salt = secrets.token_hex(4)
+        candidate_dir = parent_dir / f"run-{candidate_salt}"
+        try:
+            candidate_dir.mkdir(parents=False, exist_ok=False)
+            salt = candidate_salt
+            work_dir = candidate_dir
+            break
+        except FileExistsError:
+            continue
+    if not salt:
+        raise SystemExit(f"could not allocate a fresh run-<salt> directory under {parent_dir}")
+
     config_dir = work_dir / ".fsion-config"
     config_dir.mkdir(parents=True, exist_ok=True)
 
     base_env = dict(os.environ)
     base_env.pop("FSION_PRELUDE", None)
+    base_env.pop("FSION_POOL_SIZE", None)
     base_env.update(data["env"])
     base_env["FSION_PIPE"] = f"fsion-bench-{salt}"
     base_env["FSIOND_PATH"] = str(fsiond_path)
@@ -523,11 +549,6 @@ def main(argv: list[str]) -> int:
 
     started_at = _datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     fsion_runner = next(runner for runner in runners if runner.id == "fsion")
-    warmup = _run_command([fsion_runner.command[0], "warmup"], work_dir, base_env, args.timeout)
-    if warmup["exit"] != 0:
-        _write_text(work_dir / "warmup.err", warmup["stderr"].decode("utf-8", "replace"))
-        raise SystemExit(f"fsion warmup failed with exit {warmup['exit']}")
-    print("fsion warmup: " + warmup["stdout"].decode("utf-8", "replace").strip())
 
     rounds_detail: list[dict] = []
     totals: dict[str, dict[str, list[float]]] = {
@@ -537,6 +558,12 @@ def main(argv: list[str]) -> int:
     measured = 0
 
     try:
+        warmup = _run_command([fsion_runner.command[0], "warmup"], work_dir, base_env, args.timeout)
+        warmup_out = warmup["stdout"].decode("utf-8", "replace").strip()
+        if warmup["exit"] != 0 or "warm=True" not in warmup_out:
+            _write_text(work_dir / "warmup.err", warmup["stderr"].decode("utf-8", "replace") + "\n" + warmup_out)
+            raise SystemExit(f"fsion warmup did not fill a warm pool (exit={warmup['exit']}, out={warmup_out!r})")
+        print("fsion warmup: " + warmup_out)
         for round_index in range(0, warmup_rounds + rounds):
             measured_round = round_index >= warmup_rounds
             round_number = round_index - warmup_rounds + 1

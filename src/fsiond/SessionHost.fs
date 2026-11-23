@@ -45,6 +45,24 @@ type private RunTextWriter() =
     member _.ReplaceInBuilder(oldValue: string, newValue: string) =
         lock gate (fun () -> inner.GetStringBuilder().Replace(oldValue, newValue) |> ignore)
 
+    member _.ReplaceDiagnosticSource(sourcePath: string, fileName: string) =
+        lock gate (fun () ->
+            let builder = inner.GetStringBuilder()
+            let oldPrefix = sourcePath + "("
+            let newPrefix = fileName + "("
+            let mutable index = 0
+
+            while index >= 0 && index <= builder.Length - oldPrefix.Length do
+                let found = builder.ToString().IndexOf(oldPrefix, index, StringComparison.Ordinal)
+
+                if found < 0 then
+                    index <- -1
+                elif found = 0 || builder.[found - 1] = '\n' || builder.[found - 1] = '\r' then
+                    builder.Remove(found, sourcePath.Length).Insert(found, fileName) |> ignore
+                    index <- found + newPrefix.Length
+                else
+                    index <- found + oldPrefix.Length)
+
     override _.Encoding = inner.Encoding
 
     override _.Write(value: char) = lock gate (fun () -> inner.Write value)
@@ -278,10 +296,7 @@ let private sweepFinalizers () =
 // request's critical path.
 let private sweepTransientFinalizers () =
     GC.Collect(0, GCCollectionMode.Forced, true, false)
-
-    if GC.GetGCMemoryInfo().FinalizationPendingCount > 0L then
-        GC.WaitForPendingFinalizers()
-
+    GC.WaitForPendingFinalizers()
 let private severityText (severity: FSharpDiagnosticSeverity) =
     match severity with
     | FSharpDiagnosticSeverity.Error -> "error"
@@ -305,6 +320,138 @@ let private scriptDiagnostic (diagnostic: FSharpDiagnostic) =
       StartColumn = diagnostic.StartColumn
       EndLine = diagnostic.EndLine
       EndColumn = diagnostic.EndColumn }
+
+let private mayMutateCompilerDirectory (text: string) =
+    text.IndexOf("#cd", StringComparison.Ordinal) >= 0
+    || text.IndexOf("#silentCd", StringComparison.Ordinal) >= 0
+    || text.IndexOf("#load", StringComparison.Ordinal) >= 0
+
+type private InteractionScan =
+    | InteractionCode
+    | InteractionLineComment
+    | InteractionBlockComment of int
+    | InteractionNormalString
+    | InteractionVerbatimString
+    | InteractionTripleString
+
+// EvalInteraction stops at the first top-level `;;` terminator, whereas `dotnet fsi` executes every
+// `;;`-delimited chunk in a script file. Split on top-level `;;` outside strings/comments and pad
+// subsequent chunks with leading `\n` equal to their starting line offset so diagnostic line
+// numbers remain exact.
+let private splitInteractions (source: string) : string[] =
+    if source.IndexOf(";;", StringComparison.Ordinal) < 0 then
+        [| source |]
+    else
+        let chunks = ResizeArray<string>()
+        let length = source.Length
+        let mutable state = InteractionCode
+        let mutable i = 0
+        let mutable lineCount = 0
+        let mutable chunkStart = 0
+        let mutable chunkStartLines = 0
+
+        let emitChunk endExclusive nextStart nextLines =
+            let body = source.Substring(chunkStart, endExclusive - chunkStart)
+
+            if chunks.Count = 0 || body.Trim().Length > 0 then
+                let prefix = if chunkStartLines > 0 then String('\n', chunkStartLines) else ""
+                chunks.Add(prefix + body)
+
+            chunkStart <- nextStart
+            chunkStartLines <- nextLines
+
+        while i < length do
+            let c = source.[i]
+
+            match state with
+            | InteractionCode ->
+                if c = '\n' then
+                    lineCount <- lineCount + 1
+                    i <- i + 1
+                elif c = '/' && i + 1 < length && source.[i + 1] = '/' then
+                    state <- InteractionLineComment
+                    i <- i + 2
+                elif c = '(' && i + 1 < length && source.[i + 1] = '*' then
+                    state <- InteractionBlockComment 1
+                    i <- i + 2
+                elif c = '"' then
+                    if i + 2 < length && source.[i + 1] = '"' && source.[i + 2] = '"' then
+                        state <- InteractionTripleString
+                        i <- i + 3
+                    else
+                        state <- InteractionNormalString
+                        i <- i + 1
+                elif c = '@' && i + 1 < length && source.[i + 1] = '"' then
+                    state <- InteractionVerbatimString
+                    i <- i + 2
+                elif c = '\'' && i + 2 < length && source.[i + 1] <> '\\' && source.[i + 2] = '\'' then
+                    i <- i + 3
+                elif c = '\'' && i + 3 < length && source.[i + 1] = '\\' && source.[i + 3] = '\'' then
+                    i <- i + 4
+                elif c = ';' && i + 1 < length && source.[i + 1] = ';' then
+                    emitChunk i (i + 2) lineCount
+                    i <- i + 2
+                else
+                    i <- i + 1
+            | InteractionLineComment ->
+                if c = '\n' then
+                    lineCount <- lineCount + 1
+                    state <- InteractionCode
+
+                i <- i + 1
+            | InteractionBlockComment depth ->
+                if c = '\n' then
+                    lineCount <- lineCount + 1
+                    i <- i + 1
+                elif c = '(' && i + 1 < length && source.[i + 1] = '*' then
+                    state <- InteractionBlockComment(depth + 1)
+                    i <- i + 2
+                elif c = '*' && i + 1 < length && source.[i + 1] = ')' then
+                    state <- if depth = 1 then InteractionCode else InteractionBlockComment(depth - 1)
+                    i <- i + 2
+                else
+                    i <- i + 1
+            | InteractionNormalString ->
+                if c = '\\' && i + 1 < length then
+                    if source.[i + 1] = '\n' then
+                        lineCount <- lineCount + 1
+
+                    i <- i + 2
+                elif c = '"' then
+                    state <- InteractionCode
+                    i <- i + 1
+                elif c = '\n' then
+                    lineCount <- lineCount + 1
+                    state <- InteractionCode
+                    i <- i + 1
+                else
+                    i <- i + 1
+            | InteractionVerbatimString ->
+                if c = '"' then
+                    if i + 1 < length && source.[i + 1] = '"' then
+                        i <- i + 2
+                    else
+                        state <- InteractionCode
+                        i <- i + 1
+                elif c = '\n' then
+                    lineCount <- lineCount + 1
+                    i <- i + 1
+                else
+                    i <- i + 1
+            | InteractionTripleString ->
+                if c = '"' && i + 2 < length && source.[i + 1] = '"' && source.[i + 2] = '"' then
+                    state <- InteractionCode
+                    i <- i + 3
+                elif c = '\n' then
+                    lineCount <- lineCount + 1
+                    i <- i + 1
+                else
+                    i <- i + 1
+
+        if chunkStart < length || chunks.Count = 0 then
+            emitChunk length length lineCount
+
+        chunks.ToArray()
 
 // The throwing Eval* APIs print diagnostics to the session's error writer but construct
 // FsiCompilationException with ErrorInfos = None; only the non-throwing APIs return the
@@ -480,13 +627,7 @@ type SessionHost(options: SessionHostOptions) =
             | None -> session.EvalInteraction(text + "\n()", path)
 
             let trackedDirectory =
-                if
-                    text.IndexOf("#cd", StringComparison.Ordinal) >= 0
-                    || text.IndexOf("#load", StringComparison.Ordinal) >= 0
-                then
-                    ""
-                else
-                    directory
+                if mayMutateCompilerDirectory text then "" else directory
 
             Prelude.Tag.File(path, contentHash), trackedDirectory
     let releaseSession (claimed: WarmSession) =
@@ -546,7 +687,7 @@ type SessionHost(options: SessionHostOptions) =
             let creationErr = new StringWriter()
             Ambient.set { Out = creationOut; Error = creationErr; In = TextReader.Null }
             let mutable preludeTag = Prelude.Tag.Builtin
-            let mutable compilerDirectory = Directory.GetCurrentDirectory()
+            let mutable compilerDirectory = ""
 
             try
                 try
@@ -779,28 +920,64 @@ type SessionHost(options: SessionHostOptions) =
 
         let mutable attemptedCode = ""
         let mutable attemptedScriptName = prepared.SourceName
+        let mutable typesBeforeCurrentEval = 0
+        let mutable precheckedDiagnostics: ScriptDiagnostic[] option = None
 
         let evalCode (code: string) (scriptName: string) =
-            checkedSource <- true
-            let wrapped = code + "\n()"
-            attemptedCode <- wrapped
-            attemptedScriptName <- scriptName
+            let chunks = splitInteractions code
 
             try
-                session.EvalInteraction(wrapped, scriptName, cancellationToken = cancellationToken)
+                for chunk in chunks do
+                    let wrapped = chunk + "\n()"
+                    checkedSource <- true
+                    attemptedCode <- wrapped
+                    attemptedScriptName <- scriptName
+                    typesBeforeCurrentEval <- emittedTypeCount ()
+                    precheckedDiagnostics <- None
+
+                    if request.IncludeDiagnostics && chunk.IndexOf("#load", StringComparison.Ordinal) >= 0 then
+                        let checkResults =
+                            let saved = { Out = outWriter; Error = errWriter; In = TextReader.Null }
+                            Ambient.set { Out = TextWriter.Null; Error = TextWriter.Null; In = TextReader.Null }
+
+                            try
+                                let _, _, check = session.ParseAndCheckInteraction wrapped
+                                check
+                            finally
+                                Ambient.set saved
+
+                        let hasCompileErrors =
+                            checkResults.Diagnostics
+                            |> Array.exists (fun diagnostic -> diagnostic.Severity = FSharpDiagnosticSeverity.Error)
+
+                        if hasCompileErrors then
+                            precheckedDiagnostics <-
+                                Some(
+                                    checkResults.Diagnostics
+                                    |> Array.map (fun diagnostic ->
+                                        let mapped = scriptDiagnostic diagnostic
+
+                                        if mapped.File.EndsWith("stdin.fsx", StringComparison.OrdinalIgnoreCase) then
+                                            { mapped with File = scriptName }
+                                        else
+                                            mapped)
+                                )
+
+                            session.EvalInteraction(wrapped, scriptName, cancellationToken = cancellationToken)
+                        else
+                            typesBeforeCurrentEval <- Int32.MinValue
+                            session.EvalInteraction(wrapped, scriptName, cancellationToken = cancellationToken)
+                    else
+                        session.EvalInteraction(wrapped, scriptName, cancellationToken = cancellationToken)
             finally
-                if
-                    code.IndexOf("#cd", StringComparison.Ordinal) >= 0
-                    || code.IndexOf("#load", StringComparison.Ordinal) >= 0
-                then
+                if mayMutateCompilerDirectory code then
                     claimed.CompilerDirectory <- ""
 
                 if request.Mode = "file" && prepared.SourceExists then
                     let fileName = Path.GetFileName prepared.SourcePath
 
                     if not (String.Equals(prepared.SourcePath, fileName, StringComparison.Ordinal)) then
-                        errWriter.ReplaceInBuilder(prepared.SourcePath + "(", fileName + "(")
-
+                        errWriter.ReplaceDiagnosticSource(prepared.SourcePath, fileName)
         let run () =
             match prepared.Rewritten with
             | Some (referenceBlock, rewrittenSource) ->
@@ -835,26 +1012,34 @@ type SessionHost(options: SessionHostOptions) =
             if not checkedSource || (request.Mode = "file" && not prepared.SourceExists) then
                 [||]
             else
-                // The non-throwing APIs suppress the formatted diagnostics but still write
-                // "Stopped due to error"; route that to a discard writer so the text printed by the
-                // throwing pass stays byte-identical to 0001.
-                let saved = { Out = outWriter; Error = errWriter; In = TextReader.Null }
-                Ambient.set { Out = TextWriter.Null; Error = TextWriter.Null; In = TextReader.Null }
+                match precheckedDiagnostics with
+                | Some diagnostics -> diagnostics
+                | None ->
+                    changeDirectory (
+                        if request.Mode = "file" && prepared.SourceExists then
+                            prepared.ScriptDirectory
+                        else
+                            request.WorkingDirectory
+                    )
 
-                let diagnostics =
-                    try
-                        snd (session.EvalInteractionNonThrowing(attemptedCode, attemptedScriptName))
-                    finally
-                        Ambient.set saved
+                    // The non-throwing APIs suppress the formatted diagnostics but still write
+                    // "Stopped due to error"; route that to a discard writer so the text printed by the
+                    // throwing pass stays byte-identical to 0001.
+                    let saved = { Out = outWriter; Error = errWriter; In = TextReader.Null }
+                    Ambient.set { Out = TextWriter.Null; Error = TextWriter.Null; In = TextReader.Null }
 
-                diagnostics |> Array.map scriptDiagnostic
+                    let diagnostics =
+                        try
+                            snd (session.EvalInteractionNonThrowing(attemptedCode, attemptedScriptName))
+                        finally
+                            Ambient.set saved
 
-        let typesBeforeRun = emittedTypeCount ()
+                    diagnostics |> Array.map scriptDiagnostic
 
         try
             run ()
 
-            if emittedTypeCount () = typesBeforeRun && errWriter.SafeText().Length > 0 then
+            if checkedSource && emittedTypeCount () = typesBeforeCurrentEval && errWriter.SafeText().Length > 0 then
                 let diagnostics = if request.IncludeDiagnostics then compileDiagnostics () else [||]
                 1, diagnostics
             else
@@ -869,11 +1054,13 @@ type SessionHost(options: SessionHostOptions) =
 
                 claimed.ExitCodeProperty.Value.GetValue state :?> int, [||]
             else
-                // A failed compilation emits no CLR types; every non-empty compiled interaction
-                // emits its types before executing, so the emitted-type delta proves user IL never
-                // ran without sniffing the diagnostic text.
-                let compiledAndEnteredRuntime = emittedTypeCount () > typesBeforeRun
-
+                // A failed compilation emits no CLR types for the failing interaction (and `#load`
+                // interactions pre-checked clean set `typesBeforeCurrentEval = Int32.MinValue`), so
+                // `emittedTypeCount () > typesBeforeCurrentEval` proves user IL ran without sniffing text.
+                let compiledAndEnteredRuntime =
+                    match precheckedDiagnostics with
+                    | Some _ -> false
+                    | None -> typesBeforeCurrentEval = Int32.MinValue || emittedTypeCount () > typesBeforeCurrentEval
                 if
                     request.IncludeDiagnostics
                     && not compiledAndEnteredRuntime
@@ -1314,6 +1501,20 @@ type SessionHost(options: SessionHostOptions) =
                       Wedged = false }
 
     member _.Metrics() : MetricsInfo =
+        if targetPoolSize > 0 then
+            let shouldWait () =
+                let broken =
+                    lock desiredGate (fun () -> failedTag = Some(Prelude.tagOfSpec desiredSpec))
+
+                not stopped && not broken && pool.Count < targetPoolSize
+
+            if shouldWait () then
+                replenishSignal.Release() |> ignore
+                let deadline = Environment.TickCount64 + 30000L
+
+                while shouldWait () && Environment.TickCount64 < deadline do
+                    Thread.Sleep 10
+
         drainCleanupsBlocking ()
         sweepFinalizers ()
 

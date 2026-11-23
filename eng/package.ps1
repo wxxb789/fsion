@@ -212,16 +212,21 @@ if (-not $SkipSmokeTest) {
         }
 
         $smokeEnvironment = @{
-            FSION_PIPE = 'fsion-package-smoke-' + [guid]::NewGuid().ToString('N')
+            FSION_PIPE = 'fsion-pkg-' + [guid]::NewGuid().ToString('N').Substring(0, 16)
+            FSIOND_PATH = $null
+            FSION_PRELUDE = $null
             FSION_CONFIG_DIR = Join-Path $smokeWork '.fsion-config'
             FSION_CACHE_DIR = Join-Path $smokeWork '.fsion-cache'
         }
 
-        $warmup = Invoke-SmokeCommand 'warmup' $smokeClient @('warmup') $smokeWork $smokeEnvironment @(0)
+        $daemonStarted = $false
+        try {
+            $warmup = Invoke-SmokeCommand 'warmup' $smokeClient @('warmup') $smokeWork $smokeEnvironment @(0)
+            $daemonStarted = $true
 
-        if ($warmup.Output -notmatch 'fsiond ready') {
-            throw "warmup did not report a ready daemon: $($warmup.Output)"
-        }
+            if ($warmup.Output -notmatch 'fsiond ready') {
+                throw "warmup did not report a ready daemon: $($warmup.Output)"
+            }
 
         $scriptPath = Join-Path $smokeWork 'smoke.fsx'
         $script = @'
@@ -259,10 +264,21 @@ printfn "cwd=%s" (Fsion.cwd())
             throw "structured diagnostics are missing from --json output: $($jsonRun.Output)"
         }
 
-        Invoke-SmokeCommand 'daemon stop' $smokeClient @('daemon', 'stop') $smokeWork $smokeEnvironment @(0) | Out-Null
-        Invoke-SmokeCommand 'daemon status after stop' $smokeClient @('daemon', 'status') $smokeWork $smokeEnvironment @(0) | Out-Null
+            Invoke-SmokeCommand 'daemon stop' $smokeClient @('daemon', 'stop') $smokeWork $smokeEnvironment @(0) | Out-Null
+            $daemonStarted = $false
+            Invoke-SmokeCommand 'daemon status after stop' $smokeClient @('daemon', 'status') $smokeWork $smokeEnvironment @(0) | Out-Null
 
-        Write-Host "smoke test passed"
+            Write-Host "smoke test passed"
+        }
+        finally {
+            if ($daemonStarted) {
+                try {
+                    Invoke-SmokeCommand 'daemon stop (cleanup)' $smokeClient @('daemon', 'stop') $smokeWork $smokeEnvironment @(0, 1) | Out-Null
+                }
+                catch {
+                }
+            }
+        }
     }
     finally {
         if (Test-Path -LiteralPath $smokeRoot) {

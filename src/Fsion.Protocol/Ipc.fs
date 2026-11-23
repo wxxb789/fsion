@@ -7,6 +7,7 @@ open System.IO
 open System.IO.Pipes
 open System.Net.Sockets
 open System.Runtime.InteropServices
+open System.Security.Cryptography
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -35,10 +36,21 @@ let socketPath (endpoint: Endpoint) =
     else
         let baseDirectory =
             match Environment.GetEnvironmentVariable "XDG_RUNTIME_DIR" with
-            | null | "" -> Path.GetTempPath()
+            | null | "" -> if OperatingSystem.IsMacOS() && Directory.Exists "/tmp" then "/tmp" else Path.GetTempPath()
             | directory -> directory
-        Path.Combine(baseDirectory, sanitizeName endpoint.Name + ".sock")
 
+        let sanitized = sanitizeName endpoint.Name
+        let candidate = Path.Combine(baseDirectory, sanitized + ".sock")
+
+        if Encoding.UTF8.GetByteCount candidate <= 100 then
+            candidate
+        else
+            let hash =
+                SHA256.HashData(Encoding.UTF8.GetBytes sanitized)
+                |> Convert.ToHexString
+                |> fun value -> value.Substring(0, 16).ToLowerInvariant()
+
+            Path.Combine(baseDirectory, "fsion-" + hash + ".sock")
 let endpointDisplay (endpoint: Endpoint) =
     if isWindows then endpoint.Name else socketPath endpoint
 

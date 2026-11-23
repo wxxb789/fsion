@@ -163,19 +163,32 @@ let main argv =
     | Some options ->
         if isWindows then
             let ownershipName = "Local\\fsion-endpoint-" + sanitizeName options.Endpoint.Name
-            let mutable createdNew = false
-            let ownership = new Semaphore(1, 1, ownershipName, &createdNew)
+            let ownership = new Semaphore(1, 1, ownershipName)
+            let acquired = ownership.WaitOne(TimeSpan.FromSeconds 2.0)
 
-            if not createdNew then
+            if not acquired then
                 ownership.Dispose()
                 Log.info options.LogPath "another fsiond owns this endpoint; exiting"
                 0
             else
-                runDaemon options (fun () ->
-                    try
-                        ownership.Dispose()
-                    with _ ->
-                        ())
+                let mutable released = 0
+
+                let release () =
+                    if Interlocked.Exchange(&released, 1) = 0 then
+                        try
+                            ownership.Release() |> ignore
+                        with _ ->
+                            ()
+
+                        try
+                            ownership.Dispose()
+                        with _ ->
+                            ()
+
+                try
+                    runDaemon options release
+                finally
+                    release ()
         else
             let path = socketPath options.Endpoint
             let ownedByOther =

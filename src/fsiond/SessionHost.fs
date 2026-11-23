@@ -863,12 +863,11 @@ type SessionHost(options: SessionHostOptions) =
     let setDesiredSpec (spec: Prelude.Spec) =
         let changed =
             lock desiredGate (fun () ->
-                failedTag <- None
-
                 if desiredSpec = spec then
                     false
                 else
                     desiredSpec <- spec
+                    failedTag <- None
                     true)
 
         if changed then
@@ -883,7 +882,10 @@ type SessionHost(options: SessionHostOptions) =
             if warm.Prelude = current then
                 retained.Add warm
             else
-                releaseSession warm
+                try
+                    releaseSession warm
+                with ex ->
+                    Log.error None ("replenisher failed to release a stale warm session: " + ex.Message)
 
         for warm in retained do
             pool.Enqueue warm
@@ -928,8 +930,11 @@ type SessionHost(options: SessionHostOptions) =
                 else
                     working <- false
 
-            if pendingCleanups.Count >= 4 || ((pool.Count >= targetPoolSize || (lock desiredGate (fun () -> failedTag.IsSome))) && not pendingCleanups.IsEmpty) then
-                drainCleanups ()
+            if not pendingCleanups.IsEmpty && (pendingCleanups.Count >= 4 || pool.Count >= targetPoolSize || (lock desiredGate (fun () -> failedTag.IsSome))) then
+                try
+                    drainCleanups ()
+                with ex ->
+                    Log.error None ("replenisher failed to drain cleanups: " + ex.Message)
     do
         Task.Factory.StartNew(replenish, TaskCreationOptions.LongRunning) |> ignore
         replenishSignal.Release() |> ignore
@@ -1165,7 +1170,7 @@ type SessionHost(options: SessionHostOptions) =
         else
             let completedInGrace =
                 try
-                    worker.Wait 500
+                    worker.Wait 1500
                 with :? AggregateException ->
                     true
 

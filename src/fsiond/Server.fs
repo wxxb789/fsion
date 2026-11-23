@@ -131,6 +131,8 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
             with _ ->
                 ()
 
+            releaseOwnership ()
+
     // The drained generation keeps no endpoint and no in-flight script can return. A hard
     // self-kill bounds the leak even if managed shutdown handlers would block on the wedged
     // session's process-wide FSI cleanup.
@@ -149,7 +151,6 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
 
     let retire () =
         stop ()
-        releaseOwnership ()
         scheduleSelfTermination ()
 
     let respawn () =

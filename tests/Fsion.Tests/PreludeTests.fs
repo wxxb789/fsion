@@ -275,22 +275,40 @@ type PreludeTests(output: ITestOutputHelper) =
     member _.``a broken configured prelude unloads its aborted session and stops pool churn until fixed`` () =
         withContext "prelude-broken-unload" (fun context directory ->
             let brokenPath = Path.Combine(directory, "broken-prelude.fsx")
-            writeFile directory "broken-prelude.fsx" "let brokenPrelude : int = \"not-an-int\"\n"
+            let counterPath = Path.Combine(directory, "broken-attempts.txt")
+
+            writeFile
+                directory
+                "broken-prelude.fsx"
+                ("System.IO.File.AppendAllText(@\""
+                 + counterPath.Replace("\"", "\"\"")
+                 + "\", \"attempt\\n\")\nfailwith \"prelude-boom\"\n")
 
             let failed =
                 context.Run([ "--prelude"; brokenPath; "-e"; "1" ], timeoutMs = 120000)
 
             Assert.Equal(1, failed.ExitCode)
-            Assert.Contains("configured prelude did not compile", failed.Stderr)
+            Assert.Contains("prelude-boom", failed.Stderr)
             let daemonPid = context.DaemonPid()
             Assert.True(daemonPid.IsSome, "daemon was not reported as running")
 
             System.Threading.Thread.Sleep 800
+            let attemptsBeforeSecond = File.ReadAllLines(counterPath).Length
+
+            let failedAgain =
+                context.Run([ "--prelude"; brokenPath; "-e"; "1" ], timeoutMs = 120000)
+
+            Assert.Equal(1, failedAgain.ExitCode)
+            Assert.Contains("prelude-boom", failedAgain.Stderr)
+
+            System.Threading.Thread.Sleep 800
+            let attemptsAfterSecond = File.ReadAllLines(counterPath).Length
+            Assert.Equal(attemptsBeforeSecond + 1, attemptsAfterSecond)
+
             let settled = context.MetricsOrFail()
             Assert.Equal(0, settled.PoolWarm)
             Assert.Equal(0, settled.AliveDisposedSessions)
             Assert.Equal(0, settled.ScriptAssemblies)
-
             writeFile directory "broken-prelude.fsx" "let recoveredValue () = 42\n"
 
             let recovered =

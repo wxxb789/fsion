@@ -1,11 +1,9 @@
 module Fsion.Program
 
 open System
-open System.ComponentModel
 open System.Diagnostics
 open System.Globalization
 open System.IO
-open System.Runtime.InteropServices
 open System.Text
 open System.Text.Json
 open System.Threading
@@ -14,51 +12,6 @@ open Fsion.Ipc
 open Fsion.Protocol
 
 let private version = "0.1.0"
-
-[<Struct; StructLayout(LayoutKind.Sequential)>]
-type StartupInfo =
-    val mutable Cb: uint32
-    val mutable Reserved: nativeint
-    val mutable Desktop: nativeint
-    val mutable Title: nativeint
-    val mutable X: uint32
-    val mutable Y: uint32
-    val mutable XSize: uint32
-    val mutable YSize: uint32
-    val mutable XCountChars: uint32
-    val mutable YCountChars: uint32
-    val mutable FillAttribute: uint32
-    val mutable Flags: uint32
-    val mutable ShowWindow: uint16
-    val mutable Reserved2: uint16
-    val mutable Reserved2Ptr: nativeint
-    val mutable StdInput: nativeint
-    val mutable StdOutput: nativeint
-    val mutable StdError: nativeint
-
-[<Struct; StructLayout(LayoutKind.Sequential)>]
-type ProcessInformation =
-    val mutable Process: nativeint
-    val mutable Thread: nativeint
-    val mutable ProcessId: uint32
-    val mutable ThreadId: uint32
-
-[<DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)>]
-extern bool CreateProcessW(
-    string applicationName,
-    string commandLine,
-    nativeint processAttributes,
-    nativeint threadAttributes,
-    bool inheritHandles,
-    uint32 creationFlags,
-    nativeint environment,
-    string currentDirectory,
-    StartupInfo& startupInfo,
-    ProcessInformation& processInformation
-)
-
-[<DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)>]
-extern bool CloseHandle(nativeint handle)
 
 type private Input =
     | RunScript of path: string * args: string[]
@@ -76,6 +29,10 @@ type private Options =
     { NoDaemon: bool
       PipeName: string option
       IdleTtlMinutes: float option
+      SessionTtlMinutes: float option
+      SessionId: string option
+      Reset: bool
+      TimeoutMs: int option
       Json: bool }
 
 let private usage =
@@ -93,6 +50,10 @@ let private usage =
     + "  --json                emit a structured JSON result instead of raw streams\n"
     + "  --pipe <name>         daemon endpoint name (env: FSION_PIPE)\n"
     + "  --idle-ttl <minutes>  auto-started daemon idle TTL (env: FSION_IDLE_TTL_MINUTES, default 30)\n"
+    + "  --session <id>        reuse a named stateful session inside fsiond\n"
+    + "  --reset               discard the named session before this run (requires --session)\n"
+    + "  --session-ttl <min>   auto-started daemon named-session idle TTL (env: FSION_SESSION_TTL_MINUTES, default 15)\n"
+    + "  --timeout <ms>        cancel after this deadline; scripts observe fsionFsiState.CancellationToken; exit 124\n"
     + "  -h, --help            show this help\n"
     + "  --version             show version\n"
 
@@ -101,6 +62,10 @@ let private parse (argv: string[]) : Result<Options * Input, string> =
         { NoDaemon = false
           PipeName = None
           IdleTtlMinutes = None
+          SessionTtlMinutes = None
+          SessionId = None
+          Reset = false
+          TimeoutMs = None
           Json = false }
     let mutable outcome: Result<Options * Input, string> option = None
     let mutable index = 0
@@ -129,6 +94,29 @@ let private parse (argv: string[]) : Result<Options * Input, string> =
                 options <- { options with IdleTtlMinutes = Some value }
                 index <- index + 2
             | _ -> outcome <- Some(Error("invalid --idle-ttl value: " + argv.[index + 1]))
+        | "--session" when index + 1 < argv.Length ->
+            let sessionId = argv.[index + 1]
+
+            if sessionId.Trim().Length = 0 then
+                outcome <- Some(Error "--session requires a non-empty session id")
+            else
+                options <- { options with SessionId = Some sessionId }
+                index <- index + 2
+        | "--reset" ->
+            options <- { options with Reset = true }
+            index <- index + 1
+        | "--session-ttl" when index + 1 < argv.Length ->
+            match Double.TryParse(argv.[index + 1], NumberStyles.Float, CultureInfo.InvariantCulture) with
+            | true, value when value > 0.0 ->
+                options <- { options with SessionTtlMinutes = Some value }
+                index <- index + 2
+            | _ -> outcome <- Some(Error("invalid --session-ttl value: " + argv.[index + 1]))
+        | "--timeout" when index + 1 < argv.Length ->
+            match Int32.TryParse(argv.[index + 1], NumberStyles.Integer, CultureInfo.InvariantCulture) with
+            | true, value when value > 0 ->
+                options <- { options with TimeoutMs = Some value }
+                index <- index + 2
+            | _ -> outcome <- Some(Error("invalid --timeout value: " + argv.[index + 1]))
         | "warmup" -> outcome <- Some(Ok(options, Warmup))
         | "daemon" ->
             if index + 1 >= argv.Length then
@@ -149,11 +137,19 @@ let private parse (argv: string[]) : Result<Options * Input, string> =
         | _ when argument.StartsWith("-", StringComparison.Ordinal) ->
             outcome <- Some(Error("unknown option: " + argument))
         | script -> outcome <- Some(Ok(options, RunScript(script, argv.[index + 1 ..])))
+    let validate (parsed: Result<Options * Input, string>) =
+        match parsed with
+        | Ok (parsedOptions, _) when parsedOptions.Reset && parsedOptions.SessionId.IsNone ->
+            Error "--reset requires --session <id>"
+        | Ok (parsedOptions, _) when parsedOptions.SessionId.IsSome && parsedOptions.NoDaemon ->
+            Error "--no-daemon cannot be combined with --session <id>"
+        | _ -> parsed
+
     match outcome with
-    | Some result -> result
+    | Some result -> validate result
     | None ->
         if Console.IsInputRedirected then
-            Ok(options, RunStdin [||])
+            validate (Ok(options, RunStdin [||]))
         else
             Error "no script file, -e code, or redirected stdin input"
 
@@ -179,6 +175,17 @@ let private resolveIdleTtl (options: Options) =
             | true, parsed -> parsed
             | _ -> DefaultIdleTtlMinutes
 
+let private resolveSessionTtl (options: Options) =
+    match options.SessionTtlMinutes with
+    | Some value -> value
+    | None ->
+        match Environment.GetEnvironmentVariable SessionTtlEnvironmentVariable with
+        | null | "" -> DefaultSessionTtlMinutes
+        | value ->
+            match Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture) with
+            | true, parsed -> parsed
+            | _ -> DefaultSessionTtlMinutes
+
 let private findDaemonBinary () =
     match Environment.GetEnvironmentVariable "FSIOND_PATH" with
     | null | "" ->
@@ -190,116 +197,39 @@ let private findDaemonBinary () =
             raise (FileNotFoundException("fsiond was not found next to fsion; set FSIOND_PATH", candidate))
     | path -> path
 
-let private quoteWindowsArgument (value: string) =
-    if value.Length = 0 then
-        "\"\""
-    elif not (value.Contains ' ' || value.Contains '\t' || value.Contains '"') then
-        value
-    else
-        let builder = StringBuilder()
-        builder.Append '"' |> ignore
-        let mutable backslashes = 0
-        for character in value do
-            match character with
-            | '\\' -> backslashes <- backslashes + 1
-            | '"' ->
-                builder.Append('\\', backslashes * 2 + 1).Append '"' |> ignore
-                backslashes <- 0
-            | _ ->
-                builder.Append('\\', backslashes).Append character |> ignore
-                backslashes <- 0
-        builder.Append('\\', backslashes * 2).Append '"' |> ignore
-        builder.ToString()
-
-let private daemonArguments (idleTtlMinutes: float option) (endpoint: Endpoint) =
+let private daemonArguments (idleTtlMinutes: float option) (sessionTtlMinutes: float option) (endpoint: Endpoint) =
     let modeArguments =
         match idleTtlMinutes with
         | Some minutes -> [ "--idle-ttl"; minutes.ToString(CultureInfo.InvariantCulture) ]
         | None -> [ "--oneshot" ]
+    let sessionArguments =
+        match sessionTtlMinutes with
+        | Some minutes -> [ "--session-ttl"; minutes.ToString(CultureInfo.InvariantCulture) ]
+        | None -> []
     let logArguments =
         match Environment.GetEnvironmentVariable "FSIOND_LOG" with
         | null | "" -> []
         | logPath -> [ "--log"; logPath ]
-    [ "--endpoint"; endpoint.Name ] @ modeArguments @ logArguments
+    [ "--endpoint"; endpoint.Name ] @ modeArguments @ sessionArguments @ logArguments
 
-// Process.Start sets bInheritHandles=TRUE on Windows, so a long-lived fsiond would
-// inherit the caller's stdout/stderr pipe write ends and keep a redirected
-// ReadToEnd blocked after fsion itself exits. Spawning with bInheritHandles=false
-// leaves the daemon without any inherited handle.
-let private spawnDaemonWindows (daemonPath: string) (arguments: string list) =
-    let commandLine =
-        daemonPath :: arguments |> List.map quoteWindowsArgument |> String.concat " "
-    let mutable startupInfo = Unchecked.defaultof<StartupInfo>
-    startupInfo.Cb <- uint32 (Marshal.SizeOf<StartupInfo>())
-    let mutable processInformation = Unchecked.defaultof<ProcessInformation>
-    let creationFlags = 0x08000000u ||| 0x00000008u
-    let created =
-        CreateProcessW(
-            daemonPath,
-            commandLine,
-            IntPtr.Zero,
-            IntPtr.Zero,
-            false,
-            creationFlags,
-            IntPtr.Zero,
-            Path.GetDirectoryName daemonPath,
-            &startupInfo,
-            &processInformation
-        )
-    if not created then
-        raise (Win32Exception(Marshal.GetLastWin32Error(), "failed to start fsiond"))
-    if processInformation.Process <> IntPtr.Zero then
-        CloseHandle processInformation.Process |> ignore
-    if processInformation.Thread <> IntPtr.Zero then
-        CloseHandle processInformation.Thread |> ignore
-
-let private spawnDaemonManaged (daemonPath: string) (arguments: string list) =
-    let startInfo = ProcessStartInfo(daemonPath)
-    startInfo.UseShellExecute <- false
-    startInfo.CreateNoWindow <- true
-    startInfo.RedirectStandardOutput <- true
-    startInfo.RedirectStandardError <- true
-    startInfo.RedirectStandardInput <- true
-    startInfo.WorkingDirectory <- (Path.GetDirectoryName daemonPath)
-    for argument in arguments do
-        startInfo.ArgumentList.Add argument
-    let daemonProcess = Process.Start startInfo
-    if isNull daemonProcess then
-        raise (InvalidOperationException "failed to start fsiond")
-    Task.Run(fun () ->
-        try
-            daemonProcess.StandardOutput.ReadToEnd() |> ignore
-        with _ ->
-            ())
-    |> ignore
-    Task.Run(fun () ->
-        try
-            daemonProcess.StandardError.ReadToEnd() |> ignore
-        with _ ->
-            ())
-    |> ignore
-
-let private spawnDaemon (idleTtlMinutes: float option) (endpoint: Endpoint) =
+let private spawnDaemon (idleTtlMinutes: float option) (sessionTtlMinutes: float option) (endpoint: Endpoint) =
     let daemonPath = findDaemonBinary ()
-    let arguments = daemonArguments idleTtlMinutes endpoint
-    if isWindows then
-        spawnDaemonWindows daemonPath arguments
-    else
-        spawnDaemonManaged daemonPath arguments
+    spawnDetached daemonPath (daemonArguments idleTtlMinutes sessionTtlMinutes endpoint)
 
 let private ensureDaemon (options: Options) (endpoint: Endpoint) : Stream =
     match tryConnect endpoint (TimeSpan.FromMilliseconds 250.0) with
     | Some stream -> stream
     | None ->
-        spawnDaemon (Some(resolveIdleTtl options)) endpoint
+        spawnDaemon (Some(resolveIdleTtl options)) (Some(resolveSessionTtl options)) endpoint
         connect endpoint (TimeSpan.FromSeconds 30.0)
 
 type private Delivery =
     | NotDelivered
     | NoResponse
+    | DeadlineExpired of timeoutMs: int
     | Delivered of Response
 
-let private sendAndReceive (stream: Stream) (request: Request) : Delivery =
+let private sendAndReceive (stream: Stream) (timeoutMs: int option) (request: Request) : Delivery =
     let delivered =
         try
             sendRequest stream request
@@ -309,28 +239,49 @@ let private sendAndReceive (stream: Stream) (request: Request) : Delivery =
     if not delivered then
         NotDelivered
     else
-        match tryReceiveFrame stream with
-        | Some payload -> Delivered(parseResponse payload)
-        | None -> NoResponse
+        match timeoutMs with
+        | Some timeoutMs when timeoutMs > 0 ->
+            let receive = Task.Run(fun () -> tryReceiveFrame stream)
+            // Last-resort net only: fsiond enforces --timeout after the session is acquired, so
+            // cold daemon/session creation must not be charged against this client deadline.
+            if receive.Wait(timeoutMs + 30000) then
+                match receive.Result with
+                | Some payload -> Delivered(parseResponse payload)
+                | None -> NoResponse
+            else
+                DeadlineExpired timeoutMs
+        | _ ->
+            match tryReceiveFrame stream with
+            | Some payload -> Delivered(parseResponse payload)
+            | None -> NoResponse
+
+let private timeoutResult (timeoutMs: int) : ExecutionResult =
+    { ExitCode = TimeoutExitCode
+      StandardOut = ""
+      StandardError = timeoutMessage timeoutMs
+      Diagnostics = [||]
+      TimedOut = true }
 
 let private responseOf (delivery: Delivery) : Response =
     match delivery with
     | Delivered response -> response
     | NoResponse -> Failure "fsiond closed the connection without a response"
+    | DeadlineExpired timeoutMs -> Executed(timeoutResult timeoutMs)
     | NotDelivered -> Failure "fsiond did not accept the request"
 
 let private executeOverDaemon (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) : Response =
     let attempt () =
         let stream = ensureDaemon options endpoint
         try
-            sendAndReceive stream (Execute request)
+            sendAndReceive stream options.TimeoutMs (Execute request)
         finally
             stream.Dispose()
     let first = attempt ()
     match first with
     | Delivered response -> response
-    | NoResponse -> responseOf first
     | NotDelivered -> attempt () |> responseOf
+    | NoResponse
+    | DeadlineExpired _ -> responseOf first
 
 let private executeOneShot (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) : Response =
     let oneshotEndpoint =
@@ -346,10 +297,11 @@ let private executeOneShot (options: Options) (endpoint: Endpoint) (request: Exe
                     + Guid.NewGuid().ToString("N").Substring(0, 8) }
             | name -> { Name = name }
     validateEndpointName oneshotEndpoint.Name
-    spawnDaemon None oneshotEndpoint
+    spawnDaemon None None oneshotEndpoint
     let stream = connect oneshotEndpoint (TimeSpan.FromSeconds 60.0)
+
     try
-        responseOf (sendAndReceive stream (Execute request))
+        sendAndReceive stream options.TimeoutMs (Execute request) |> responseOf
     finally
         stream.Dispose()
 
@@ -360,6 +312,7 @@ let private writeJsonResult (elapsedMs: float) (result: ExecutionResult) =
     writer.WriteNumber("exitCode", result.ExitCode)
     writer.WriteString("stdout", result.StandardOut)
     writer.WriteString("stderr", result.StandardError)
+    writer.WriteBoolean("timedOut", result.TimedOut)
     writer.WriteNumber("elapsedMs", elapsedMs)
     writer.WriteStartArray("diagnostics")
 
@@ -387,7 +340,8 @@ let private emitFailure (options: Options) (elapsedMs: float) (message: string) 
             { ExitCode = 1
               StandardOut = ""
               StandardError = "fsion: " + message + Environment.NewLine
-              Diagnostics = [||] }
+              Diagnostics = [||]
+              TimedOut = false }
     else
         Console.Error.Write("fsion: " + message + Environment.NewLine)
         Console.Error.Flush()
@@ -418,7 +372,7 @@ let private fetchStatus (endpoint: Endpoint) : StatusInfo option =
     | None -> None
     | Some stream ->
         use connection = stream
-        match sendAndReceive connection GetStatus with
+        match sendAndReceive connection None GetStatus with
         | Delivered (Status status) -> Some status
         | _ -> None
 
@@ -428,7 +382,7 @@ let private stopDaemon (endpoint: Endpoint) : bool =
     | Some stream ->
         let replied =
             try
-                match sendAndReceive stream Shutdown with
+                match sendAndReceive stream None Shutdown with
                 | Delivered ShuttingDown -> true
                 | _ -> false
             finally
@@ -459,7 +413,7 @@ let private statusLine (status: StatusInfo) =
 let private runWarmup (options: Options) (endpoint: Endpoint) : int =
     let stream = ensureDaemon options endpoint
     try
-        match sendAndReceive stream Ping with
+        match sendAndReceive stream None Ping with
         | Delivered Pong ->
             match fetchStatus endpoint with
             | Some status ->
@@ -514,6 +468,17 @@ let rec private runDaemonCommand (options: Options) (endpoint: Endpoint) (input:
             runDaemonCommand options endpoint DaemonStart
     | _ -> 1
 
+let private describe (options: Options) (mode: string) (source: string) (args: string[]) : ExecuteRequest =
+    { Mode = mode
+      Source = source
+      WorkingDirectory = Directory.GetCurrentDirectory()
+      Args = args
+      Environment = environmentSnapshot ()
+      IncludeDiagnostics = options.Json
+      SessionId = options.SessionId
+      Reset = options.Reset
+      TimeoutMs = defaultArg options.TimeoutMs 0 }
+
 let private executeInput (options: Options) (endpoint: Endpoint) (request: ExecuteRequest) (elapsedMs: unit -> float) : int =
     let response =
         if options.NoDaemon then
@@ -555,34 +520,19 @@ let main argv =
                 executeInput
                     options
                     endpoint
-                    { Mode = "file"
-                      Source = path
-                      WorkingDirectory = Directory.GetCurrentDirectory()
-                      Args = Array.append [| path |] args
-                      Environment = environmentSnapshot ()
-                      IncludeDiagnostics = options.Json }
+                    (describe options "file" path (Array.append [| path |] args))
                     elapsedMs
             | RunEval (code, args) ->
                 executeInput
                     options
                     endpoint
-                    { Mode = "eval"
-                      Source = code
-                      WorkingDirectory = Directory.GetCurrentDirectory()
-                      Args = Array.append [| "eval.fsx" |] args
-                      Environment = environmentSnapshot ()
-                      IncludeDiagnostics = options.Json }
+                    (describe options "eval" code (Array.append [| "eval.fsx" |] args))
                     elapsedMs
             | RunStdin args ->
                 executeInput
                     options
                     endpoint
-                    { Mode = "stdin"
-                      Source = readAllStdin ()
-                      WorkingDirectory = Directory.GetCurrentDirectory()
-                      Args = Array.append [| "stdin.fsx" |] args
-                      Environment = environmentSnapshot ()
-                      IncludeDiagnostics = options.Json }
+                    (describe options "stdin" (readAllStdin ()) (Array.append [| "stdin.fsx" |] args))
                     elapsedMs
             | Warmup -> runWarmup options endpoint
             | DaemonStart

@@ -153,6 +153,20 @@ let ``idle ttl retires an auto-started daemon`` () =
 
         Assert.False(running, "daemon did not exit after the idle TTL elapsed"))
 
+let private readAllTextEventually (path: string) =
+    let deadline = DateTime.UtcNow.AddSeconds 10.0
+    let mutable text = ""
+    let mutable complete = false
+
+    while not complete && DateTime.UtcNow < deadline do
+        try
+            text <- File.ReadAllText path
+            complete <- true
+        with :? IOException ->
+            Thread.Sleep 100
+
+    text
+
 [<Fact>]
 let ``daemon log path containing spaces is passed to fsiond intact`` () =
     withContext "lifecycle-log-path" (fun context directory ->
@@ -166,7 +180,7 @@ let ``daemon log path containing spaces is passed to fsiond intact`` () =
         Assert.Equal(0, run.ExitCode)
         Assert.Equal("logged" + Environment.NewLine, run.Stdout)
         Assert.True(File.Exists logPath, "fsiond did not write its log to the spaced path")
-        Assert.Contains("listening on", File.ReadAllText logPath))
+        Assert.Contains("listening on", readAllTextEventually logPath))
 
 [<Fact>]
 let ``--pipe overrides FSION_PIPE and its daemon is stopped afterwards`` () =

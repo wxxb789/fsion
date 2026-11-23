@@ -13,7 +13,6 @@ Read [Core Design](../core-design.md) for enduring architectural invariants and 
 
 | Goal | Status | Prerequisite | Intended Outcome |
 |---|---|---|---|
-| [0003-stateful-sessions-and-runaway-recovery.md](0003-stateful-sessions-and-runaway-recovery.md) | Ready after 0002 | `0002` | Opt-in `--session <id>` multi-turn stateful sessions + `--timeout <ms>` cooperative cancellation and automatic drain-and-respawn recovery on infinite loops |
 | [0004-agent-prelude-and-cached-nuget.md](0004-agent-prelude-and-cached-nuget.md) | Ready after 0002 | `0002` *(recommended after `0003`)* | Built-in zero-dependency `Fsion` agent prelude, configurable pre-warmed user `prelude.fsx`, and persistent `#r "nuget: ..."` resolution cache |
 | [0005-cross-platform-packaging-and-benchmark-gate.md](0005-cross-platform-packaging-and-benchmark-gate.md) | Ready after 0001–0004 | `0001`, `0002`, `0003`, `0004` | Unseen-script head-to-head benchmark proof (`>= 20x` vs `dotnet fsi`, `bun`-class latency), 3-OS CI & NativeAOT packaging, and operator/agent documentation |
 
@@ -23,5 +22,6 @@ Read [Core Design](../core-design.md) for enduring architectural invariants and 
 |---|---|---|---|
 | [0001-native-cli-and-warm-reactor-slice.md](archive/0001-native-cli-and-warm-reactor-slice.md) | Completed | None | 100% F# (`net10.0;net11.0`) NativeAOT `fsion` thin client + auto-started `fsiond` in-memory reactor over private local IPC with `dotnet fsi` output/exit parity |
 | [0002-collectible-fission-pool-and-isolation.md](archive/0002-collectible-fission-pool-and-isolation.md) | Completed | `0001` | Background-replenished `collectible = true` session pool, multi-threaded `AsyncLocal` stream/context isolation, Windows file-handle hygiene, and structured `--json` diagnostics |
+| [0003-stateful-sessions-and-runaway-recovery.md](archive/0003-stateful-sessions-and-runaway-recovery.md) | Completed | `0002` | Opt-in `--session <id>` multi-turn stateful sessions + `--timeout <ms>` cooperative cancellation and automatic drain-and-respawn recovery on infinite loops |
 
-Evidence: [../evidence/0001-evidence.md](../evidence/0001-evidence.md), [../evidence/0002-evidence.md](../evidence/0002-evidence.md).
+Evidence: [../evidence/0001-evidence.md](../evidence/0001-evidence.md), [../evidence/0002-evidence.md](../evidence/0002-evidence.md), [../evidence/0003-evidence.md](../evidence/0003-evidence.md).

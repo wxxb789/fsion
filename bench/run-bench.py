@@ -366,7 +366,7 @@ def _read_metrics(endpoint: str, env: dict, timeout: float) -> dict:
     else:
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(timeout)
-            directory = Path(env.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+            directory = Path(env.get("XDG_RUNTIME_DIR") or env.get("TMPDIR") or "/tmp")
             path = directory / (endpoint + ".sock")
             if len(os.fsencode(path)) > 100:
                 if len(os.fsencode(directory / "fsion-0123456789abcdef.sock")) > 100:
@@ -690,6 +690,8 @@ def main(argv: list[str]) -> int:
     workloads = [item.strip() for item in args.workloads.split(",") if item.strip()]
     only = [item.strip() for item in args.runners.split(",")] if args.runners else None
 
+    if len(set(workloads)) != len(workloads):
+        raise SystemExit(f"duplicate workloads are not allowed: {workloads}")
     for workload in workloads:
         if workload not in data["workloads"]:
             raise SystemExit(f"unknown workload: {workload} (bench/data.json defines {data['workloads']})")

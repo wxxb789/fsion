@@ -34,8 +34,14 @@ let private mapValue (environment: (string * string)[]) (name: string) =
 let private cachedWindowsApplicationData =
     lazy (Environment.GetFolderPath Environment.SpecialFolder.ApplicationData)
 
-let private cachedPosixApplicationData =
-    lazy (Environment.GetFolderPath Environment.SpecialFolder.ApplicationData)
+let private cachedPosixPasswdConfigDirectory =
+    lazy (Path.Combine(Environment.GetFolderPath Environment.SpecialFolder.UserProfile, ".config"))
+
+let initializeProcessCaches () =
+    if OperatingSystem.IsWindows() then
+        cachedWindowsApplicationData.Value |> ignore
+    else
+        cachedPosixPasswdConfigDirectory.Value |> ignore
 
 let userPreludePathFrom (workingDirectory: string option) (lookup: string -> string option) : string option =
     let configDirectory =
@@ -51,19 +57,15 @@ let userPreludePathFrom (workingDirectory: string option) (lookup: string -> str
                     | None ->
                         match lookup "HOME" with
                         | Some directory -> Path.Combine(directory, ".config")
-                        | None -> cachedPosixApplicationData.Value
+                        | None -> cachedPosixPasswdConfigDirectory.Value
 
             Path.Combine(home, "fsion")
 
-    let resolvedConfigDirectory =
-        if Path.IsPathRooted configDirectory then
-            configDirectory
-        else
-            match workingDirectory with
-            | Some baseDir when baseDir.Length > 0 -> Path.Combine(baseDir, configDirectory)
-            | _ -> configDirectory
-
-    let candidate = Path.GetFullPath(Path.Combine(resolvedConfigDirectory, "prelude.fsx"))
+    let candidate =
+        match workingDirectory with
+        | Some baseDir when baseDir.Length > 0 && Path.IsPathFullyQualified baseDir ->
+            Path.GetFullPath(Path.Combine(configDirectory, "prelude.fsx"), baseDir)
+        | _ -> Path.GetFullPath(Path.Combine(configDirectory, "prelude.fsx"))
 
     if File.Exists candidate then Some candidate else None
 

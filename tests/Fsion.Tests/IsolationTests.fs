@@ -477,7 +477,6 @@ type IsolationTests(output: ITestOutputHelper) =
             let creating = Path.Combine(directory, "creating")
             let active = Path.Combine(directory, "active")
             let env = [ "FSIOND_LOG", log ]
-            let run args = context.Run([ "--pool-size"; "2"; "--prelude"; prelude ] @ args, timeoutMs = 120000, extraEnv = env)
             let literal path = "@\"" + path + "\""
             writeFile directory "prelude.fsx"
                 (String.concat "\n"
@@ -487,18 +486,27 @@ type IsolationTests(output: ITestOutputHelper) =
                        "    File.WriteAllText(" + literal creating + ", \"creating\")"
                        "    while File.Exists " + literal block + " do Thread.Sleep 10"
                        "let greeting = \"hello\"" ])
-            run [ "warmup" ] |> assertRun
+            let daemonDir = Path.GetDirectoryName Fsion.Tests.TestInfra.fsiondBinary
+            let runFromDaemonDir args =
+                runProcess
+                    Fsion.Tests.TestInfra.fsionBinary
+                    ([ "--pool-size"; "2"; "--prelude"; prelude ] @ args)
+                    daemonDir
+                    (context.Environment @ env)
+                    None
+                    120000
+            runFromDaemonDir [ "warmup" ] |> assertRun
             let before = context.MetricsOrFail()
             Assert.Equal(2, before.PoolWarm)
             writeFile directory "block" ""
             try
-                let first = Task.Run(fun () -> run [ "-e"; "System.Console.Write(greeting)" ])
+                let first = Task.Run(fun () -> runFromDaemonDir [ "-e"; "System.Console.Write(greeting)" ])
                 assertRun first.Result
                 awaitCondition "replenishment did not start" (fun () -> File.Exists creating)
-                let second = run [ "-e"; "System.Console.Write(greeting + \"2\")" ]
+                let second = runFromDaemonDir [ "-e"; "System.Console.Write(greeting + \"2\")" ]
                 assertRun second
                 Assert.Equal("hello2", second.Stdout)
-                let third = Task.Run(fun () -> run [ "-e"; "System.IO.File.WriteAllText(" + literal active + ", greeting)" ])
+                let third = Task.Run(fun () -> runFromDaemonDir [ "-e"; "System.IO.File.WriteAllText(" + literal active + ", greeting)" ])
                 awaitCondition "empty-pool claimant did not wait for the in-flight producer" (fun () -> (readLog log).Contains("session-claim waiting"))
                 Assert.False(File.Exists active)
                 File.Delete block

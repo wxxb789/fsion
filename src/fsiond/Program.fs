@@ -154,7 +154,7 @@ let private runDaemon (options: Options) (releaseOwnership: unit -> unit) =
 [<EntryPoint>]
 let main argv =
     Ambient.install ()
-
+    initializeProcessCaches ()
     match parse argv with
     | None -> 1
     | Some options when options.Oneshot -> runDaemon options ignore

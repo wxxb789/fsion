@@ -441,10 +441,11 @@ type PreludeTests(output: ITestOutputHelper) =
             let callerReleasePath = Path.Combine(directory, "caller-release.txt")
             let callerSubdir = Path.Combine(directory, "caller-cwd")
             Directory.CreateDirectory callerSubdir |> ignore
+            writeFile callerSubdir "settings.txt" "wrong-caller-settings"
 
             let slowPrelude =
                 sprintf
-                    "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\nlet capturedProbe = (match System.Environment.GetEnvironmentVariable(\"FSION_REPLENISH_PROBE\") with null -> \"unset\" | v -> v) + \"|\" + System.IO.Directory.GetCurrentDirectory()\n"
+                    "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\nlet relSettings = if System.IO.File.Exists(\"settings.txt\") then System.IO.File.ReadAllText(\"settings.txt\") else \"no-rel-settings\"\nlet capturedProbe = (match System.Environment.GetEnvironmentVariable(\"FSION_REPLENISH_PROBE\") with null -> \"unset\" | v -> v) + \"|\" + relSettings\n"
                     enteredPath
                     releasePath
 
@@ -488,13 +489,10 @@ type PreludeTests(output: ITestOutputHelper) =
             Assert.True(builtinDone.ExitCode = 0, builtinDone.Stderr)
             Assert.Equal("leaked", builtinDone.Stdout)
 
-            let daemonDirResult = context.Run([ "--pool-size"; "1"; "-e"; "System.Console.Write(System.AppContext.BaseDirectory.TrimEnd('\\\\', '/'))" ], timeoutMs = 60000)
-            Assert.True(daemonDirResult.ExitCode = 0, daemonDirResult.Stderr)
             let checkClean =
                 context.Run([ "--pool-size"; "1"; "--prelude"; preludePath; "-e"; "System.Console.Write(capturedProbe)" ], timeoutMs = 60000)
             Assert.True(checkClean.ExitCode = 0, checkClean.Stderr)
-            Assert.StartsWith("unset|", checkClean.Stdout)
-            Assert.DoesNotContain("caller-cwd", checkClean.Stdout)
+            Assert.Equal("unset|no-rel-settings", checkClean.Stdout)
 
             let failEntered = Path.Combine(directory, "fail-entered.txt")
             let failRelease = Path.Combine(directory, "fail-release.txt")
@@ -548,4 +546,19 @@ type PreludeTests(output: ITestOutputHelper) =
                     None
                     60000
             Assert.True(relRun.ExitCode = 0, relRun.Stderr)
-            Assert.Equal("rel-ok", relRun.Stdout))
+            Assert.Equal("rel-ok", relRun.Stdout)
+
+            if OperatingSystem.IsWindows() then
+                let root = Path.GetPathRoot subProject
+                if not (isNull root) && root.Length >= 2 && root.[1] = ':' then
+                    let driveRelEnv = context.Environment @ [ "FSION_CONFIG_DIR", root.Substring(0, 2) + ".fsion-rel"; "FSION_PRELUDE", null ]
+                    let driveRelRun =
+                        runProcess
+                            Fsion.Tests.TestInfra.fsionBinary
+                            [ "--pool-size"; "1"; "-e"; "System.Console.Write(relPrelude())" ]
+                            subProject
+                            driveRelEnv
+                            None
+                            60000
+                    Assert.True(driveRelRun.ExitCode = 0, driveRelRun.Stderr)
+                    Assert.Equal("rel-ok", driveRelRun.Stdout))

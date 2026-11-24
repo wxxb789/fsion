@@ -1,0 +1,56 @@
+# Goal 0007 — Protocol Coexistence, Endpoint Hardening & Fault Isolation
+
+## Purpose and Intended Advance
+
+In real multi-agent developer environments, several coding agents run concurrently across different repositories, working directories, environment snapshots, and tool upgrades on the same machine. Architectural review of Goals 0001–0005 uncovered five operational and security failure modes that break `fsion` under concurrent or upgraded usage:
+
+1. **Upgrade / TFM Version Skew Bricks `fsion` (`P0`)**: The wire protocol enforces strict version equality (`ProtocolVersion`), `fsiond` encodes error replies using its own version, `stopDaemon` requires a parsed `ShuttingDown` response, and the default endpoint name (`fsion-<user>`) omits build/protocol/TFM identity. Upgrading `fsion` while an older `fsiond` is alive causes every invocation—including `fsion daemon stop` and `restart`—to fail for up to 30 minutes, while `net10.0` and `net11.0` builds silently attach to whichever daemon started first.
+2. **IPC Squatting & Group-Kill Hazards (`P1`)**: Windows Named Pipes omit `PipeOptions.CurrentUserOnly` (and first-instance ownership checks on initial server creation), Unix fallback sockets in `/tmp` lack `0700`/`0600` owner-only permissions and race on bind/connect startup, and Unix `spawnDetached` leaves `fsiond` in the caller's process group so a `SIGINT` or harness process-group kill terminates the shared daemon.
+3. **`ProcessStateGate` Deadlocks & Starves (`P1`)**: `ProcessStateGate.Enter` uses an uninterruptible `Monitor.Wait` with no FIFO ordering, no cancellation, and no `--timeout` budget before evaluation starts. A script that invokes a child `fsion` with one modified environment variable (or different working directory) deadlocks forever (`activeRuns > 0`), and steady runs in directory A can starve directory B indefinitely.
+4. **Wedged Runaway Self-Kill Kills Innocent Bystanders (`P1`)**: When one script wedges past `--timeout`, `Server.retire` unconditionally calls `Process.GetCurrentProcess().Kill()` after `1,000 ms`, murdering unrelated concurrent scripts mid-flight (`fsiond closed the connection without a response`) and silently wiping live `--session <id>` state without telling the caller on its next turn that the daemon generation changed.
+5. **Non-Atomic Request Accounting (`P2`)**: `Server.fs` mutates `activeRequests` and `stopped` non-atomically across accept, worker, and watchdog threads, risking drifted counts that prevent or prematurely trigger idle TTL shutdown.
+
+This goal hardens endpoint identity, version-tolerant control commands, OS-level IPC permissions, detached Unix session leadership, cancellable FIFO epoch scheduling, non-collateral wedged draining, and explicit named-session generation loss reporting.
+
+Read [../core-design.md](../core-design.md) and [../specs/2026-11-22-fsion-core-design.md](../specs/2026-11-22-fsion-core-design.md) for the architectural invariants.
+
+## Prerequisite
+
+Accepted completion of [0006-hot-path-and-burst-resilience.md](0006-hot-path-and-burst-resilience.md).
+
+## Material Scope, Constraints, and Assumptions
+
+- **Build/TFM-Scoped Default Endpoints & Version-Tolerant Control**:
+  - Default endpoint naming (when `--pipe` / `FSION_PIPE` is not explicitly overridden) incorporates user identity plus TFM and build/protocol fingerprint so `net10.0` vs `net11.0` and upgraded binaries isolate cleanly side by side while old daemons retire naturally via idle TTL.
+  - Wire framing carries an immutable version-independent header/envelope for `Status`, `Shutdown`, and version-mismatch `Failure` replies so any newer or older `fsion` client on an explicit `--pipe` can always inspect (`daemon status` exposing PID, TFM, protocol version, build fingerprint, and effective pool/TTL settings) and cleanly stop/restart (`daemon stop` / `daemon restart`) a mismatched `fsiond` without hanging or failing closed with an unreadable frame.
+- **OS-Level IPC Trust Boundary & Detached Daemon Survival**:
+  - Windows Named Pipe client and server enforce `PipeOptions.CurrentUserOnly`.
+  - Unix Domain Socket endpoints place sockets inside a `0700` user-owned directory with `0600` socket permissions (including when `XDG_RUNTIME_DIR` is unset), eliminate the bind/listen vs stale-unlink startup race via an atomic lockfile/flock owner guard (matching Windows semaphore ownership semantics), and spawn `fsiond` in its own session (`setsid`) with `stdin/stdout/stderr` redirected away from the caller's pipes.
+- **Fair, Cancellable, Deadlock-Safe `ProcessStateGate`**:
+  - `ProcessStateGate.Enter` uses fair FIFO turn ordering (preventing cross-directory/cross-env starvation), honors both client disconnect cancellation and the request's `--timeout <ms>` budget while waiting for an epoch transition (returning clean timeout exit `124` / `TimedOut = true` with `Wedged = false` if the budget expires before entering evaluation), and moves slow NuGet miss resolution outside the exclusive OS `cwd`/`env` lock where safe.
+  - Detect or bound recursive/nested `fsion` calls targeting the same daemon with a conflicting epoch: if `--timeout` is set, the child times out cleanly with exit `124` without wedging or retiring the daemon; even without `--timeout`, passing parent-epoch propagation or clear self-deadlock detection prevents an infinite silent hang when a child `fsion` inherits parent tracking metadata.
+- **Non-Collateral Wedged Drain & Named-Session Generation Tracking**:
+  - When a runaway evaluation wedges, `retire` immediately stops accepting new connections, releases endpoint ownership, and spawns the replacement `fsiond` generation so new callers proceed at once—**but** delays self-termination of the retiring process until all *other* non-wedged active evaluations complete (bounded by a generous drain ceiling / their own timeouts rather than killing healthy siblings at `1 s`).
+  - Track known named-session IDs across client/daemon or persist lightweight tombstones per endpoint so that if a `--session <id>` was previously established and the daemon generation subsequently restarted/respawned (due to crash or another turn's wedge), the first subsequent call to `--session <id>` without `--reset` reports an explicit, actionable session-lost error (non-zero exit, clear stderr/JSON message naming `<id>` and advising `--reset`) instead of silently evaluating in an empty session; `--session <id> --reset` clears the tombstone and starts fresh.
+- **Atomic Lifecycle State**:
+  - All `Server.fs` request counters (`activeRequests`), activity timestamps, and stop flags use thread-safe atomic operations (`Interlocked` / `Volatile`).
+- **Out of Scope**:
+  - Piped `stdin` forwarding for file/`-e` runs, `exit` inside user `try ... with` blocks, and in-process `Console.SetOut` / `AppDomain` event-handler restoration (owned by Goal `0008`).
+
+## Done when
+
+- If anything only the user can supply is missing at the start of the run, stop and report at once. Otherwise take and report reversible defaults, stopping only for irreversible or out-of-bounds decisions. Do not push commits, open PRs, or publish external releases unless explicitly authorized in that run's prompt.
+- `pwsh -NoProfile -File eng/gate.ps1` and `pwsh -NoProfile -File eng/package.ps1 -Framework net10.0` pass with exit code `0` across `net10.0` and `net11.0` (and across all 3 OSes in CI when published).
+- **Verification & Falsifiability Contract** — automated black-box tests in `Fsion.Tests` verify every failure mode end to end on both `net10.0` and `net11.0`:
+  1. **Cross-TFM Coexistence & Version-Mismatch Control**: Running `net10.0` `fsion` and `net11.0` `fsion` with default endpoint configuration starts two distinct `fsiond` processes whose `daemon status` outputs report their respective TFM and build identity without colliding; and against a simulated or test-injected protocol-version-mismatched peer on an explicit `--pipe`, `fsion daemon status` and `fsion daemon stop` succeed cleanly instead of throwing an unsupported-protocol failure.
+  2. **IPC Current-User / Mode Enforcement**: On Windows, attempting to connect without current-user pipe semantics or verifying the pipe ACL confirms `CurrentUserOnly` enforcement; on Unix (`!OperatingSystem.IsWindows()`), when `XDG_RUNTIME_DIR` is unset/overridden to a shared temp root, the created socket directory has mode `0700` and socket file has mode `0600` (asserted explicitly on POSIX and reported, never silently skipped), and killing the spawning client's process group does not kill the detached `fsiond`.
+  3. **Nested Epoch Deadlock Prevention & Gate Timeout/Cancel**:
+     - A parent `fsion -e ...` script invokes child `fsion` with a modified environment variable (`CHILD_VAR=1`): with `--timeout 500` on the child, the child returns exit `124` (`TimedOut = true`) within a bounded margin and the parent completes cleanly with the same daemon PID still alive (`Wedged = false`); without `--timeout`, nested same-daemon invocation either fails fast with a clear diagnostic or completes without deadlocking.
+     - Under overlapping cross-directory requests, a burst of staggered requests in directory A does not starve a waiting request in directory B (FIFO fairness proven deterministically with synchronized barrier scripts).
+  4. **Zero-Collateral Wedged Drain**: Start script A (a healthy `1,500 ms` cooperative run) and concurrently start script B (`--timeout 300 -e "while true do ()"`):
+     - Script B returns exit `124` promptly around `300 ms`;
+     - Script A **completes with exit `0` and full expected stdout** (instead of failing at `1,000 ms` with `closed the connection without a response`);
+     - Script C started right after B times out is served immediately by the fresh replacement `fsiond` PID;
+     - Once script A finishes, the retired wedged `fsiond` PID terminates within its post-drain window (zero leaked runaway processes).
+  5. **Explicit Named-Session Generation Loss Notice**: Establish `let x = 42` in `--session alpha`, trigger a wedged respawn on an unrelated stateless run, then invoke `fsion --session alpha -e "x + 1"`: it exits non-zero with an explicit message stating that session `alpha` was lost when `fsiond` restarted (not an unexplained `FS0039`), after which `fsion --session alpha --reset -e "let x = 99\nprintfn \"%d\" x"` succeeds with exit `0`.
+- Follow the Goal Close Ritual in `AGENTS.md`: record `docs/plans/2026-11-24-goal-0007-implementation-choices.md` and `docs/evidence/0007-evidence.md`, move `docs/goals/0007-protocol-security-and-fault-isolation.md` unchanged to `docs/goals/archive/`, and update `docs/goals/README.md`, `README.md`, and `AGENTS.md`.

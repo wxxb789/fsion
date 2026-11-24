@@ -6,12 +6,16 @@ Read [Core Design](../core-design.md) for enduring architectural invariants and 
 
 ## Lifecycle Convention
 
-- **Active queue**: none; all planned goals are completed and archived.
+- **Active queue**: Goals `0006`–`0008` in recommended execution order (`0006` -> `0007` -> `0008`).
 - **Archive**: Once a goal's outcome is accepted, move the completed goal file unchanged into `docs/goals/archive/`. Never rewrite archived contracts.
 
 ## Active Series
 
-None.
+| Goal | Status | Prerequisite | Intended Outcome |
+|---|---|---|---|
+| [0006-hot-path-and-burst-resilience.md](0006-hot-path-and-burst-resilience.md) | Ready | `0005` | Zero-cache client/daemon hot-path slimming (beat `bun` on `hello`, push `typical` toward `bun`), single-producer/multi-tag pool & idle non-compacting unload fixing the `2.3–2.7 s` zero-gap burst cliff, plus default-path/diverse/burst benchmark proof |
+| [0007-protocol-security-and-fault-isolation.md](0007-protocol-security-and-fault-isolation.md) | Ready | `0006` | Build/TFM-isolated endpoints & version-tolerant control frames, `CurrentUserOnly` / `0600` IPC + detached Unix `setsid`, cancellable FIFO `ProcessStateGate` (nested deadlock fix), non-collateral wedged drain, and named-session generation loss reporting |
+| [0008-stdin-exit-parity-and-state-guards.md](0008-stdin-exit-parity-and-state-guards.md) | Ready | `0007` | Demand-driven piped `stdin` forwarding in `file`/`-e` modes without open-pipe hangs, `exit <n>` parity inside `try ... with` blocks without marker leaks, and `< 0.1 ms` post-run global state guards (`Console.SetOut`, `AppDomain` handlers, culture, `Trace`) |
 
 ## Completed and Archived
 

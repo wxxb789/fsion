@@ -16,24 +16,14 @@ bindings alive across agent turns.
 
 Goal 0006 measured the Windows `win-x64` package on `CPC-lhan-XF3D0M`: 30 interleaved rounds
 per workload after three warmups. Every round generated fresh F# / TS / JS / Python source and
-verified byte-identical stdout across all five runners. The table shows process wall time in ms.
+verified byte-identical stdout across all five runners. The [Goal 0006 benchmark report](docs/evidence/0006-benchmark-report.md)
+holds the current timings for `hello`, `typical`, `diverse`, the separately logged `typical` phase probe,
+and the 12-script zero-gap burst.
 
-| Workload | `fsion` median / p95 | `dotnet fsi` median | `bun` median | `node` median | `python` median |
-|---|---:|---:|---:|---:|---:|
-| `hello` (formatted write) | **49.0 / 193.6** | 3059.0 | 53.6 | 76.2 | 48.1 |
-| `typical` (JSON parse, env, filter/sort, formatted stdout) | **69.6 / 548.4** | 3246.4 | 53.4 | 76.6 | 69.9 |
-| `diverse` (rotating F# constructs) | **50.3 / 76.5** | 3253.9 | 53.7 | 79.4 | 48.9 |
-
-`fsion` was 62.4x, 46.6x, and 64.6x faster than `dotnet fsi` at the median, respectively.
-It beat `bun` by 4.6 ms on `hello` but was 1.304x `bun` on `typical`, missing the separate
-AC-07 `<= 1.00x` criterion. A separate 12-sample logged `typical` probe measured medians of
-72.8 ms wall, 36.3 ms client + IPC, 7.9 ms daemon claim/gate/release, and 26.8 ms FCS
-compile + execution. The phase medians need not sum to the wall-time median.
-
-In the 12-script zero-gap burst, `fsion` measured 66.7 ms median and 215.9 ms max, down from
-109.9 ms and 2,366.2 ms on the same-harness baseline. The packaged daemon added zero cold
-claims and reported zero live disposed sessions after idle. The `bun` burst measured
-54.9 ms median and 188.9 ms max. All nine Goal 0006 thresholds passed.
+The Round 1 refresh passed the burst thresholds with zero cold claims and zero live disposed
+sessions after idle. It missed the Goal 0006 `typical` latency baseline and the separate strict
+AC-07 `typical` / `bun` criterion. See the [evidence](docs/evidence/0006-evidence.md#round-1-verification)
+for the pre-review comparison and verification limits.
 
 After the build and test gate has finished, run `python bench/run-bench.py` from the repository
 root. It writes the [Goal 0006 report](docs/evidence/0006-benchmark-report.md) and

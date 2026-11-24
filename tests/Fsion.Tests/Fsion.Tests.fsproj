@@ -20,6 +20,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/Fsion.Protocol/Fsion.Protocol.fsproj" />
+    <ProjectReference Include="../../src/fsiond/fsiond.fsproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.12.0" />

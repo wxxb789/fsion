@@ -3,12 +3,17 @@ module Fsiond.Log
 open System
 open System.IO
 
+let private gate = obj ()
+
 let private write (logPath: string option) (level: string) (message: string) =
     let line = DateTime.UtcNow.ToString("o") + " [" + level + "] " + message + Environment.NewLine
     match logPath with
     | Some path ->
         try
-            File.AppendAllText(path, line)
+            lock gate (fun () ->
+                use stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite ||| FileShare.Delete)
+                use writer = new StreamWriter(stream)
+                writer.Write line)
         with _ ->
             ()
     | None ->

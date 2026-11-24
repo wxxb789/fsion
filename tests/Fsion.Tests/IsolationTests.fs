@@ -226,6 +226,53 @@ type IsolationTests(output: ITestOutputHelper) =
             Assert.Equal("<null>" + Environment.NewLine, second.Stdout))
 
     [<Fact>]
+    member _.``script SetEnvironmentVariable does not leak into subsequent cold session creation`` () =
+        withContext "isolation-cold-prelude-env" (fun context directory ->
+            let run args =
+                context.Run([ "--pool-size"; "0" ] @ args, timeoutMs = 120000, extraEnv = [ "FSION_LEAK_PROBE", null ])
+
+            let mutate =
+                "System.Environment.SetEnvironmentVariable(\"FSION_LEAK_PROBE\", \"leaked\"); "
+                + "System.Console.Write(System.Environment.GetEnvironmentVariable(\"FSION_LEAK_PROBE\"))"
+            let first = run [ "-e"; mutate ]
+            assertRun first
+            Assert.Equal("leaked", first.Stdout)
+
+            writeFile directory "prelude.fsx"
+                "let coldProbe = System.Environment.GetEnvironmentVariable(\"FSION_LEAK_PROBE\") |> Option.ofObj"
+            let second = run [ "--prelude"; Path.Combine(directory, "prelude.fsx"); "-e"; "System.Console.Write(defaultArg coldProbe \"<null>\")" ]
+            assertRun second
+            Assert.Equal("<null>", second.Stdout)
+            Assert.Equal(2, context.MetricsOrFail().ColdClaims))
+
+    [<Fact>]
+    member _.``parallel daemon log writers preserve every line with a concurrent reader`` () =
+        withContext "parallel-log" (fun _ directory ->
+            let path = Path.Combine(directory, "daemon.log")
+            File.WriteAllText(path, "")
+            use reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite ||| FileShare.Delete)
+            let writers = 8
+            let linesPerWriter = 64
+            use start = new Barrier(writers)
+            let tasks =
+                Array.init writers (fun writer ->
+                    Task.Factory.StartNew(
+                        (fun () ->
+                            start.SignalAndWait()
+                            for line in 1 .. linesPerWriter do
+                                Fsiond.Log.info (Some path) $"writer={writer} line={line}"),
+                        TaskCreationOptions.LongRunning))
+            Task.WaitAll tasks
+
+            use text = new StreamReader(reader)
+            let actual =
+                text.ReadToEnd().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries)
+                |> Array.map (fun line -> line.Substring(line.IndexOf(" [info] ", StringComparison.Ordinal) + 8))
+            let expected = [| for writer in 0 .. writers - 1 do for line in 1 .. linesPerWriter -> $"writer={writer} line={line}" |]
+            Assert.Equal(expected.Length, actual.Length)
+            Assert.Equal<string>(Array.sort expected, Array.sort actual))
+
+    [<Fact>]
     member _.``pool size zero disables warm sessions and every run claims cold`` () =
         let poolDisabled = [ "FSION_POOL_SIZE", "0" ]
 

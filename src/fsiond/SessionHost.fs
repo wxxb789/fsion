@@ -616,6 +616,16 @@ let private environmentMap (snapshot: (string * string)[]) =
         variables.[key] <- value
     variables
 
+let private readProcessEnvironment () =
+    let snapshot = Environment.GetEnvironmentVariables()
+    let variables = Dictionary<string, string>(snapshot.Count, environmentComparer)
+    for entry in snapshot do
+        let pair = unbox<System.Collections.DictionaryEntry> entry
+        let key = unbox<string> pair.Key
+        if key.Length > 0 && key.IndexOf '=' < 0 then
+            variables.[key] <- unbox<string> pair.Value
+    variables
+
 let private applyEnvironment (current: Dictionary<string, string>) (desired: Dictionary<string, string>) =
     for key in current.Keys do
         if not (desired.ContainsKey key) then
@@ -632,19 +642,19 @@ type private ProcessStateGate() =
     let mutable activeRuns = 0
     let mutable lastExit = Environment.TickCount64
     let mutable currentDirectory = daemonDirectory
-    let mutable currentEnvironment = environmentMap (environmentSnapshot ())
+    let daemonBaseline = readProcessEnvironment ()
+    let mutable currentEnvironment = daemonBaseline
+
+    let matchesEnvironment (environment: (string * string)[]) =
+        currentEnvironment.Count = environment.Length
+        && (environment |> Array.forall (fun (key, value) ->
+            match currentEnvironment.TryGetValue key with
+            | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
+            | _ -> false))
 
     member _.Enter(directory: string, environment: (string * string)[]) =
         lock sync (fun () ->
-            let matches () =
-                currentDirectory = directory
-                && currentEnvironment.Count = environment.Length
-                && (environment |> Array.forall (fun (key, value) ->
-                    match currentEnvironment.TryGetValue key with
-                    | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
-                    | _ -> false))
-
-            while activeRuns > 0 && not (matches ()) do
+            while activeRuns > 0 && (currentDirectory <> directory || not (matchesEnvironment environment)) do
                 Monitor.Wait sync |> ignore
 
             if activeRuns = 0 then
@@ -652,9 +662,11 @@ type private ProcessStateGate() =
                     Directory.SetCurrentDirectory directory
                     currentDirectory <- directory
 
-                let desired = environmentMap environment
-                applyEnvironment (environmentMap (environmentSnapshot ())) desired
-                currentEnvironment <- desired
+                if not (matchesEnvironment environment) then
+                    currentEnvironment <- environmentMap environment
+
+                // Script code can mutate process variables without updating the cached request map.
+                applyEnvironment (readProcessEnvironment ()) currentEnvironment
 
             activeRuns <- activeRuns + 1)
 
@@ -667,6 +679,12 @@ type private ProcessStateGate() =
                 Directory.SetCurrentDirectory daemonDirectory
                 currentDirectory <- daemonDirectory
                 Monitor.PulseAll sync)
+
+    member _.EnsureBaselineWhenIdle() =
+        lock sync (fun () ->
+            if activeRuns = 0 then
+                applyEnvironment (readProcessEnvironment ()) daemonBaseline
+                currentEnvironment <- daemonBaseline)
 
     member _.IsQuiet(quietMs: int64) =
         lock sync (fun () -> activeRuns = 0 && Environment.TickCount64 - lastExit >= quietMs)
@@ -749,6 +767,7 @@ type SessionHost(options: SessionHostOptions) =
     let releaseSession = releaseSessionWith ValueNone
 
     let createWarmSession (spec: Prelude.Spec) : WarmSession =
+        processState.EnsureBaselineWhenIdle()
         let processExitBefore = processExitSnapshot ()
         let unmanagedDllBefore = unmanagedDllSnapshot ()
         let assemblyResolveBefore = assemblyResolveSnapshot ()

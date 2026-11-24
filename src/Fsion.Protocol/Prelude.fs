@@ -17,26 +17,43 @@ let private environment (name: string) =
 
 let configuredPreludePath () : string option = environment PreludeEnvironmentVariable
 
-let private specialFolder (variable: string) folder =
-    match environment variable with
-    | Some directory -> directory
-    | None -> Environment.GetFolderPath folder
+let private mapValue (environment: (string * string)[]) (name: string) =
+    let comparer =
+        if OperatingSystem.IsWindows() then
+            StringComparer.OrdinalIgnoreCase
+        else
+            StringComparer.Ordinal
 
-let userPreludePath () : string option =
+    environment
+    |> Array.tryPick (fun (key, value) ->
+        if comparer.Equals(key, name) && not (isNull value) && value.Length > 0 then
+            Some value
+        else
+            None)
+
+let private cachedWindowsApplicationData =
+    lazy (Environment.GetFolderPath Environment.SpecialFolder.ApplicationData)
+
+let private cachedPosixApplicationData =
+    lazy (Environment.GetFolderPath Environment.SpecialFolder.ApplicationData)
+
+let userPreludePathFrom (lookup: string -> string option) : string option =
     let configDirectory =
-        match environment ConfigDirectoryEnvironmentVariable with
+        match lookup ConfigDirectoryEnvironmentVariable with
         | Some directory -> directory
         | None ->
             let home =
                 if OperatingSystem.IsWindows() then
-                    specialFolder "APPDATA" Environment.SpecialFolder.ApplicationData
+                    cachedWindowsApplicationData.Value
                 else
-                    match environment "XDG_CONFIG_HOME" with
+                    match lookup "XDG_CONFIG_HOME" with
                     | Some directory -> directory
                     | None ->
-                        match environment "HOME" with
-                        | Some directory when OperatingSystem.IsLinux() -> Path.Combine(directory, ".config")
-                        | _ -> Environment.GetFolderPath Environment.SpecialFolder.ApplicationData
+                        match lookup "HOME" with
+                        | Some directory when OperatingSystem.IsMacOS() ->
+                            Path.Combine(directory, "Library", "Application Support")
+                        | Some directory -> Path.Combine(directory, ".config")
+                        | None -> cachedPosixApplicationData.Value
 
             Path.Combine(home, "fsion")
 
@@ -44,16 +61,20 @@ let userPreludePath () : string option =
 
     if File.Exists candidate then Some candidate else None
 
+let userPreludePath () : string option = userPreludePathFrom environment
+
+let userPreludePathForEnvironment (snapshot: (string * string)[]) : string option =
+    userPreludePathFrom (mapValue snapshot)
+
 let cacheDirectory () : string =
     match environment CacheDirectoryEnvironmentVariable with
     | Some directory -> directory
     | None ->
         let baseDirectory =
             if OperatingSystem.IsWindows() then
-                specialFolder "LOCALAPPDATA" Environment.SpecialFolder.LocalApplicationData
+                Environment.GetFolderPath Environment.SpecialFolder.LocalApplicationData
             else
                 match environment "XDG_CACHE_HOME" with
                 | Some directory -> directory
                 | None -> Path.Combine(Environment.GetFolderPath Environment.SpecialFolder.UserProfile, ".cache")
-
         Path.Combine(baseDirectory, "fsion", "nuget-cache")

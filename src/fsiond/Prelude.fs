@@ -4,6 +4,7 @@ open System
 open System.IO
 open System.Security.Cryptography
 open System.Text
+open Fsion
 open Fsion.Protocol
 
 [<NoComparison>]
@@ -70,7 +71,9 @@ let specOfRequest (request: ExecuteRequest) : Spec =
     elif request.PreludePath.IsSome then
         Spec.File(normalizePath request.PreludePath.Value)
     else
-        Spec.Builtin
+        match PreludeConfig.userPreludePathForEnvironment request.Environment with
+        | Some path -> Spec.File(normalizePath path)
+        | None -> Spec.Builtin
 
 let specOfOptions (preludePath: string option) (noPrelude: bool) : Spec =
     if noPrelude then
@@ -78,4 +81,6 @@ let specOfOptions (preludePath: string option) (noPrelude: bool) : Spec =
     elif preludePath.IsSome then
         Spec.File(normalizePath preludePath.Value)
     else
-        Spec.Builtin
+        match PreludeConfig.userPreludePath () with
+        | Some path -> Spec.File(normalizePath path)
+        | None -> Spec.Builtin

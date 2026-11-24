@@ -725,8 +725,13 @@ def main(argv: list[str]) -> int:
     if not salt:
         raise SystemExit(f"could not allocate a fresh run-<salt> directory under {parent_dir}")
 
-    config_dir = work_dir / ".fsion-config"
-    config_dir.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        roaming_dir = Path(os.environ.get("APPDATA", ""))
+        default_prelude = roaming_dir / "fsion" / "prelude.fsx" if roaming_dir else None
+        if default_prelude and default_prelude.exists():
+            raise SystemExit(
+                f"default user prelude {default_prelude} exists; move it aside before running the default-path benchmark"
+            )
 
     base_env = dict(os.environ)
     base_env.pop("FSION_PRELUDE", None)
@@ -736,8 +741,10 @@ def main(argv: list[str]) -> int:
     base_env["FSION_PIPE"] = f"fsion-bench-{salt}"
     base_env["FSIOND_PATH"] = str(fsiond_path)
     base_env.pop("FSION_CONFIG_DIR", None)
-    base_env["APPDATA" if os.name == "nt" else "XDG_CONFIG_HOME"] = str(config_dir)
-
+    if os.name != "nt":
+        config_dir = work_dir / ".fsion-config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        base_env["XDG_CONFIG_HOME"] = str(config_dir)
     present = [runner.id for runner in runners]
     print(f"benchmark salt {salt}; runners: {', '.join(present)}")
     if skipped:

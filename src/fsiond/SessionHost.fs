@@ -656,6 +656,8 @@ type private ProcessStateGate() =
     let sync = obj ()
     let daemonDirectory = Directory.GetCurrentDirectory()
     let mutable activeRuns = 0
+    let mutable nonBaselineEpochNumber = 0L
+    let mutable baselineEpoch = true
     let mutable lastExit = Environment.TickCount64
     let mutable currentDirectory = daemonDirectory
     let daemonBaseline = readProcessEnvironment ()
@@ -668,6 +670,12 @@ type private ProcessStateGate() =
             | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
             | _ -> false))
 
+    let matchesBaseline (baseline: Dictionary<string, string>) (candidate: Dictionary<string, string>) =
+        baseline.Count = candidate.Count
+        && (baseline |> Seq.forall (fun (KeyValue(key, value)) ->
+            match candidate.TryGetValue key with
+            | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
+            | _ -> false))
     member _.Enter(directory: string, environment: (string * string)[]) =
         lock sync (fun () ->
             while activeRuns > 0 && (currentDirectory <> directory || not (matchesEnvironment environment)) do
@@ -683,7 +691,9 @@ type private ProcessStateGate() =
 
                 // Script code can mutate process variables without updating the cached request map.
                 applyEnvironment (readProcessEnvironment ()) currentEnvironment
-
+                baselineEpoch <- matchesBaseline daemonBaseline currentEnvironment
+                if not baselineEpoch then
+                    nonBaselineEpochNumber <- nonBaselineEpochNumber + 1L
             activeRuns <- activeRuns + 1)
 
     member _.Exit() =
@@ -699,9 +709,23 @@ type private ProcessStateGate() =
     member _.EnsureBaselineWhenIdle() =
         lock sync (fun () ->
             if activeRuns = 0 then
+                if currentDirectory <> daemonDirectory then
+                    Directory.SetCurrentDirectory daemonDirectory
+                    currentDirectory <- daemonDirectory
                 applyEnvironment (readProcessEnvironment ()) daemonBaseline
-                currentEnvironment <- daemonBaseline)
+                currentEnvironment <- daemonBaseline
+                baselineEpoch <- true
+                ValueSome nonBaselineEpochNumber
+            elif baselineEpoch then
+                ValueSome nonBaselineEpochNumber
+            else
+                ValueNone)
 
+    member _.UnchangedSinceBaseline(stamp: int64 voption) =
+        match stamp with
+        | ValueNone -> false
+        | ValueSome expected ->
+            lock sync (fun () -> (activeRuns = 0 || baselineEpoch) && nonBaselineEpochNumber = expected)
     member _.RespawnEnvironment() =
         daemonBaseline |> Seq.map (fun (KeyValue(key, value)) -> key, value) |> Seq.toArray
 
@@ -787,8 +811,8 @@ type SessionHost(options: SessionHostOptions) =
 
     let releaseSession = releaseSessionWith ValueNone
 
-    let createWarmSession (spec: Prelude.Spec) : WarmSession =
-        processState.EnsureBaselineWhenIdle()
+    let createWarmSession (spec: Prelude.Spec) : WarmSession * int64 voption =
+        let baselineStamp = processState.EnsureBaselineWhenIdle()
         let processExitBefore = processExitSnapshot ()
         let unmanagedDllBefore = unmanagedDllSnapshot ()
         let assemblyResolveBefore = assemblyResolveSnapshot ()
@@ -872,7 +896,7 @@ type SessionHost(options: SessionHostOptions) =
                 for assembly in session.DynamicAssemblies do
                     warm.PreludeTypes.UnionWith(assembly.GetTypes())
             succeeded <- true
-            warm
+            warm, baselineStamp
         finally
             if not succeeded then
                 releaseSession warm
@@ -935,12 +959,19 @@ type SessionHost(options: SessionHostOptions) =
                     | Some warm -> warm
                     | None ->
                         Interlocked.Increment(&coldClaims.contents) |> ignore
+                        let attemptedTag = tagOfSpec slot.Spec
                         try
-                            let warm = createWarmSession slot.Spec
-                            lock poolGate (fun () -> slot.Failure <- None)
+                            let warm, _ = createWarmSession slot.Spec
+                            let currentTag = tagOfSpec slot.Spec
+                            lock poolGate (fun () ->
+                                if refreshTagWith currentTag slot = warm.Prelude then
+                                    slot.Failure <- None)
                             warm
                         with ex ->
-                            lock poolGate (fun () -> slot.Failure <- Some ex.Message)
+                            let currentTag = tagOfSpec slot.Spec
+                            lock poolGate (fun () ->
+                                if refreshTagWith currentTag slot = attemptedTag then
+                                    slot.Failure <- Some ex.Message)
                             reraise ()
                 finally
                     creationGate.Release() |> ignore
@@ -1339,23 +1370,38 @@ type SessionHost(options: SessionHostOptions) =
                             |> Seq.rev
                             |> Seq.filter (fun slot -> slot.Failure.IsNone && slot.Warm.Count < targetPoolSize)
                             |> Seq.sortBy (fun slot -> slot.Warm.Count)
-                            |> Seq.tryHead)
+                            |> Seq.tryHead
+                            |> Option.map (fun slot -> slot, slot.Tag))
                     match next with
                     | None -> filling <- false
-                    | Some slot ->
-                        try
-                            let warm = createWarmSession slot.Spec
-                            if processState.IsQuiet 250L then
-                                GC.Collect(1, GCCollectionMode.Optimized, false)
-                            let currentTag = tagOfSpec slot.Spec
-                            lock poolGate (fun () ->
-                                if pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
-                                    slot.Warm.Enqueue warm
-                                else
-                                    discard.Enqueue warm)
-                        with ex ->
-                            Log.error options.LogPath ("replenisher could not create a warm session: " + ex.Message)
-                            lock poolGate (fun () -> slot.Failure <- Some ex.Message)
+                    | Some (slot, attemptedTag) ->
+                        let canReplenish =
+                            match slot.Spec with
+                            | Prelude.Spec.File _ -> ValueOption.isSome (processState.EnsureBaselineWhenIdle())
+                            | _ -> true
+                        if not canReplenish then
+                            filling <- false
+                        else
+                            try
+                                let warm, baselineStamp = createWarmSession slot.Spec
+                                let untainted =
+                                    match slot.Spec with
+                                    | Prelude.Spec.File _ -> processState.UnchangedSinceBaseline baselineStamp
+                                    | _ -> true
+                                if processState.IsQuiet 250L then
+                                    GC.Collect(1, GCCollectionMode.Optimized, false)
+                                let currentTag = tagOfSpec slot.Spec
+                                lock poolGate (fun () ->
+                                    if untainted && pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
+                                        slot.Warm.Enqueue warm
+                                    else
+                                        discard.Enqueue warm)
+                            with ex ->
+                                Log.error options.LogPath ("replenisher could not create a warm session: " + ex.Message)
+                                let currentTag = tagOfSpec slot.Spec
+                                lock poolGate (fun () ->
+                                    if pools.Contains slot && refreshTagWith currentTag slot = attemptedTag then
+                                        slot.Failure <- Some ex.Message)
                 finally
                     creationGate.Release() |> ignore
                 drainDiscarded ()
@@ -1413,7 +1459,7 @@ type SessionHost(options: SessionHostOptions) =
                 | Prelude.Spec.File _ ->
                     creationGate.Wait()
                     try
-                        createWarmSession spec |> releaseSession
+                        createWarmSession spec |> fst |> releaseSession
                     finally
                         creationGate.Release() |> ignore
                     replenishSignal.Release() |> ignore

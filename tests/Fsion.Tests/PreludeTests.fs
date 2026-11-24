@@ -156,21 +156,31 @@ type PreludeTests(output: ITestOutputHelper) =
                 tryDeleteDirectory cacheDirectory)
 
     [<Fact>]
-    member _.``default user prelude loads from platform config home when FSION_CONFIG_DIR is unset`` () =
+    member _.``default user prelude resolves POSIX XDG_CONFIG_HOME and keeps Windows SpecialFolder semantics`` () =
         withContext "prelude-platform-config" (fun context directory ->
             let configHome = Path.Combine(directory, "config-home")
-            let configVariable = if OperatingSystem.IsWindows() then "APPDATA" else "XDG_CONFIG_HOME"
             writeFile configHome "fsion/prelude.fsx" "let platformPreludeValue = \"platform-config\"\n"
 
-            let result =
-                context.Run(
-                    [ "-e"; "System.Console.Write(platformPreludeValue)" ],
-                    timeoutMs = 120000,
-                    extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; configVariable, configHome ]
-                )
+            if OperatingSystem.IsWindows() then
+                let result =
+                    context.Run(
+                        [ "-e"; "System.Console.Write(\"windows-special-folder-ok\")" ],
+                        timeoutMs = 120000,
+                        extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "APPDATA", configHome ]
+                    )
 
-            Assert.True(result.ExitCode = 0, result.Stderr)
-            Assert.Equal("platform-config", result.Stdout))
+                Assert.True(result.ExitCode = 0, result.Stderr)
+                Assert.Equal("windows-special-folder-ok", result.Stdout)
+            else
+                let result =
+                    context.Run(
+                        [ "-e"; "System.Console.Write(platformPreludeValue)" ],
+                        timeoutMs = 120000,
+                        extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", configHome ]
+                    )
+
+                Assert.True(result.ExitCode = 0, result.Stderr)
+                Assert.Equal("platform-config", result.Stdout))
 
     [<Fact>]
     member _.``prelude resolution prefers the flag, then the environment, then the config directory`` () =
@@ -406,3 +416,90 @@ type PreludeTests(output: ITestOutputHelper) =
             let settled = context.MetricsOrFail()
             Assert.Equal(settled.PoolTarget, settled.PoolWarm)
             Assert.Equal(0, settled.AliveDisposedSessions))
+
+    [<Fact>]
+    member _.``background file-prelude replenish stays isolated from concurrent request environment and stale failure`` () =
+        withContext "prelude-replenish-isolation" (fun context directory ->
+            let waitFor message (condition: unit -> bool) =
+                Assert.True(System.Threading.SpinWait.SpinUntil(Func<bool>(condition), TimeSpan.FromSeconds 30.0), message)
+            let preludePath = Path.Combine(directory, "prelude.fsx")
+            let enteredPath = Path.Combine(directory, "prelude-entered.txt")
+            let releasePath = Path.Combine(directory, "prelude-release.txt")
+            let callerEnteredPath = Path.Combine(directory, "caller-entered.txt")
+            let callerReleasePath = Path.Combine(directory, "caller-release.txt")
+
+            let slowPrelude =
+                sprintf
+                    "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\nlet capturedProbe = match System.Environment.GetEnvironmentVariable(\"FSION_REPLENISH_PROBE\") with null -> \"unset\" | v -> v\n"
+                    enteredPath
+                    releasePath
+
+            writeFile directory "prelude.fsx" "let capturedProbe = \"seed\"\n"
+            let warmBuiltin = context.Run([ "--pool-size"; "1"; "warmup" ], timeoutMs = 120000)
+            Assert.True(warmBuiltin.ExitCode = 0, warmBuiltin.Stderr)
+            let warmFile = context.Run([ "--pool-size"; "1"; "--prelude"; preludePath; "warmup" ], timeoutMs = 120000)
+            Assert.True(warmFile.ExitCode = 0, warmFile.Stderr)
+
+            let drainSeed = context.Run([ "--pool-size"; "1"; "--prelude"; preludePath; "-e"; "System.Console.Write(capturedProbe)" ], timeoutMs = 60000)
+            Assert.True(drainSeed.ExitCode = 0, drainSeed.Stderr)
+            Assert.Equal("seed", drainSeed.Stdout)
+
+            writeFile directory "prelude.fsx" slowPrelude
+            let triggerReplenish =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    context.Run([ "--pool-size"; "1"; "--prelude"; preludePath; "warmup" ], timeoutMs = 120000))
+
+            waitFor "file prelude entered replenisher" (fun () -> File.Exists enteredPath)
+
+            let concurrentBuiltin =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    context.Run(
+                        [ "--pool-size"; "1"; "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20; System.Console.Write(System.Environment.GetEnvironmentVariable(\"FSION_REPLENISH_PROBE\"))" callerEnteredPath callerReleasePath ],
+                        timeoutMs = 120000,
+                        extraEnv = [ "FSION_REPLENISH_PROBE", "leaked" ]
+                    ))
+
+            waitFor "concurrent request entered while file prelude was evaluating" (fun () -> File.Exists callerEnteredPath)
+
+            writeFile directory "prelude-release.txt" "go"
+            writeFile directory "caller-release.txt" "go"
+            let builtinDone = concurrentBuiltin.GetAwaiter().GetResult()
+            Assert.True(builtinDone.ExitCode = 0, builtinDone.Stderr)
+            Assert.Equal("leaked", builtinDone.Stdout)
+
+            let warmDone = triggerReplenish.GetAwaiter().GetResult()
+            Assert.True(warmDone.ExitCode = 0, warmDone.Stderr)
+            let checkClean =
+                context.Run([ "--pool-size"; "1"; "--prelude"; preludePath; "-e"; "System.Console.Write(capturedProbe)" ], timeoutMs = 60000)
+            Assert.True(checkClean.ExitCode = 0, checkClean.Stderr)
+            Assert.Equal("unset", checkClean.Stdout)
+
+            let failEntered = Path.Combine(directory, "fail-entered.txt")
+            let failRelease = Path.Combine(directory, "fail-release.txt")
+            writeFile
+                directory
+                "prelude.fsx"
+                (sprintf "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\nfailwith \"stale-v1-boom\"\n" failEntered failRelease)
+
+            let staleWarmup =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    context.Run([ "--pool-size"; "1"; "--prelude"; preludePath; "warmup" ], timeoutMs = 120000))
+
+            waitFor "failing v1 prelude entered" (fun () -> File.Exists failEntered)
+            writeFile directory "prelude.fsx" "let fixedVersion () = \"v2-ok\"\n"
+
+            let fixedWarmup =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    System.Threading.Thread.Sleep 100
+                    context.Run([ "--pool-size"; "1"; "--prelude"; preludePath; "warmup" ], timeoutMs = 120000))
+
+            System.Threading.Thread.Sleep 250
+            writeFile directory "fail-release.txt" "go"
+            let _ = staleWarmup.GetAwaiter().GetResult()
+            let v2WarmResult = fixedWarmup.GetAwaiter().GetResult()
+            Assert.True(v2WarmResult.ExitCode = 0, v2WarmResult.Stderr)
+
+            let v2Run =
+                context.Run([ "--pool-size"; "1"; "--prelude"; preludePath; "-e"; "System.Console.Write(fixedVersion())" ], timeoutMs = 60000)
+            Assert.True(v2Run.ExitCode = 0, v2Run.Stderr)
+            Assert.Equal("v2-ok", v2Run.Stdout))

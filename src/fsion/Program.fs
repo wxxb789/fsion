@@ -226,7 +226,7 @@ let private resolvePoolSize (options: Options) =
             | true, parsed when parsed >= 0 -> parsed
             | _ -> DefaultPoolSize
 
-let private resolvePrelude (options: Options) : Result<string option, string> =
+let private resolvePrelude (includeImplicitUserPrelude: bool) (options: Options) : Result<string option, string> =
     if options.NoPrelude then
         Ok None
     else
@@ -238,7 +238,11 @@ let private resolvePrelude (options: Options) : Result<string option, string> =
                 Ok(Some fullPath)
             else
                 Error("prelude file not found: " + path)
-        | None -> Ok(PreludeConfig.userPreludePath ())
+        | None ->
+            if includeImplicitUserPrelude then
+                Ok(PreludeConfig.userPreludePath ())
+            else
+                Ok None
 
 let private findDaemonBinary () =
     match Environment.GetEnvironmentVariable "FSIOND_PATH" with
@@ -286,9 +290,13 @@ let private spawnDaemon
     (options: Options)
     (endpoint: Endpoint)
     =
+    let spawnOptions =
+        if not options.NoPrelude && options.PreludePath.IsNone then
+            { options with PreludePath = PreludeConfig.userPreludePath () }
+        else
+            options
     let daemonPath = findDaemonBinary ()
-    spawnDetached daemonPath (daemonArguments idleTtlMinutes sessionTtlMinutes options endpoint)
-
+    spawnDetached daemonPath (daemonArguments idleTtlMinutes sessionTtlMinutes spawnOptions endpoint)
 let private ensureDaemon (options: Options) (endpoint: Endpoint) : Stream =
     match tryConnect endpoint (TimeSpan.FromMilliseconds 250.0) with
     | Some stream -> stream
@@ -621,13 +629,15 @@ let main argv =
             | ShowVersion
             | DaemonStop
             | DaemonStatus -> Ok options
-            | Warmup
             | RunScript _
             | RunEval _
-            | RunStdin _
+            | RunStdin _ ->
+                resolvePrelude options.NoDaemon options
+                |> Result.map (fun preludePath -> { options with PreludePath = preludePath })
+            | Warmup
             | DaemonStart
             | DaemonRestart ->
-                resolvePrelude options
+                resolvePrelude true options
                 |> Result.map (fun preludePath -> { options with PreludePath = preludePath })
 
         match resolvedOptions with

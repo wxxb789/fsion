@@ -30,6 +30,7 @@ type private Options =
       PipeName: string option
       IdleTtlMinutes: float option
       SessionTtlMinutes: float option
+      PoolSize: int option
       SessionId: string option
       Reset: bool
       TimeoutMs: int option
@@ -55,6 +56,8 @@ let private usage =
     + "  --session <id>        reuse a named stateful session inside fsiond\n"
     + "  --reset               discard the named session before this run (requires --session)\n"
     + "  --session-ttl <min>   auto-started daemon named-session idle TTL (env: FSION_SESSION_TTL_MINUTES, default 15)\n"
+    + "  --pool-size <n>       warm session pool size for the auto-started daemon; 0 disables warm sessions\n"
+    + "                        (env: FSION_POOL_SIZE, default 3)\n"
     + "  --timeout <ms>        cancel after this deadline; scripts observe fsionFsiState.CancellationToken; exit 124\n"
     + "  --prelude <path>      evaluate this prelude.fsx in warm sessions (env: FSION_PRELUDE)\n"
     + "  --no-prelude          do not load the Fsion module or the user prelude\n"
@@ -67,6 +70,7 @@ let private parse (argv: string[]) : Result<Options * Input, string> =
           PipeName = None
           IdleTtlMinutes = None
           SessionTtlMinutes = None
+          PoolSize = None
           SessionId = None
           Reset = false
           TimeoutMs = None
@@ -117,6 +121,12 @@ let private parse (argv: string[]) : Result<Options * Input, string> =
                 options <- { options with SessionTtlMinutes = Some value }
                 index <- index + 2
             | _ -> outcome <- Some(Error("invalid --session-ttl value: " + argv.[index + 1]))
+        | "--pool-size" when index + 1 < argv.Length ->
+            match Int32.TryParse(argv.[index + 1], NumberStyles.Integer, CultureInfo.InvariantCulture) with
+            | true, value when value >= 0 ->
+                options <- { options with PoolSize = Some value }
+                index <- index + 2
+            | _ -> outcome <- Some(Error("invalid --pool-size value: " + argv.[index + 1]))
         | "--timeout" when index + 1 < argv.Length ->
             match Int32.TryParse(argv.[index + 1], NumberStyles.Integer, CultureInfo.InvariantCulture) with
             | true, value when value > 0 ->
@@ -205,6 +215,17 @@ let private resolveSessionTtl (options: Options) =
             | true, parsed -> parsed
             | _ -> DefaultSessionTtlMinutes
 
+let private resolvePoolSize (options: Options) =
+    match options.PoolSize with
+    | Some value -> value
+    | None ->
+        match Environment.GetEnvironmentVariable PoolSizeEnvironmentVariable with
+        | null | "" -> DefaultPoolSize
+        | value ->
+            match Int32.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture) with
+            | true, parsed when parsed >= 0 -> parsed
+            | _ -> DefaultPoolSize
+
 let private resolvePrelude (options: Options) : Result<string option, string> =
     if options.NoPrelude then
         Ok None
@@ -244,6 +265,8 @@ let private daemonArguments
         match sessionTtlMinutes with
         | Some minutes -> [ "--session-ttl"; minutes.ToString(CultureInfo.InvariantCulture) ]
         | None -> []
+    let poolArguments =
+        [ "--pool-size"; (resolvePoolSize options).ToString(CultureInfo.InvariantCulture) ]
     let preludeArguments =
         if options.NoPrelude then
             [ "--no-prelude" ]
@@ -255,7 +278,7 @@ let private daemonArguments
         match Environment.GetEnvironmentVariable "FSIOND_LOG" with
         | null | "" -> []
         | logPath -> [ "--log"; logPath ]
-    [ "--endpoint"; endpoint.Name ] @ modeArguments @ sessionArguments @ preludeArguments @ logArguments
+    [ "--endpoint"; endpoint.Name ] @ modeArguments @ sessionArguments @ poolArguments @ preludeArguments @ logArguments
 
 let private spawnDaemon
     (idleTtlMinutes: float option)

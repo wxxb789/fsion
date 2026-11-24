@@ -22,7 +22,41 @@ let ``file mode matches dotnet fsi byte for byte`` () =
         writeFile directory "probe.fsx" contextScript
         let expected = runFsi directory [ "probe.fsx"; "one"; "two words" ] None
         let actual = context.Run [ "probe.fsx"; "one"; "two words" ]
-        assertSameOutput expected actual)
+        assertSameOutput expected actual
+
+        let multiScript =
+            "let ``a;;b`` = 41\n"
+            + "let interp = $\"x{1}y{2}z\"\n"
+            + "#if FOO\n"
+            + "let skipped = 1\n"
+            + ";;\n"
+            + "#endif\n"
+            + "#if INTERACTIVE\n"
+            + "let insideActive = 10;;\n"
+            + "printfn \"active=%d|%s\" insideActive interp\n"
+            + "#endif\n"
+            + "let full = System.IO.Path.Combine(__SOURCE_DIRECTORY__, __SOURCE_FILE__)\n"
+            + "eprintfn \"%s(\" full;;;\n"
+            + ";\n"
+            + "printfn \"after-semi=%d\" (``a;;b`` + 1);;\n"
+            + "exit 7\n"
+
+        writeFile directory "multi.fsx" multiScript
+        let expectedMulti = runFsi directory [ "multi.fsx" ] None
+        let actualMulti = context.Run [ "multi.fsx" ]
+        assertSameOutput expectedMulti actualMulti
+
+        let straySemiZero = "printfn \"a\";;; printfn \"b\"\n"
+        writeFile directory "stray0.fsx" straySemiZero
+        let expectedStray = runFsi directory [ "stray0.fsx" ] None
+        let actualStray = context.Run [ "stray0.fsx" ]
+        assertSameOutput expectedStray actualStray
+
+        let sameLineErrScript = "printfn \"a\";; let y : int = \"nope\"\n"
+        writeFile directory "sameline.fsx" sameLineErrScript
+        let expectedSame = runFsi directory [ "sameline.fsx" ] None
+        let actualSame = context.Run [ "sameline.fsx" ]
+        assertSameOutput expectedSame actualSame)
 
 [<Fact>]
 let ``file mode passes quoting-sensitive arguments like dotnet fsi`` () =

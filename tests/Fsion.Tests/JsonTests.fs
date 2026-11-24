@@ -94,7 +94,28 @@ type JsonTests() =
             Assert.EndsWith("bad.fsx", diagnostic.GetProperty("file").GetString())
             Assert.Equal(2, diagnostic.GetProperty("startLine").GetInt32())
             Assert.Equal(14, diagnostic.GetProperty("startColumn").GetInt32())
-            Assert.Equal(20, diagnostic.GetProperty("endColumn").GetInt32()))
+            Assert.Equal(20, diagnostic.GetProperty("endColumn").GetInt32())
+
+            writeFile directory "sameline_bad.fsx" "printfn \"a\";; let z : int = \"nope\"\n"
+            let sameLineResult = context.Run([ "--json"; "sameline_bad.fsx" ], timeoutMs = 120000)
+            Assert.Equal(1, sameLineResult.ExitCode)
+            use sameLineDoc = parseSingleJson sameLineResult.Stdout
+            let sameLineDiag = sameLineDoc.RootElement.GetProperty("diagnostics").[0]
+            Assert.Equal("FS0001", sameLineDiag.GetProperty("code").GetString())
+            Assert.Equal(1, sameLineDiag.GetProperty("startLine").GetInt32())
+            Assert.Equal(28, sameLineDiag.GetProperty("startColumn").GetInt32())
+            Assert.Equal(34, sameLineDiag.GetProperty("endColumn").GetInt32())
+
+            writeFile directory "helper.fsx" "let helperVal = 10\n"
+            writeFile directory "load_bad.fsx" "#load \"helper.fsx\"\nlet y : int = \"nope\"\n"
+            let loadResult = context.Run([ "--json"; "load_bad.fsx" ], timeoutMs = 120000)
+            Assert.Equal(1, loadResult.ExitCode)
+            use loadDoc = parseSingleJson loadResult.Stdout
+            let loadDiagnostics = loadDoc.RootElement.GetProperty("diagnostics")
+            Assert.Equal(1, loadDiagnostics.GetArrayLength())
+            Assert.Equal("FS0001", loadDiagnostics.[0].GetProperty("code").GetString())
+            Assert.EndsWith("load_bad.fsx", loadDiagnostics.[0].GetProperty("file").GetString())
+            Assert.Equal(2, loadDiagnostics.[0].GetProperty("startLine").GetInt32()))
 
     [<Fact>]
     member _.``runtime failures still emit one valid json document`` () =

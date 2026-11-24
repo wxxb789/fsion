@@ -7,6 +7,7 @@ open System.IO
 open System.IO.Pipes
 open System.Net.Sockets
 open System.Runtime.InteropServices
+open System.Security.Cryptography
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -26,19 +27,32 @@ let sanitizeName (name: string) =
 let defaultEndpointName () = "fsion-" + sanitizeName Environment.UserName
 
 let validateEndpointName (name: string) =
-    if isWindows && (name.Contains '\\' || name.Contains '/') then
+    if name.Contains '\\' || name.Contains '/' then
         raise (ArgumentException("pipe name must not contain path separators"))
-
 let socketPath (endpoint: Endpoint) =
-    if Path.IsPathRooted endpoint.Name then
-        endpoint.Name
-    else
-        let baseDirectory =
-            match Environment.GetEnvironmentVariable "XDG_RUNTIME_DIR" with
-            | null | "" -> Path.GetTempPath()
-            | directory -> directory
-        Path.Combine(baseDirectory, sanitizeName endpoint.Name + ".sock")
+    let baseDirectory =
+        match Environment.GetEnvironmentVariable "XDG_RUNTIME_DIR" with
+        | null | "" -> Path.GetTempPath()
+        | directory -> directory
 
+    let sanitized = sanitizeName endpoint.Name
+    let candidate = Path.Combine(baseDirectory, sanitized + ".sock")
+
+    if Encoding.UTF8.GetByteCount candidate <= 100 then
+        candidate
+    else
+        let fallbackBase =
+            if Encoding.UTF8.GetByteCount(Path.Combine(baseDirectory, "fsion-0123456789abcdef.sock")) <= 100 then
+                baseDirectory
+            else
+                "/tmp"
+
+        let hash =
+            SHA256.HashData(Encoding.UTF8.GetBytes sanitized)
+            |> Convert.ToHexString
+            |> fun value -> value.Substring(0, 16).ToLowerInvariant()
+
+        Path.Combine(fallbackBase, "fsion-" + hash + ".sock")
 let endpointDisplay (endpoint: Endpoint) =
     if isWindows then endpoint.Name else socketPath endpoint
 

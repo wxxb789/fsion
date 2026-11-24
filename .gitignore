@@ -12,5 +12,6 @@ BenchmarkDotNet.Artifacts/
 __pycache__/
 *.py[cod]
 .venv/
+bench/.work/
 .tmp-artifacts/
 local/

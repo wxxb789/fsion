@@ -21,8 +21,6 @@ type private Options =
       LogPath: string option
       Prelude: Spec }
 
-let private defaultPoolSize = 3
-
 let private parse (argv: string[]) =
     let mutable endpointName = defaultEndpointName ()
     let mutable endpointSet = false
@@ -31,7 +29,7 @@ let private parse (argv: string[]) =
     let mutable sessionTtlMinutes = DefaultSessionTtlMinutes
     let mutable sessionTtlSet = false
     let mutable oneshot = false
-    let mutable poolSize = defaultPoolSize
+    let mutable poolSize = DefaultPoolSize
     let mutable poolSizeSet = false
     let mutable logPath = None
     let mutable preludePath = None

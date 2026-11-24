@@ -50,24 +50,24 @@ type LatencyTests(output: ITestOutputHelper) =
             let prime = context.Run([ "-e"; "printfn \"prime\"" ], timeoutMs = 60000)
             Assert.Equal(0, prime.ExitCode)
 
+            let warmupAgain = context.Run([ "warmup" ], timeoutMs = 120000)
+            Assert.Equal(0, warmupAgain.ExitCode)
+
             let fsionTimes = ResizeArray<float>()
-
-            for round in 1 .. 8 do
-                let name = "fsion-" + string round + ".fsx"
-                writeFile directory name (generateTypicalScript round (round * 7919))
-                let result = context.Run([ name ], timeoutMs = 60000)
-                Assert.Equal(0, result.ExitCode)
-                fsionTimes.Add result.DurationMs
-
             let fsiTimes = ResizeArray<float>()
 
-            for round in 1 .. 3 do
-                let name = "fsi-" + string round + ".fsx"
-                writeFile directory name (generateTypicalScript (100 + round) (round * 104729))
-                let result = runFsi directory [ name ] None
-                Assert.Equal(0, result.ExitCode)
-                fsiTimes.Add result.DurationMs
+            for round in 1 .. 5 do
+                let fsionName = "fsion-" + string round + ".fsx"
+                writeFile directory fsionName (generateTypicalScript round (round * 7919))
+                let fsionResult = context.Run([ fsionName ], timeoutMs = 60000)
+                Assert.Equal(0, fsionResult.ExitCode)
+                fsionTimes.Add fsionResult.DurationMs
 
+                let fsiName = "fsi-" + string round + ".fsx"
+                writeFile directory fsiName (generateTypicalScript (100 + round) (round * 104729))
+                let fsiResult = runFsi directory [ fsiName ] None
+                Assert.Equal(0, fsiResult.ExitCode)
+                fsiTimes.Add fsiResult.DurationMs
             writeFile directory "verify.fsx" (generateTypicalScript 500 424242)
             let expected = runFsi directory [ "verify.fsx" ] None
             let actual = context.Run([ "verify.fsx" ], timeoutMs = 60000)

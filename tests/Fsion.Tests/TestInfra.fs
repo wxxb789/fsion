@@ -127,12 +127,22 @@ let runFsi (workingDirectory: string) (arguments: string list) (stdin: string op
     runProcess "dotnet" ([ "fsi"; "--nologo" ] @ arguments) workingDirectory [] stdin 180000
 
 let createTempDir (prefix: string) =
+    let rawBase =
+        if OperatingSystem.IsMacOS() then
+            let tempPath = Path.GetTempPath()
+
+            if tempPath.StartsWith("/var/", StringComparison.Ordinal) && Directory.Exists("/private" + tempPath) then
+                "/private" + tempPath
+            else
+                tempPath
+        else
+            Path.GetTempPath()
+
     let directory =
-        Path.Combine(Path.GetTempPath(), "fsion-tests", prefix + "-" + Guid.NewGuid().ToString("N"))
+        Path.Combine(rawBase, "fsion-tests", prefix + "-" + Guid.NewGuid().ToString("N"))
 
     Directory.CreateDirectory directory |> ignore
     directory
-
 let tryDeleteDirectory (directory: string) =
     try
         if Directory.Exists directory then

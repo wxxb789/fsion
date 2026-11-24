@@ -230,6 +230,37 @@ type IsolationTests(output: ITestOutputHelper) =
             Assert.True(metrics.ColdClaims >= 1, "expected at least one cold claim, got " + string metrics.ColdClaims))
 
     [<Fact>]
+    member _.``--pool-size reaches the auto-started daemon and zero disables warm sessions`` () =
+        withContext "isolation-pool-flag" (fun context _ ->
+            let warmup = context.Run([ "--pool-size"; "0"; "warmup" ], timeoutMs = 180000)
+            Assert.Equal(0, warmup.ExitCode)
+            Assert.Contains("warm=False", warmup.Stdout)
+
+            let before =
+                context.Metrics(30000)
+                |> Option.defaultWith (fun () -> failwith "fsiond did not answer GetMetrics")
+
+            Assert.Equal(0, before.PoolTarget)
+            Assert.Equal(0, before.PoolWarm)
+
+            let run = context.Run([ "--pool-size"; "0"; "-e"; "printfn \"flag-cold\"" ], timeoutMs = 180000)
+            Assert.Equal(0, run.ExitCode)
+
+            let after =
+                context.Metrics(30000)
+                |> Option.defaultWith (fun () -> failwith "fsiond did not answer GetMetrics")
+
+            Assert.Equal(0, after.PoolTarget)
+            Assert.True(
+                after.ColdClaims >= before.ColdClaims + 1,
+                "expected the flag run to claim cold, got " + string after.ColdClaims
+            )
+
+            let invalid = context.Run([ "--pool-size"; "-1"; "-e"; "()" ], timeoutMs = 30000)
+            Assert.Equal(1, invalid.ExitCode)
+            Assert.Contains("invalid --pool-size value", invalid.Stderr))
+
+    [<Fact>]
     member _.``spaced fresh scripts claim warm sessions without cold claims`` () =
         withContext "isolation-pool" (fun context _ ->
             let warmup = context.Run([ "warmup" ], timeoutMs = 180000)

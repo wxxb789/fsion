@@ -273,6 +273,35 @@ type IsolationTests(output: ITestOutputHelper) =
             Assert.Equal<string>(Array.sort expected, Array.sort actual))
 
     [<Fact>]
+    member _.``concurrent fsiond processes preserve every record in a shared log`` () =
+        withContext "shared-log" (fun _ directory ->
+            let path = Path.Combine(directory, "daemon.log")
+            let writers = 8
+            let messages = Array.init 64 (fun index -> $"invalid-{index}-" + String(char (65 + index % 26), 16000))
+            use start = new Barrier(writers)
+            let tasks =
+                Array.init writers (fun writer ->
+                    Task.Factory.StartNew(
+                        (fun () ->
+                            start.SignalAndWait()
+                            for index in writer .. writers .. messages.Length - 1 do
+                                let args = [ "--log"; path; messages.[index] ]
+                                let result = runProcess fsiondBinary args directory [] None 30000
+                                Assert.Equal(1, result.ExitCode)),
+                        TaskCreationOptions.LongRunning))
+            Task.WaitAll tasks
+
+            let actual = File.ReadAllLines path
+            Assert.Equal(messages.Length, actual.Length)
+            let prefix = " [error] invalid arguments: --log " + path + " "
+            let records =
+                actual |> Array.map (fun line ->
+                    let offset = line.IndexOf(prefix, StringComparison.Ordinal)
+                    Assert.True(offset > 0, "missing log record prefix")
+                    line.Substring(offset + prefix.Length))
+            Assert.Equal<string>(Array.sort messages, Array.sort records))
+
+    [<Fact>]
     member _.``pool size zero disables warm sessions and every run claims cold`` () =
         let poolDisabled = [ "FSION_POOL_SIZE", "0" ]
 

@@ -82,6 +82,35 @@ type RecoveryTests(output: ITestOutputHelper) =
             Assert.NotEqual(oldPid, newPid))
 
     [<Fact>]
+    member _.``a replacement daemon cold prelude does not inherit the wedged script environment`` () =
+        withContext "recovery-wedge-environment" (fun context directory ->
+            let cleanEnvironment = [ "FSION_WEDGE_LEAK", null ]
+            let prime = context.Run([ "--pool-size"; "0"; "-e"; "()" ], extraEnv = cleanEnvironment)
+            Assert.Equal(0, prime.ExitCode)
+            let oldPid = context.DaemonPid()
+            Assert.True(oldPid.IsSome, "daemon was not reported as running")
+
+            let wedge = """System.Environment.SetEnvironmentVariable("FSION_WEDGE_LEAK", "leaked"); while true do ()"""
+            let timed = context.Run([ "--timeout"; "1200"; "-e"; wedge ], extraEnv = cleanEnvironment)
+            Assert.Equal(124, timed.ExitCode)
+            Assert.True(processGone oldPid.Value 15000, "the drained daemon did not terminate")
+            let replacement = context.DaemonPid()
+            Assert.True(replacement.IsSome, "no replacement daemon appeared without a client auto-start")
+            Assert.NotEqual(oldPid, replacement)
+
+            writeFile directory "prelude.fsx"
+                """let wedgeProbe = System.Environment.GetEnvironmentVariable("FSION_WEDGE_LEAK") |> Option.ofObj"""
+            let prelude = Path.Combine(directory, "prelude.fsx")
+            let next =
+                context.Run(
+                    [ "--pool-size"; "0"; "--prelude"; prelude; "-e"; """System.Console.Write(defaultArg wedgeProbe "<null>")""" ],
+                    extraEnv = cleanEnvironment
+                )
+            Assert.True(next.ExitCode = 0, next.Stderr)
+            Assert.Equal(replacement, context.DaemonPid())
+            Assert.Equal("<null>", next.Stdout))
+
+    [<Fact>]
     member _.``client disconnect cancels a cooperative wait without retiring the daemon`` () =
         withContext "recovery-disconnect" (fun context directory ->
             let marker = Path.Combine(directory, "started.txt")

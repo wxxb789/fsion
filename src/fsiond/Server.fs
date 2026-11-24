@@ -178,7 +178,7 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
                        | None -> [])
 
                 try
-                    spawnDetached daemonPath arguments
+                    spawnDetachedWithEnvironment daemonPath arguments (session.RespawnEnvironment())
                     Log.info options.LogPath "spawned a replacement fsiond generation"
                 with ex ->
                     Log.error options.LogPath ("replacement spawn failed: " + ex.Message)

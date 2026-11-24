@@ -686,6 +686,9 @@ type private ProcessStateGate() =
                 applyEnvironment (readProcessEnvironment ()) daemonBaseline
                 currentEnvironment <- daemonBaseline)
 
+    member _.RespawnEnvironment() =
+        daemonBaseline |> Seq.map (fun (KeyValue(key, value)) -> key, value) |> Seq.toArray
+
     member _.IsQuiet(quietMs: int64) =
         lock sync (fun () -> activeRuns = 0 && Environment.TickCount64 - lastExit >= quietMs)
 
@@ -1380,6 +1383,8 @@ type SessionHost(options: SessionHostOptions) =
         failure
 
     member _.DesiredSpec = lock poolGate (fun () -> desiredSpec)
+
+    member _.RespawnEnvironment() = processState.RespawnEnvironment()
 
     member _.EnsureWarm(spec: Prelude.Spec) =
         if not options.Oneshot then

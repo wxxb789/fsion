@@ -180,7 +180,19 @@ type PreludeTests(output: ITestOutputHelper) =
                     )
 
                 Assert.True(result.ExitCode = 0, result.Stderr)
-                Assert.Equal("platform-config", result.Stdout))
+                Assert.Equal("platform-config", result.Stdout)
+
+                let homeFallback = Path.Combine(directory, "posix-home")
+                writeFile homeFallback ".config/fsion/prelude.fsx" "let homePreludeValue = \"posix-home-config\"\n"
+                let homeResult =
+                    context.Run(
+                        [ "-e"; "System.Console.Write(homePreludeValue)" ],
+                        timeoutMs = 120000,
+                        extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", null; "HOME", homeFallback ]
+                    )
+
+                Assert.True(homeResult.ExitCode = 0, homeResult.Stderr)
+                Assert.Equal("posix-home-config", homeResult.Stdout))
 
     [<Fact>]
     member _.``prelude resolution prefers the flag, then the environment, then the config directory`` () =
@@ -427,10 +439,12 @@ type PreludeTests(output: ITestOutputHelper) =
             let releasePath = Path.Combine(directory, "prelude-release.txt")
             let callerEnteredPath = Path.Combine(directory, "caller-entered.txt")
             let callerReleasePath = Path.Combine(directory, "caller-release.txt")
+            let callerSubdir = Path.Combine(directory, "caller-cwd")
+            Directory.CreateDirectory callerSubdir |> ignore
 
             let slowPrelude =
                 sprintf
-                    "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\nlet capturedProbe = match System.Environment.GetEnvironmentVariable(\"FSION_REPLENISH_PROBE\") with null -> \"unset\" | v -> v\n"
+                    "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\nlet capturedProbe = (match System.Environment.GetEnvironmentVariable(\"FSION_REPLENISH_PROBE\") with null -> \"unset\" | v -> v) + \"|\" + System.IO.Directory.GetCurrentDirectory()\n"
                     enteredPath
                     releasePath
 
@@ -453,26 +467,34 @@ type PreludeTests(output: ITestOutputHelper) =
 
             let concurrentBuiltin =
                 System.Threading.Tasks.Task.Run(fun () ->
-                    context.Run(
-                        [ "--pool-size"; "1"; "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20; System.Console.Write(System.Environment.GetEnvironmentVariable(\"FSION_REPLENISH_PROBE\"))" callerEnteredPath callerReleasePath ],
-                        timeoutMs = 120000,
-                        extraEnv = [ "FSION_REPLENISH_PROBE", "leaked" ]
-                    ))
+                    runProcess
+                        Fsion.Tests.TestInfra.fsionBinary
+                        [ "--pool-size"; "1"; "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20; System.Console.Write(System.Environment.GetEnvironmentVariable(\"FSION_REPLENISH_PROBE\"))" callerEnteredPath callerReleasePath ]
+                        callerSubdir
+                        (context.Environment @ [ "FSION_REPLENISH_PROBE", "leaked" ])
+                        None
+                        120000)
 
-            waitFor "concurrent request entered while file prelude was evaluating" (fun () -> File.Exists callerEnteredPath)
+            System.Threading.Thread.Sleep 200
+            Assert.False(File.Exists callerEnteredPath, "concurrent request entered ProcessStateGate while file prelude was evaluating")
 
             writeFile directory "prelude-release.txt" "go"
+            let warmDone = triggerReplenish.GetAwaiter().GetResult()
+            Assert.True(warmDone.ExitCode = 0, warmDone.Stderr)
+
+            waitFor "concurrent request entered after file prelude exited" (fun () -> File.Exists callerEnteredPath)
             writeFile directory "caller-release.txt" "go"
             let builtinDone = concurrentBuiltin.GetAwaiter().GetResult()
             Assert.True(builtinDone.ExitCode = 0, builtinDone.Stderr)
             Assert.Equal("leaked", builtinDone.Stdout)
 
-            let warmDone = triggerReplenish.GetAwaiter().GetResult()
-            Assert.True(warmDone.ExitCode = 0, warmDone.Stderr)
+            let daemonDirResult = context.Run([ "--pool-size"; "1"; "-e"; "System.Console.Write(System.AppContext.BaseDirectory.TrimEnd('\\\\', '/'))" ], timeoutMs = 60000)
+            Assert.True(daemonDirResult.ExitCode = 0, daemonDirResult.Stderr)
             let checkClean =
                 context.Run([ "--pool-size"; "1"; "--prelude"; preludePath; "-e"; "System.Console.Write(capturedProbe)" ], timeoutMs = 60000)
             Assert.True(checkClean.ExitCode = 0, checkClean.Stderr)
-            Assert.Equal("unset", checkClean.Stdout)
+            Assert.StartsWith("unset|", checkClean.Stdout)
+            Assert.DoesNotContain("caller-cwd", checkClean.Stdout)
 
             let failEntered = Path.Combine(directory, "fail-entered.txt")
             let failRelease = Path.Combine(directory, "fail-release.txt")
@@ -502,4 +524,28 @@ type PreludeTests(output: ITestOutputHelper) =
             let v2Run =
                 context.Run([ "--pool-size"; "1"; "--prelude"; preludePath; "-e"; "System.Console.Write(fixedVersion())" ], timeoutMs = 60000)
             Assert.True(v2Run.ExitCode = 0, v2Run.Stderr)
-            Assert.Equal("v2-ok", v2Run.Stdout))
+            Assert.Equal("v2-ok", v2Run.Stdout)
+
+            let subProject = Path.Combine(directory, "sub-project")
+            let relConfig = Path.Combine(subProject, ".fsion-rel")
+            writeFile relConfig "prelude.fsx" "let relPrelude () = \"rel-ok\"\n"
+            let relEnv = context.Environment @ [ "FSION_CONFIG_DIR", ".fsion-rel"; "FSION_PRELUDE", null ]
+            let relWarm =
+                runProcess
+                    Fsion.Tests.TestInfra.fsionBinary
+                    [ "--pool-size"; "1"; "warmup" ]
+                    subProject
+                    relEnv
+                    None
+                    120000
+            Assert.True(relWarm.ExitCode = 0, relWarm.Stderr)
+            let relRun =
+                runProcess
+                    Fsion.Tests.TestInfra.fsionBinary
+                    [ "--pool-size"; "1"; "-e"; "System.Console.Write(relPrelude())" ]
+                    subProject
+                    relEnv
+                    None
+                    60000
+            Assert.True(relRun.ExitCode = 0, relRun.Stderr)
+            Assert.Equal("rel-ok", relRun.Stdout))

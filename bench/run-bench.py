@@ -18,6 +18,7 @@ See bench/data.json for the workload, environment, and runner definitions.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import datetime as _datetime
 import hashlib
 import json
@@ -44,6 +45,35 @@ WORKLOAD_HELLO = "hello"
 WORKLOAD_TYPICAL = "typical"
 WORKLOAD_DIVERSE = "diverse"
 
+def _windows_roaming_appdata() -> Path | None:
+    if os.name != "nt":
+        return None
+    from ctypes import wintypes
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    folder_id = _GUID(
+        0x3EB685DB,
+        0x65F9,
+        0x4CF6,
+        (ctypes.c_ubyte * 8)(0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D),
+    )
+    out = ctypes.c_wchar_p()
+    hr = ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None, ctypes.byref(out))
+    try:
+        if hr == 0 and out.value:
+            return Path(out.value)
+    finally:
+        if out.value:
+            ctypes.windll.ole32.CoTaskMemFree(out)
+    fallback = os.environ.get("APPDATA", "")
+    return Path(fallback) if fallback else None
 
 def _read_data() -> dict:
     with open(DATA_FILE, "r", encoding="utf-8") as handle:
@@ -726,13 +756,12 @@ def main(argv: list[str]) -> int:
         raise SystemExit(f"could not allocate a fresh run-<salt> directory under {parent_dir}")
 
     if os.name == "nt":
-        roaming_dir = Path(os.environ.get("APPDATA", ""))
+        roaming_dir = _windows_roaming_appdata()
         default_prelude = roaming_dir / "fsion" / "prelude.fsx" if roaming_dir else None
         if default_prelude and default_prelude.exists():
             raise SystemExit(
                 f"default user prelude {default_prelude} exists; move it aside before running the default-path benchmark"
             )
-
     base_env = dict(os.environ)
     base_env.pop("FSION_PRELUDE", None)
     base_env.pop("FSION_POOL_SIZE", None)

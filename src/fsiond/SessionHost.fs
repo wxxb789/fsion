@@ -656,8 +656,8 @@ type private ProcessStateGate() =
     let sync = obj ()
     let daemonDirectory = Directory.GetCurrentDirectory()
     let mutable activeRuns = 0
-    let mutable nonBaselineEpochNumber = 0L
-    let mutable baselineEpoch = true
+    let mutable activeFilePreludes = 0
+    let mutable activeFilePreludeNeedsBaselineCwd = 0
     let mutable lastExit = Environment.TickCount64
     let mutable currentDirectory = daemonDirectory
     let daemonBaseline = readProcessEnvironment ()
@@ -676,9 +676,22 @@ type private ProcessStateGate() =
             match candidate.TryGetValue key with
             | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
             | _ -> false))
+
+    let matchesBaselineArray (environment: (string * string)[]) =
+        environment.Length = daemonBaseline.Count
+        && (environment |> Array.forall (fun (key, value) ->
+            match daemonBaseline.TryGetValue key with
+            | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
+            | _ -> false))
+
     member _.Enter(directory: string, environment: (string * string)[]) =
         lock sync (fun () ->
-            while activeRuns > 0 && (currentDirectory <> directory || not (matchesEnvironment environment)) do
+            let envIsBaseline = matchesBaselineArray environment
+            let cwdIsBaseline = String.Equals(directory, daemonDirectory, StringComparison.Ordinal)
+
+            while (activeRuns > 0 && (currentDirectory <> directory || not (matchesEnvironment environment)))
+                  || (activeFilePreludes > 0 && not envIsBaseline)
+                  || (activeFilePreludeNeedsBaselineCwd > 0 && not cwdIsBaseline) do
                 Monitor.Wait sync |> ignore
 
             if activeRuns = 0 then
@@ -686,14 +699,13 @@ type private ProcessStateGate() =
                     Directory.SetCurrentDirectory directory
                     currentDirectory <- directory
 
-                if not (matchesEnvironment environment) then
-                    currentEnvironment <- environmentMap environment
+                if activeFilePreludes = 0 then
+                    if not (matchesEnvironment environment) then
+                        currentEnvironment <- environmentMap environment
 
-                // Script code can mutate process variables without updating the cached request map.
-                applyEnvironment (readProcessEnvironment ()) currentEnvironment
-                baselineEpoch <- matchesBaseline daemonBaseline currentEnvironment
-                if not baselineEpoch then
-                    nonBaselineEpochNumber <- nonBaselineEpochNumber + 1L
+                    // Script code can mutate process variables without updating the cached request map.
+                    applyEnvironment (readProcessEnvironment ()) currentEnvironment
+
             activeRuns <- activeRuns + 1)
 
     member _.Exit() =
@@ -706,26 +718,62 @@ type private ProcessStateGate() =
                 currentDirectory <- daemonDirectory
                 Monitor.PulseAll sync)
 
-    member _.EnsureBaselineWhenIdle() =
+    member _.EnterFilePreludeBlocking(needsBaselineCwd: bool) =
         lock sync (fun () ->
-            if activeRuns = 0 then
+            while activeRuns > 0
+                  && (not (matchesBaseline daemonBaseline currentEnvironment)
+                      || (needsBaselineCwd && not (String.Equals(currentDirectory, daemonDirectory, StringComparison.Ordinal)))) do
+                Monitor.Wait sync |> ignore
+
+            if activeRuns = 0 && activeFilePreludes = 0 then
                 if currentDirectory <> daemonDirectory then
                     Directory.SetCurrentDirectory daemonDirectory
                     currentDirectory <- daemonDirectory
                 applyEnvironment (readProcessEnvironment ()) daemonBaseline
                 currentEnvironment <- daemonBaseline
-                baselineEpoch <- true
-                ValueSome nonBaselineEpochNumber
-            elif baselineEpoch then
-                ValueSome nonBaselineEpochNumber
-            else
-                ValueNone)
 
-    member _.UnchangedSinceBaseline(stamp: int64 voption) =
-        match stamp with
-        | ValueNone -> false
-        | ValueSome expected ->
-            lock sync (fun () -> (activeRuns = 0 || baselineEpoch) && nonBaselineEpochNumber = expected)
+            activeFilePreludes <- activeFilePreludes + 1
+            if needsBaselineCwd then
+                activeFilePreludeNeedsBaselineCwd <- activeFilePreludeNeedsBaselineCwd + 1)
+
+    member _.TryEnterFilePrelude(needsBaselineCwd: bool) =
+        lock sync (fun () ->
+            if activeRuns = 0 then
+                if activeFilePreludes = 0 then
+                    if currentDirectory <> daemonDirectory then
+                        Directory.SetCurrentDirectory daemonDirectory
+                        currentDirectory <- daemonDirectory
+                    applyEnvironment (readProcessEnvironment ()) daemonBaseline
+                    currentEnvironment <- daemonBaseline
+                activeFilePreludes <- activeFilePreludes + 1
+                if needsBaselineCwd then
+                    activeFilePreludeNeedsBaselineCwd <- activeFilePreludeNeedsBaselineCwd + 1
+                true
+            elif matchesBaseline daemonBaseline currentEnvironment
+                 && (not needsBaselineCwd || String.Equals(currentDirectory, daemonDirectory, StringComparison.Ordinal)) then
+                activeFilePreludes <- activeFilePreludes + 1
+                if needsBaselineCwd then
+                    activeFilePreludeNeedsBaselineCwd <- activeFilePreludeNeedsBaselineCwd + 1
+                true
+            else
+                false)
+
+    member _.ExitFilePrelude(needsBaselineCwd: bool) =
+        lock sync (fun () ->
+            activeFilePreludes <- activeFilePreludes - 1
+            if needsBaselineCwd then
+                activeFilePreludeNeedsBaselineCwd <- activeFilePreludeNeedsBaselineCwd - 1
+            if activeFilePreludes = 0 || (needsBaselineCwd && activeFilePreludeNeedsBaselineCwd = 0) then
+                Monitor.PulseAll sync)
+
+    member _.EnsureBaselineWhenIdle() =
+        lock sync (fun () ->
+            if activeRuns = 0 && activeFilePreludes = 0 then
+                if currentDirectory <> daemonDirectory then
+                    Directory.SetCurrentDirectory daemonDirectory
+                    currentDirectory <- daemonDirectory
+                applyEnvironment (readProcessEnvironment ()) daemonBaseline
+                currentEnvironment <- daemonBaseline)
     member _.RespawnEnvironment() =
         daemonBaseline |> Seq.map (fun (KeyValue(key, value)) -> key, value) |> Seq.toArray
 
@@ -759,6 +807,20 @@ type SessionHost(options: SessionHostOptions) =
     let coldClaims = ref 0
     let executed = ref 0
     let logDetail message = options.LogPath |> Option.iter (fun _ -> Log.info options.LogPath message)
+    let mayObserveProcessWorkingDirectory (source: string) =
+        source.IndexOf("GetCurrentDirectory", StringComparison.Ordinal) >= 0
+        || source.IndexOf("CurrentDirectory", StringComparison.Ordinal) >= 0
+        || source.IndexOf("Fsion.cwd", StringComparison.Ordinal) >= 0
+        || source.IndexOf("Fsion.path", StringComparison.Ordinal) >= 0
+        || source.IndexOf("GetFullPath", StringComparison.Ordinal) >= 0
+        || source.IndexOf("FileInfo", StringComparison.Ordinal) >= 0
+        || source.IndexOf("DirectoryInfo", StringComparison.Ordinal) >= 0
+        || source.IndexOf("#load", StringComparison.Ordinal) >= 0
+
+    let filePreludeNeedsBaselineCwd (path: string) =
+        match Prelude.readAndHashFile path with
+        | Some (text, _) -> mayObserveProcessWorkingDirectory text
+        | None -> false
 
     let evaluateUserPrelude (session: FsiEvaluationSession) (path: string) : Prelude.Tag * string =
         match Prelude.readAndHashFile path with
@@ -811,8 +873,8 @@ type SessionHost(options: SessionHostOptions) =
 
     let releaseSession = releaseSessionWith ValueNone
 
-    let createWarmSession (spec: Prelude.Spec) : WarmSession * int64 voption =
-        let baselineStamp = processState.EnsureBaselineWhenIdle()
+    let createWarmSession (spec: Prelude.Spec) : WarmSession =
+        processState.EnsureBaselineWhenIdle()
         let processExitBefore = processExitSnapshot ()
         let unmanagedDllBefore = unmanagedDllSnapshot ()
         let assemblyResolveBefore = assemblyResolveSnapshot ()
@@ -896,12 +958,11 @@ type SessionHost(options: SessionHostOptions) =
                 for assembly in session.DynamicAssemblies do
                     warm.PreludeTypes.UnionWith(assembly.GetTypes())
             succeeded <- true
-            warm, baselineStamp
+            warm
         finally
             if not succeeded then
                 releaseSession warm
                 replenishSignal.Release() |> ignore
-
     let tagOfSpec spec = Prelude.tagOfSpec spec
 
     let discard = ConcurrentQueue<WarmSession>()
@@ -961,7 +1022,16 @@ type SessionHost(options: SessionHostOptions) =
                         Interlocked.Increment(&coldClaims.contents) |> ignore
                         let attemptedTag = tagOfSpec slot.Spec
                         try
-                            let warm, _ = createWarmSession slot.Spec
+                            let warm =
+                                match slot.Spec with
+                                | Prelude.Spec.File path ->
+                                    let needsCwd = filePreludeNeedsBaselineCwd path
+                                    processState.EnterFilePreludeBlocking needsCwd
+                                    try
+                                        createWarmSession slot.Spec
+                                    finally
+                                        processState.ExitFilePrelude needsCwd
+                                | _ -> createWarmSession slot.Spec
                             let currentTag = tagOfSpec slot.Spec
                             lock poolGate (fun () ->
                                 if refreshTagWith currentTag slot = warm.Prelude then
@@ -1356,54 +1426,66 @@ type SessionHost(options: SessionHostOptions) =
             let mutable filling = targetPoolSize > 0
             while filling
                   && Volatile.Read(&claimWaiters) = 0
-                  && (Volatile.Read(&ensureWarmActive) > 0 || processState.IsQuiet 250L)
-                  && creationGate.Wait 0 do
-                try
-                    let next =
-                        let snapshot = lock poolGate (fun () -> pools.ToArray())
-                        let tags = [| for candidate in snapshot -> candidate, tagOfSpec candidate.Spec |]
-                        lock poolGate (fun () ->
-                            for candidate, tag in tags do
-                                if pools.Contains candidate then
-                                    refreshTagWith tag candidate |> ignore
-                            pools
-                            |> Seq.rev
-                            |> Seq.filter (fun slot -> slot.Failure.IsNone && slot.Warm.Count < targetPoolSize)
-                            |> Seq.sortBy (fun slot -> slot.Warm.Count)
-                            |> Seq.tryHead
-                            |> Option.map (fun slot -> slot, slot.Tag))
-                    match next with
-                    | None -> filling <- false
-                    | Some (slot, attemptedTag) ->
-                        let canReplenish =
-                            match slot.Spec with
-                            | Prelude.Spec.File _ -> ValueOption.isSome (processState.EnsureBaselineWhenIdle())
-                            | _ -> true
-                        if not canReplenish then
-                            filling <- false
-                        else
-                            try
-                                let warm, baselineStamp = createWarmSession slot.Spec
-                                let untainted =
-                                    match slot.Spec with
-                                    | Prelude.Spec.File _ -> processState.UnchangedSinceBaseline baselineStamp
-                                    | _ -> true
-                                if processState.IsQuiet 250L then
-                                    GC.Collect(1, GCCollectionMode.Optimized, false)
-                                let currentTag = tagOfSpec slot.Spec
-                                lock poolGate (fun () ->
-                                    if untainted && pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
-                                        slot.Warm.Enqueue warm
-                                    else
-                                        discard.Enqueue warm)
-                            with ex ->
-                                Log.error options.LogPath ("replenisher could not create a warm session: " + ex.Message)
-                                let currentTag = tagOfSpec slot.Spec
-                                lock poolGate (fun () ->
-                                    if pools.Contains slot && refreshTagWith currentTag slot = attemptedTag then
-                                        slot.Failure <- Some ex.Message)
-                finally
-                    creationGate.Release() |> ignore
+                  && (Volatile.Read(&ensureWarmActive) > 0 || processState.IsQuiet 250L) do
+                let next =
+                    let snapshot = lock poolGate (fun () -> pools.ToArray())
+                    let tags =
+                        [| for candidate in snapshot do
+                               let needsCheck =
+                                   lock poolGate (fun () ->
+                                       pools.Contains candidate
+                                       && candidate.Failure.IsNone
+                                       && candidate.Warm.Count < targetPoolSize)
+                               if needsCheck then
+                                   yield candidate, tagOfSpec candidate.Spec |]
+                    lock poolGate (fun () ->
+                        for candidate, tag in tags do
+                            if pools.Contains candidate then
+                                refreshTagWith tag candidate |> ignore
+                        pools
+                        |> Seq.rev
+                        |> Seq.filter (fun slot -> slot.Failure.IsNone && slot.Warm.Count < targetPoolSize)
+                        |> Seq.sortBy (fun slot -> slot.Warm.Count)
+                        |> Seq.tryHead
+                        |> Option.map (fun slot -> slot, slot.Tag))
+                match next with
+                | None -> filling <- false
+                | Some (slot, attemptedTag) ->
+                    if not (creationGate.Wait 0) then
+                        filling <- false
+                    else
+                        try
+                            let entered =
+                                match slot.Spec with
+                                | Prelude.Spec.File path ->
+                                    let needsCwd = filePreludeNeedsBaselineCwd path
+                                    if processState.TryEnterFilePrelude needsCwd then ValueSome(true, needsCwd) else ValueNone
+                                | _ -> ValueSome(false, false)
+                            match entered with
+                            | ValueNone -> filling <- false
+                            | ValueSome(isFile, needsCwd) ->
+                                try
+                                    try
+                                        let warm = createWarmSession slot.Spec
+                                        if processState.IsQuiet 250L then
+                                            GC.Collect(1, GCCollectionMode.Optimized, false)
+                                        let currentTag = tagOfSpec slot.Spec
+                                        lock poolGate (fun () ->
+                                            if pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
+                                                slot.Warm.Enqueue warm
+                                            else
+                                                discard.Enqueue warm)
+                                    with ex ->
+                                        Log.error options.LogPath ("replenisher could not create a warm session: " + ex.Message)
+                                        let currentTag = tagOfSpec slot.Spec
+                                        lock poolGate (fun () ->
+                                            if pools.Contains slot && refreshTagWith currentTag slot = attemptedTag then
+                                                slot.Failure <- Some ex.Message)
+                                finally
+                                    if isFile then
+                                        processState.ExitFilePrelude needsCwd
+                        finally
+                            creationGate.Release() |> ignore
                 drainDiscarded ()
                 drainCleanups ()
 
@@ -1435,7 +1517,11 @@ type SessionHost(options: SessionHostOptions) =
             retained <- nextRetained
         if not retained then
             failwith "requested prelude pool was evicted during warmup"
-        failure
+        match failure with
+        | Some message -> Some message
+        | None when count < targetPoolSize ->
+            Some("timed out waiting for warm session pool to fill within " + string timeoutMs + " ms")
+        | None -> None
 
     member _.DesiredSpec = lock poolGate (fun () -> desiredSpec)
 
@@ -1456,16 +1542,25 @@ type SessionHost(options: SessionHostOptions) =
                     Interlocked.Decrement(&ensureWarmActive) |> ignore
             else
                 match spec with
-                | Prelude.Spec.File _ ->
+                | Prelude.Spec.File path ->
                     creationGate.Wait()
                     try
-                        createWarmSession spec |> fst |> releaseSession
+                        let needsCwd = filePreludeNeedsBaselineCwd path
+                        processState.EnterFilePreludeBlocking needsCwd
+                        try
+                            createWarmSession spec |> releaseSession
+                        finally
+                            processState.ExitFilePrelude needsCwd
                     finally
                         creationGate.Release() |> ignore
                     replenishSignal.Release() |> ignore
                 | _ -> ()
 
-    member _.IsWarm = poolCount () > 0
+    member _.IsWarm =
+        lock poolGate (fun () ->
+            match pools |> Seq.tryFind (fun slot -> slot.Spec = desiredSpec) with
+            | Some slot -> slot.Warm.Count > 0
+            | None -> false)
 
     member _.ExecutedCount = executed.Value
 

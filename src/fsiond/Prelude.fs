@@ -71,7 +71,7 @@ let specOfRequest (request: ExecuteRequest) : Spec =
     elif request.PreludePath.IsSome then
         Spec.File(normalizePath request.PreludePath.Value)
     else
-        match PreludeConfig.userPreludePathForEnvironment request.Environment with
+        match PreludeConfig.userPreludePathForEnvironment request.WorkingDirectory request.Environment with
         | Some path -> Spec.File(normalizePath path)
         | None -> Spec.Builtin
 
@@ -81,6 +81,4 @@ let specOfOptions (preludePath: string option) (noPrelude: bool) : Spec =
     elif preludePath.IsSome then
         Spec.File(normalizePath preludePath.Value)
     else
-        match PreludeConfig.userPreludePath () with
-        | Some path -> Spec.File(normalizePath path)
-        | None -> Spec.Builtin
+        Spec.Builtin

@@ -4,7 +4,7 @@ Contract: [0006-hot-path-and-burst-resilience.md](../goals/archive/0006-hot-path
 Implementation choices: [2026-11-24-goal-0006-implementation-choices.md](../plans/2026-11-24-goal-0006-implementation-choices.md)
 Campaign: [benchmark report](0006-benchmark-report.md) and [raw results](0006-benchmark-results.json)
 
-**Status: COMPLETE.** Both full suites passed all five black-box clauses and all regression controls (`85/85` per TFM), the Round 6 Windows `win-x64` package (`DefaultPoolSize = 4`) passed all six fresh-temp smoke checks, and the packaged benchmark (`--phase-samples 12 --require-goal0006`, salt `f75ae763`) exited `0` with all nine Goal 0006 thresholds passing (`9/9 PASS`). `hello` (`45.3 ms` vs `47.0 ms`) beat `bun` outright and `diverse` (`47.5 ms` vs `47.3 ms`) matched `bun`; the separate historical AC-07 strict `typical <= 1.00x bun` criterion remains `FAIL` (`65.1 ms` vs `48.4 ms`, `1.344x`).
+**Status: COMPLETE.** Both full suites passed all five black-box clauses and all regression controls (`85/85` per TFM), the Round 7 Windows `win-x64` package (`DefaultPoolSize = 4`) passed all six fresh-temp smoke checks, and the packaged benchmark (`--phase-samples 12 --require-goal0006`, salt `e576d5cf`) exited `0` with all nine Goal 0006 thresholds passing (`9/9 PASS`). `hello` (`46.8 ms` vs `48.0 ms`) beat `bun` outright and `diverse` (`49.2 ms` vs `48.0 ms`) stayed within `1.2 ms` of `bun`; the separate historical AC-07 strict `typical <= 1.00x bun` criterion remains `FAIL` (`69.2 ms` vs `49.0 ms`, `1.412x`).
 
 ## Contract Amendment Disclosure
 
@@ -20,30 +20,30 @@ The [handle-count control](#handle-count-control) records the observed counterex
 
 ## Environment and commands
 
-Host: `CPC-lhan-XF3D0M`, Windows 11 build 26300, AMD64, .NET SDK 11.0.100. Shipping candidate: Round 6 on `feat/goal-0006-hot-path-and-burst-resilience`. Commands ran serially from `Q:/repos/fsion`.
+Host: `CPC-lhan-XF3D0M`, Windows 11 build 26300, AMD64, .NET SDK 11.0.100. Shipping candidate: Round 7 on `feat/goal-0006-hot-path-and-burst-resilience`. Commands ran serially from `Q:/repos/fsion`.
 
 | ID | Command | Exit | Evidence |
 |---|---|---:|---|
 | G | `pwsh -NoProfile -File eng/gate.ps1` | 0 | `GATE PASSED` (0 warnings, 0 errors; `85/85` passed on `net10.0` and `85/85` passed on `net11.0`; 67 paths LF-clean). |
 | P | `pwsh -NoProfile -File eng/package.ps1 -Framework net10.0` | 0 | `PACKAGE OK`; all six smoke operations passed: warmup, file execution, exit 7 passthrough, exit 1 JSON diagnostic, stop, and status after stop. |
-| B | `FSION_BINARY=Q:/repos/fsion/artifacts/package/fsion-win-x64-net10.0/fsion.exe FSIOND_PATH=Q:/repos/fsion/artifacts/package/fsion-win-x64-net10.0/fsiond.exe python bench/run-bench.py --phase-samples 12 --require-goal0006` | 0 | Salt `f75ae763`: 30 measured rounds (+3 warmup) across `hello`, `typical`, `diverse` with 100% byte-for-byte stdout parity across all 5 runners, 12-script zero-gap burst (`0` cold claims, `0` alive disposed sessions), 12 logged phase samples, and `9/9` Goal 0006 thresholds `PASS`. |
+| B | `FSION_BINARY=Q:/repos/fsion/artifacts/package/fsion-win-x64-net10.0/fsion.exe FSIOND_PATH=Q:/repos/fsion/artifacts/package/fsion-win-x64-net10.0/fsiond.exe python bench/run-bench.py --phase-samples 12 --require-goal0006` | 0 | Salt `e576d5cf`: 30 measured rounds (+3 warmup) across `hello`, `typical`, `diverse` with 100% byte-for-byte stdout parity across all 5 runners, 12-script zero-gap burst (`0` cold claims, `0` alive disposed sessions), 12 logged phase samples, and `9/9` Goal 0006 thresholds `PASS`. |
 
 | G step | Observed outcome |
 |---|---|
 | Release build, both TFMs | 0 warnings, 0 errors |
 | NativeAOT publish, both TFMs | Both clients published under `artifacts/publish/fsion/`; no AOT or trim warnings reported |
-| `net10.0` CLI/IPC suite | 85 passed, 0 failed, 0 skipped (13 m 32 s) |
+| `net10.0` CLI/IPC suite | 85 passed, 0 failed, 0 skipped (13 m 29 s) |
 | `net11.0` CLI/IPC suite | 85 passed, 0 failed, 0 skipped (12 m 48 s) |
 | LF check | 67 tracked and 67 non-ignored paths clean at gate time |
 
-The new ZIP and package directory match byte-for-byte for `fsion.exe`, `fsiond.exe`, and `fsiond.dll`. The packaged client also matches G's `net10.0` client. These fingerprints identify the smoke-tested and benchmarked Round 6 shipping package:
+The new ZIP and package directory match byte-for-byte for `fsion.exe`, `fsiond.exe`, and `fsiond.dll`. The packaged client also matches G's `net10.0` client. These fingerprints identify the smoke-tested and benchmarked Round 7 shipping package:
 
 | Package file | SHA-256 |
 |---|---|
-| `fsion-win-x64-net10.0.zip` | `1473493b472c91e7117bcabcde4ef86669379609a240d96d9858ed0ce05488e0` |
-| `fsion.exe` | `e98a040ed9ef5b6545177dd2e47abc4a4eb10e2ec5108d17e0e5066a1124aae7` |
-| `fsiond.exe` | `ba169a94f03f259d89ac507f62f34024d574dd40add508ba0a2f53d268623e13` |
-| `fsiond.dll` | `36b4632a2667410a312384fa0a985ae54c59e9a2dd41d233b5b3289a7ad389ad` |
+| `fsion-win-x64-net10.0.zip` | `4169331e8927ea66330432dcedb37de03dd8bb5194b57aefc6e1cc20125e354d` |
+| `fsion.exe` | `eedc046aedfba26add3b932ce730330e781b376f8048911ed89b2843a64d8554` |
+| `fsiond.exe` | `0eff141590083cf4a41ea7d4e82b85345dfe7b8471a52cee51df5f0bd555100b` |
+| `fsiond.dll` | `cb9dc3bf001caefa7e1e21df8b94c7e84591a7ec14aa5505c4eb095d868238c8` |
 
 ## Clause verification
 
@@ -86,25 +86,25 @@ A private Windows daemon with `--pool-size 0` collected after a leaking turn wit
 
 The carried-forward base run (salt `1c1e642f`, exit 0) used the upgraded default-path harness on pre-change binaries, all five runners, 30 measured rounds after 3 warmups, and byte parity. The campaigns used the repo-local `bench/.work/` carrier, fresh source each round, a private endpoint, and default config lookup without setting `FSION_CONFIG_DIR` (POSIX sets an empty `XDG_CONFIG_HOME`, while Windows verifies `%APPDATA%\fsion\prelude.fsx` is absent so `Environment.GetFolderPath` runs cleanly).
 
-Baseline (salt `1c1e642f`) vs final Round 6 packaged shipping candidate (salt `f75ae763`, `--require-goal0006` exit `0`) median / p95 / max in ms. Full per-round details live in the [generated report](0006-benchmark-report.md) and [raw results](0006-benchmark-results.json).
+Baseline (salt `1c1e642f`) vs final Round 7 packaged shipping candidate (salt `e576d5cf`, `--require-goal0006` exit `0`) median / p95 / max in ms. Full per-round details live in the [generated report](0006-benchmark-report.md) and [raw results](0006-benchmark-results.json).
 
-| Workload | Runner | Baseline (`1c1e642f`) | Shipping (`f75ae763`) | Goal 0006 threshold & verdict |
+| Workload | Runner | Baseline (`1c1e642f`) | Shipping (`e576d5cf`) | Goal 0006 threshold & verdict |
 |---|---|---:|---:|---|
-| hello | `fsion` | 65.4 / 115.0 / 149.6 | **45.3** / 191.8 / 199.5 | `63.59x` over FSI (`>= 50x`), `-1.64 ms` / `0.965x` vs `bun` (`<= 3 ms` or `<= 1.05x`) — **PASS** |
-| hello | `bun` | 52.1 / 205.1 / 226.5 | 47.0 / 50.7 / 56.0 | reference |
-| hello | `dotnet fsi` | 3192.5 / 3827.1 / 3858.6 | 2883.5 / 3183.5 / 3381.3 | reference |
-| typical | `fsion` | 84.9 / 242.9 / 278.6 | **65.1** / 452.4 / 470.0 | `46.85x` over FSI (`>= 40x`), `< 84.9 ms` baseline — **PASS** |
-| typical | `bun` | 52.4 / 70.2 / 114.6 | 48.4 / 57.9 / 67.3 | reference (strict AC-07 `<= 1.00x`: `1.344x` — FAIL) |
-| typical | `dotnet fsi` | 3412.5 / 3704.9 / 4430.7 | 3049.2 / 3476.6 / 4179.5 | reference |
-| diverse | `fsion` | 75.6 / 166.0 / 307.3 | **47.5** / 57.4 / 58.5 | `63.40x` over FSI (`>= 40x`), `< 75.6 ms` baseline (`1.004x` vs `bun`) — **PASS** |
-| diverse | `bun` | 53.3 / 138.4 / 216.5 | 47.3 / 184.8 / 191.9 | reference |
-| diverse | `dotnet fsi` | 3322.1 / 3825.1 / 3921.4 | 3009.8 / 3215.2 / 3540.7 | reference |
-| burst (12 zero-gap) | `fsion` | 109.9 / 2366.2 / 2366.2 | **67.4** / 79.8 / **79.8** | `1.036x` spaced `typical` (`<= 1.25x`), max `< 750 ms`, `ColdClaims` delta `0`, `AliveDisposedSessions = 0` — **PASS** |
-| burst (12 zero-gap) | `bun` | 55.5 / 60.5 / 60.5 | 48.2 / 204.5 / 204.5 | reference |
+| hello | `fsion` | 65.4 / 115.0 / 149.6 | **46.8** / 52.9 / 191.2 | `62.13x` over FSI (`>= 50x`), `-1.19 ms` / `0.975x` vs `bun` (`<= 3 ms` or `<= 1.05x`) — **PASS** |
+| hello | `bun` | 52.1 / 205.1 / 226.5 | 48.0 / 193.7 / 195.9 | reference |
+| hello | `dotnet fsi` | 3192.5 / 3827.1 / 3858.6 | 2906.7 / 5509.4 / 6960.6 | reference |
+| typical | `fsion` | 84.9 / 242.9 / 278.6 | **69.2** / 432.4 / 573.8 | `43.89x` over FSI (`>= 40x`), `< 84.9 ms` baseline — **PASS** |
+| typical | `bun` | 52.4 / 70.2 / 114.6 | 49.0 / 178.2 / 208.8 | reference (strict AC-07 `<= 1.00x`: `1.412x` — FAIL) |
+| typical | `dotnet fsi` | 3412.5 / 3704.9 / 4430.7 | 3038.8 / 3400.2 / 3674.3 | reference |
+| diverse | `fsion` | 75.6 / 166.0 / 307.3 | **49.2** / 136.2 / 180.0 | `61.68x` over FSI (`>= 40x`), `< 75.6 ms` baseline (`1.025x` vs `bun`) — **PASS** |
+| diverse | `bun` | 53.3 / 138.4 / 216.5 | 48.0 / 52.7 / 56.6 | reference |
+| diverse | `dotnet fsi` | 3322.1 / 3825.1 / 3921.4 | 3036.4 / 3618.3 / 4400.3 | reference |
+| burst (12 zero-gap) | `fsion` | 109.9 / 2366.2 / 2366.2 | **70.1** / 87.1 / **87.1** | `1.013x` spaced `typical` (`<= 1.25x`), max `< 750 ms`, `ColdClaims` delta `0`, `AliveDisposedSessions = 0` — **PASS** |
+| burst (12 zero-gap) | `bun` | 55.5 / 60.5 / 60.5 | 51.4 / 65.9 / 65.9 | reference |
 
-Separate `typical` phase probe (`n = 12`, daemon logging enabled on an isolated endpoint): wall median `90.9 ms` (`Client + IPC = 34.9 ms`, `Daemon gate/release = 10.5 ms`, `FCS compile + exec = 38.7 ms`).
+Separate `typical` phase probe (`n = 12`, daemon logging enabled on an isolated endpoint): wall median `100.5 ms` (`Client + IPC = 37.7 ms`, `Daemon gate/release = 12.7 ms`, `FCS compile + exec = 50.5 ms`).
 
-Equal-capacity (`--pool-size 12`) burst control on pre-change base `c14f60c` (salt `74c8d67f`, same `bench/run-bench.py` pre-warming 12 sessions on packaged `c14f60c` binaries): `c14f60c` recorded **172.3 ms** burst median and **334.2 ms** max (`142.2, 147.7, 146.9, 162.8, 194.2, 334.2, 189.5, 195.7, 114.1, 183.5, 181.8, 151.1 ms` due to unconditional per-turn Gen-2 collection and client/IPC overhead), whereas the shipping build achieves **67.4 ms** burst median (`79.8 ms` max, **2.56x faster** at identical `poolTarget = 12`), isolating the per-run hot-path and GC improvements from pool capacity.
+Equal-capacity (`--pool-size 12`) burst control on pre-change base `c14f60c` (salt `74c8d67f`, same `bench/run-bench.py` pre-warming 12 sessions on packaged `c14f60c` binaries): `c14f60c` recorded **172.3 ms** burst median and **334.2 ms** max (`142.2, 147.7, 146.9, 162.8, 194.2, 334.2, 189.5, 195.7, 114.1, 183.5, 181.8, 151.1 ms` due to unconditional per-turn Gen-2 collection and client/IPC overhead), whereas the shipping build achieves **70.1 ms** burst median (`87.1 ms` max, **2.46x faster** at identical `poolTarget = 12`), isolating the per-run hot-path and GC improvements from pool capacity.
 
 ### Review rounds & verification history
 
@@ -113,7 +113,8 @@ Equal-capacity (`--pool-size 12`) burst control on pre-change base `c14f60c` (sa
 - Round 3 (`5f685ce`): passed clean baseline environment explicitly to wedged-respawn replacements (`F1`), expanded the full 5-item Contract Amendment Disclosure (`F2`), guarded `Fsiond.Log` appends with a path-keyed cross-process `Mutex` (`F3`), and passed Windows and Ubuntu CI (`82/82` per TFM), while `macos-latest` arm64 CI flagged `DefaultPoolSize = 12` exceeding Goal 0002's `< 400 MiB` post-GC heap bound (`513.6–546.9 MiB`).
 - Round 4 (`e155582`): lowered production `DefaultPoolSize` to `4` (passing all three OS CI jobs including `macos-latest` arm64) while `bench/run-bench.py` pre-warms `--pool-size 12`.
 - Round 5 (`21eab44`): addressed Round 4 PR review findings — hashed file preludes outside `poolGate`, routed stale pool discards through deferred `enqueueCleanup`, restored `Environment.UserName` in `Ipc.defaultEndpointName`, restored `FxResolver.ClearStaticCaches` inside `clearCheckerCaches`, tightened `--require-goal0006` to require all 5 runners and `--phase-samples >= 1`, and preserved `docs/goals/archive/0006-hot-path-and-burst-resilience.md` untouched at its archived `3fcc0a7` state.
-- Round 6 (shipping candidate): addressed Round 5 `ghc/gpt-6.2-sol` review findings — isolated background file-prelude replenishment from concurrent non-baseline request environments via `ProcessStateGate` `nonBaselineEpochNumber` epoch stamping, bound prelude creation failures to the exact `attemptedTag` so stale errors cannot block a fixed prelude, restored Windows `Environment.GetFolderPath` config/cache semantics while resolving implicit user preludes inside `fsiond` (keeping the NativeAOT `fsion` thin client off Win32 shell-folder calls on the default path), passed `eng/gate.ps1` (`85/85` per TFM) and `eng/package.ps1 -Framework net10.0`, and passed `python bench/run-bench.py --phase-samples 12 --require-goal0006` (`9/9 PASS`, salt `f75ae763`).
+- Round 6 (`73bc848`): addressed Round 5 `ghc/gpt-6.2-sol` review findings — isolated background file-prelude replenishment from concurrent non-baseline request environments, bound prelude creation failures to the exact `attemptedTag` so stale errors cannot block a fixed prelude, restored Windows `Environment.GetFolderPath` config/cache semantics while resolving implicit user preludes inside `fsiond` (`85/85` per TFM, salt `f75ae763`, `9/9 PASS`).
+- Round 7 (shipping candidate): addressed Round 6 `ghc/gpt-6.2-sol` and `deepseek-v4.1-flash-fast` findings — anchored relative `FSION_CONFIG_DIR` paths to `request.WorkingDirectory`, tracked `activeFilePreludes` / `activeFilePreludeNeedsBaselineCwd` in `ProcessStateGate` so file preludes stay isolated from concurrent non-baseline `cwd`/env mutations while preserving single-producer empty-pool handoffs, eliminated daemon-env drift in `Prelude.specOfOptions(None, false)`, failed `waitForWarm` / `IsWarm` strictly against `desiredSpec`, hashed only non-full pools outside `creationGate`, unified POSIX `HOME/.config` fallback across Linux/macOS, queried Win32 `SHGetKnownFolderPath(FOLDERID_RoamingAppData)` in `bench/run-bench.py`, passed `eng/gate.ps1` (`85/85` per TFM) and `eng/package.ps1 -Framework net10.0`, and passed `python bench/run-bench.py --phase-samples 12 --require-goal0006` (`9/9 PASS`, salt `e576d5cf`).
 
 ### Diagnostic campaigns before acceptance
 

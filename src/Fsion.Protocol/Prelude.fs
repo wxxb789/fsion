@@ -37,7 +37,7 @@ let private cachedWindowsApplicationData =
 let private cachedPosixApplicationData =
     lazy (Environment.GetFolderPath Environment.SpecialFolder.ApplicationData)
 
-let userPreludePathFrom (lookup: string -> string option) : string option =
+let userPreludePathFrom (workingDirectory: string option) (lookup: string -> string option) : string option =
     let configDirectory =
         match lookup ConfigDirectoryEnvironmentVariable with
         | Some directory -> directory
@@ -50,22 +50,27 @@ let userPreludePathFrom (lookup: string -> string option) : string option =
                     | Some directory -> directory
                     | None ->
                         match lookup "HOME" with
-                        | Some directory when OperatingSystem.IsMacOS() ->
-                            Path.Combine(directory, "Library", "Application Support")
                         | Some directory -> Path.Combine(directory, ".config")
                         | None -> cachedPosixApplicationData.Value
 
             Path.Combine(home, "fsion")
 
-    let candidate = Path.GetFullPath(Path.Combine(configDirectory, "prelude.fsx"))
+    let resolvedConfigDirectory =
+        if Path.IsPathRooted configDirectory then
+            configDirectory
+        else
+            match workingDirectory with
+            | Some baseDir when baseDir.Length > 0 -> Path.Combine(baseDir, configDirectory)
+            | _ -> configDirectory
+
+    let candidate = Path.GetFullPath(Path.Combine(resolvedConfigDirectory, "prelude.fsx"))
 
     if File.Exists candidate then Some candidate else None
 
-let userPreludePath () : string option = userPreludePathFrom environment
+let userPreludePath () : string option = userPreludePathFrom None environment
 
-let userPreludePathForEnvironment (snapshot: (string * string)[]) : string option =
-    userPreludePathFrom (mapValue snapshot)
-
+let userPreludePathForEnvironment (workingDirectory: string) (snapshot: (string * string)[]) : string option =
+    userPreludePathFrom (Some workingDirectory) (mapValue snapshot)
 let cacheDirectory () : string =
     match environment CacheDirectoryEnvironmentVariable with
     | Some directory -> directory

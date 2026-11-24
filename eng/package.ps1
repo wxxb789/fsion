@@ -155,9 +155,9 @@ Invoke-DotnetPublish "dotnet publish src/fsion -c Release -f $Framework -r $Runt
     '-c', 'Release', '-f', $Framework, '-r', $Runtime, '-o', $stage
 )
 
-Invoke-DotnetPublish "dotnet publish src/fsiond -c Release -f $Framework -r $Runtime (framework-dependent)" @(
+Invoke-DotnetPublish "dotnet publish src/fsiond -c Release -f $Framework -r $Runtime (framework-dependent ReadyToRun)" @(
     'publish', (Join-Path $repoRoot 'src/fsiond/fsiond.fsproj'),
-    '-c', 'Release', '-f', $Framework, '-r', $Runtime, '--self-contained', 'false', '-o', $stage
+    '-c', 'Release', '-f', $Framework, '-r', $Runtime, '--self-contained', 'false', '-p:PublishReadyToRun=true', '-o', $stage
 )
 
 Get-ChildItem -LiteralPath $stage -Filter '*.pdb' | Remove-Item -Force

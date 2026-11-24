@@ -23,11 +23,15 @@ import json
 import math
 import os
 import platform
+import re
 import secrets
 import shutil
+import socket
 import statistics
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -37,6 +41,7 @@ DATA_FILE = BENCH_DIR / "data.json"
 
 WORKLOAD_HELLO = "hello"
 WORKLOAD_TYPICAL = "typical"
+WORKLOAD_DIVERSE = "diverse"
 
 
 def _read_data() -> dict:
@@ -119,6 +124,8 @@ def _typical_rows(data: dict, nonce: str, seed: int) -> list[dict]:
 def _expected_output(workload: str, nonce: str, seed: int, domain: str, rows: list[dict]) -> str:
     if workload == WORKLOAD_HELLO:
         return f"hello {nonce} {seed * 2 + 7}\n"
+    if workload == WORKLOAD_DIVERSE:
+        return f"diverse {nonce} {seed * 2 + 7}\n"
     ordered = sorted((row for row in rows if row["active"]), key=lambda row: (-row["score"], row["name"]))
     lines = [f"domain={domain}"]
     lines.extend(f"{row['name']}|{row['score']}" for row in ordered)
@@ -225,7 +232,40 @@ def _python_source(workload: str, nonce: str, seed: int, rows: list[dict]) -> st
     )
 
 
+def _diverse_source(ext: str, nonce: str, seed: int) -> str:
+    variant = (int(nonce.split("-")[0][1:]) - 1) % 4
+    if ext == "fsx":
+        setup = (
+            'type Input = { Value: int }\ntype Operation = | Twice of Input | Identity of int\n'
+            'let op = Twice { Value = seed }\n'
+            'let value = match op with Twice { Value = n } -> n * 2 + 7 | Identity n -> n',
+            'let value = [|seed; seed; 7|] |> Array.map id |> Seq.sum',
+            'let value = try if seed > 0 then failwith "positive" else seed with _ -> seed * 2 + 7',
+            'let value = System.Text.StringBuilder().Append(seed * 2).Append(" ").Append(7).ToString().Split()\n'
+            '            |> Array.sumBy int',
+        )[variant]
+        return f'let seed = {seed}\n{setup}\nSystem.Console.Out.Write(sprintf "diverse {nonce} %d\\n" value)\n'
+    if ext == "py":
+        setup = (
+            'op = ("twice", {"value": seed})\nmatch op:\n    case ("twice", {"value": n}): value = n * 2 + 7\n    case (_, n): value = n',
+            'value = sum(map(lambda n: n, [seed, seed, 7]))',
+            'try:\n    if seed > 0: raise ValueError("positive")\n    value = seed\nexcept ValueError:\n    value = seed * 2 + 7',
+            'value = sum(map(int, " ".join([str(seed * 2), str(7)]).split()))',
+        )[variant]
+        return f'import sys\nseed = {seed}\n{setup}\nsys.stdout.buffer.write(f"diverse {nonce} {{value}}\\n".encode())\n'
+    setup = (
+        'const op = { kind: "twice", input: { value: seed } };\n'
+        'const value = op.kind === "twice" ? op.input.value * 2 + 7 : op.input.value;',
+        'const value = [seed, seed, 7].map(n => n).reduce((a, b) => a + b, 0);',
+        'let value; try { if (seed > 0) throw new Error("positive"); value = seed; } catch { value = seed * 2 + 7; }',
+        'const value = [String(seed * 2), String(7)].join(" ").split(" ").reduce((a, b) => a + Number(b), 0);',
+    )[variant]
+    return f'const seed = {seed};\n{setup}\nprocess.stdout.write(`diverse {nonce} ${{value}}\\n`);\n'
+
+
 def _render_source(runner: Runner, workload: str, nonce: str, seed: int, rows: list[dict]) -> str:
+    if workload == WORKLOAD_DIVERSE:
+        return _diverse_source(runner.ext, nonce, seed)
     if runner.ext == "fsx":
         return _fsharp_source(workload, nonce, seed, rows)
     if runner.kind == "node":
@@ -264,6 +304,122 @@ def _run_command(command: list[str], work_dir: Path, env: dict, timeout: float) 
 
 def _run_once(runner: Runner, script: Path, work_dir: Path, env: dict, timeout: float) -> dict:
     return _run_command(runner.command + [str(script)], work_dir, env, timeout)
+
+
+def _read_metrics(endpoint: str, env: dict, timeout: float) -> dict:
+    request = struct.pack("<iiB", 5, 4, 5)
+
+    def read_response(stream) -> tuple:
+        def read_exact(size: int) -> bytes:
+            data = bytearray()
+            while len(data) < size:
+                chunk = stream.read(size - len(data))
+                if not chunk:
+                    raise EOFError("daemon closed the metrics response")
+                data.extend(chunk)
+            return bytes(data)
+
+        stream.write(request)
+        size, = struct.unpack("<i", read_exact(4))
+        fmt = "<iBiiiiqiii"
+        if size != struct.calcsize(fmt):
+            raise ValueError(f"unexpected metrics response size: {size}")
+        version, kind, *metrics = struct.unpack(fmt, read_exact(size))
+        if (version, kind) != (4, 16):
+            raise ValueError(f"unexpected metrics response: {version}/{kind}")
+        return metrics
+
+    if os.name == "nt":
+        with open(r"\\.\pipe" + "\\" + endpoint, "r+b", buffering=0) as stream:
+            metrics = read_response(stream)
+    else:
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(timeout)
+            directory = Path(env.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+            path = directory / (endpoint + ".sock")
+            if len(os.fsencode(path)) > 100:
+                if len(os.fsencode(directory / "fsion-0123456789abcdef.sock")) > 100:
+                    directory = Path("/tmp")
+                name_hash = hashlib.sha256(endpoint.encode()).hexdigest()[:16]
+                path = directory / f"fsion-{name_hash}.sock"
+            connection.connect(str(path))
+            with connection.makefile("rwb", buffering=0) as stream:
+                metrics = read_response(stream)
+    return dict(zip(("poolTarget", "poolWarm", "coldClaims", "executed", "managedHeapBytes",
+                     "scriptAssemblies", "aliveDisposedSessions", "namedSessions"), metrics))
+
+
+def _burst(runners: list[Runner], data: dict, work_dir: Path, env: dict, timeout: float, salt: str) -> dict:
+    plans = []
+    for index in range(1, data["burstRuns"] + 1):
+        nonce, seed = _nonce(salt, index, "burst")
+        rows = _typical_rows(data, nonce, seed)
+        expected = _expected_output(WORKLOAD_TYPICAL, nonce, seed, data["env"]["BENCH_DOMAIN"], rows).encode()
+        scripts = {
+            runner.id: _write_script(work_dir, f"burst-{index:02d}.{runner.ext}",
+                                     _render_source(runner, WORKLOAD_TYPICAL, nonce, seed, rows))
+            for runner in runners
+        }
+        plans.append((nonce, expected, scripts))
+
+    before = _read_metrics(env["FSION_PIPE"], env, timeout)
+    if not before["poolTarget"] or before["poolWarm"] != before["poolTarget"]:
+        raise SystemExit(f"burst requires a full warm pool, got {before}")
+    bursts = {}
+    for runner in runners:
+        values = []
+        for nonce, expected, scripts in plans:
+            result = _run_once(runner, scripts[runner.id], work_dir, env, timeout)
+            if result["exit"] != 0 or result["stdout"] != expected:
+                raise SystemExit(f"burst {runner.id} {nonce}: exit={result['exit']}, {result['stderr']!r}")
+            values.append(result["ms"])
+        bursts[runner.id] = {"individualMs": values, **_stats(values)}
+
+    time.sleep(0.75)
+    after = _read_metrics(env["FSION_PIPE"], env, timeout)
+    if after["executed"] - before["executed"] != len(plans):
+        raise SystemExit("burst execution count mismatch")
+    return {
+        "runners": bursts,
+        "nonces": [nonce for nonce, _, _ in plans],
+        "outputSha256": [hashlib.sha256(expected).hexdigest() for _, expected, _ in plans],
+        "coldClaimsDelta": after["coldClaims"] - before["coldClaims"],
+        "before": before,
+        "after": after,
+    }
+
+
+def _measure_phases(runner: Runner, data: dict, directory: Path, env: dict, timeout: float, salt: str, samples: int) -> dict:
+    log = directory / "phases.log"
+    env = dict(env, FSIOND_LOG=str(log), FSION_PIPE=env["FSION_PIPE"] + "-phases")
+    command = runner.command
+    details = []
+    try:
+        warmup = _run_command(command + ["warmup"], directory, env, timeout)
+        if warmup["exit"] != 0 or b"warm=True" not in warmup["stdout"]:
+            raise SystemExit(f"phase warmup failed: {warmup['stderr']!r}")
+        for index in range(1, samples + 1):
+            nonce, seed = _nonce(salt, index, "phases")
+            rows = _typical_rows(data, nonce, seed)
+            script = _write_script(directory, f"phases-{index:02}.fsx", _fsharp_source(WORKLOAD_TYPICAL, nonce, seed, rows))
+            result = _run_once(runner, script, directory, env, timeout)
+            expected = _expected_output(WORKLOAD_TYPICAL, nonce, seed, data["env"]["BENCH_DOMAIN"], rows).encode()
+            if result["exit"] != 0 or result["stdout"] != expected:
+                raise SystemExit(f"phase parity failed: {nonce} {result['stderr']!r}")
+            details.append({"nonce": nonce, "wallMs": result["ms"]})
+            _read_metrics(env["FSION_PIPE"], env, timeout)
+    finally:
+        _run_command(command + ["daemon", "stop"], directory, env, timeout)
+    trace = log.read_text(encoding="utf-8")
+    evaluate = re.findall(r"run-phases evalMs=([\d.]+)", trace)
+    daemon = re.findall(r"executed exit=0 .* daemonMs=([\d.]+)", trace)
+    if len(evaluate) != samples or len(daemon) != samples:
+        raise SystemExit(f"expected {samples} phase observations; got {len(evaluate)} eval and {len(daemon)} daemon")
+    for row, eval_ms, daemon_ms in zip(details, map(float, evaluate), map(float, daemon)):
+        row.update(fcsMs=eval_ms, daemonGateReleaseMs=daemon_ms - eval_ms, clientIpcMs=row["wallMs"] - daemon_ms)
+    medians = {key: statistics.median(row[key] for row in details)
+               for key in ("wallMs", "fcsMs", "daemonGateReleaseMs", "clientIpcMs")}
+    return {"samples": details, "medians": medians}
 
 
 def _percentile(sorted_values: list[float], fraction: float) -> float:
@@ -326,7 +482,7 @@ def _write_text(path: Path, text: str) -> None:
 def _report_markdown(results: dict) -> str:
     lines: list[str] = []
     env = results["environment"]
-    lines.append("# Goal 0005 — Unseen-Script Benchmark Report")
+    lines.append("# Goal 0006 — Unseen-Script Benchmark Report")
     lines.append("")
     lines.append(
         "Generated by `python bench/run-bench.py` on the Windows development host. "
@@ -422,6 +578,31 @@ def _report_markdown(results: dict) -> str:
                 + (f" — {', '.join(_fmt_ms(value) for value in outliers)}" if outliers else "")
             )
             lines.append("")
+    if results["burst"]:
+        burst = results["burst"]
+        lines.extend(["## Zero-gap burst", "", "| Runner | Individual ms | Median | p95 | Max |",
+                      "|---|---|---|---|---|"])
+        for runner, stats in burst["runners"].items():
+            samples = ", ".join(map(_fmt_ms, stats["individualMs"]))
+            lines.append(f"| {runner} | {samples} | {stats['median']:.1f} | {stats['p95']:.1f} | {stats['max']:.1f} |")
+        lines.extend(["", f"ColdClaims delta: {burst['coldClaimsDelta']}; "
+                      f"post-idle AliveDisposedSessions: {burst['after']['aliveDisposedSessions']}.", ""])
+    if results["phases"]:
+        phases = results["phases"]
+        lines.extend(["## Typical phase probe", "",
+                      "Separate spaced runs with daemon logging enabled; not part of the benchmark aggregates.",
+                      "FCS includes evaluation bookkeeping. Daemon gate/release includes worker scheduling and claim; "
+                      "client + IPC is the residual from process wall time minus the daemon's execution interval.", "",
+                      "| Wall | Client + IPC | Daemon gate/release | FCS compile + exec | n |",
+                      "|---|---|---|---|---|"])
+        values = " | ".join(_fmt_ms(phases["medians"][key])
+                            for key in ("wallMs", "clientIpcMs", "daemonGateReleaseMs", "fcsMs"))
+        lines.extend([f"| {values} | {len(phases['samples'])} |", ""])
+    if results["goal0006"]:
+        lines.extend(["## Goal 0006 thresholds", ""])
+        for label, (actual, limit, passed) in results["goal0006"].items():
+            lines.append(f"- {label}: {actual:.3f} ({limit}) — {'PASS' if passed else 'FAIL'}")
+        lines.append("")
     lines.append("## AC-07 Verdict")
     lines.append("")
     verdicts = results["ac07"]["verdicts"]
@@ -447,13 +628,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--rounds", type=int, default=None, help="measured rounds (default from bench/data.json)")
     parser.add_argument("--warmup", type=int, default=None, help="warmup rounds whose timings are discarded")
     parser.add_argument("--tfm", default=None, help="fsion/fsiond target framework (default net10.0)")
-    parser.add_argument("--workloads", default="hello,typical", help="comma-separated workloads")
+    parser.add_argument("--workloads", default="hello,typical,diverse", help="comma-separated workloads")
     parser.add_argument("--runners", default=None, help="comma-separated runner ids (default: all present)")
-    parser.add_argument("--report", default=str(REPO_ROOT / "docs" / "evidence" / "0005-benchmark-report.md"))
+    parser.add_argument("--report", default=str(REPO_ROOT / "docs" / "evidence" / "0006-benchmark-report.md"))
     parser.add_argument(
-        "--results", default=str(REPO_ROOT / "docs" / "evidence" / "0005-benchmark-results.json")
+        "--results", default=str(REPO_ROOT / "docs" / "evidence" / "0006-benchmark-results.json")
     )
     parser.add_argument("--timeout", type=float, default=120.0, help="per-run timeout in seconds")
+    parser.add_argument("--phase-samples", type=int, default=0, help="separate spaced typical runs with daemon phase logging")
     parser.add_argument("--require-ac07", action="store_true", help="exit non-zero when a measured threshold fails")
     parser.add_argument("--keep", action="store_true", help="keep the generated script directory")
     parser.add_argument(
@@ -479,8 +661,8 @@ def main(argv: list[str]) -> int:
     for workload in workloads:
         if workload not in data["workloads"]:
             raise SystemExit(f"unknown workload: {workload} (bench/data.json defines {data['workloads']})")
-    if rounds < 1 or warmup_rounds < 0:
-        raise SystemExit("--rounds must be >= 1 and --warmup >= 0")
+    if rounds < 1 or warmup_rounds < 0 or args.phase_samples < 0:
+        raise SystemExit("--rounds must be >= 1, --warmup and --phase-samples must be >= 0")
 
     fsion_path = _fsion_binary(tfm)
     fsiond_path = _fsiond_binary(tfm)
@@ -537,10 +719,12 @@ def main(argv: list[str]) -> int:
     base_env = dict(os.environ)
     base_env.pop("FSION_PRELUDE", None)
     base_env.pop("FSION_POOL_SIZE", None)
+    base_env.pop("FSIOND_LOG", None)
     base_env.update(data["env"])
     base_env["FSION_PIPE"] = f"fsion-bench-{salt}"
     base_env["FSIOND_PATH"] = str(fsiond_path)
-    base_env["FSION_CONFIG_DIR"] = str(config_dir)
+    base_env.pop("FSION_CONFIG_DIR", None)
+    base_env["APPDATA" if os.name == "nt" else "XDG_CONFIG_HOME"] = str(config_dir)
 
     present = [runner.id for runner in runners]
     print(f"benchmark salt {salt}; runners: {', '.join(present)}")
@@ -556,6 +740,8 @@ def main(argv: list[str]) -> int:
     }
     fsion_per_round: dict[str, list[float]] = {workload: [] for workload in workloads}
     measured = 0
+    burst = None
+    phases = None
 
     try:
         warmup = _run_command([fsion_runner.command[0], "warmup"], work_dir, base_env, args.timeout)
@@ -623,6 +809,14 @@ def main(argv: list[str]) -> int:
                             if runner != "fsion"
                         )
                     )
+        burst_runners = [runner for runner in runners if runner.id in ("fsion", "bun")]
+        if WORKLOAD_TYPICAL in workloads and len(burst_runners) == 2:
+            burst = _burst(burst_runners, data, work_dir, base_env, args.timeout, salt)
+        if args.phase_samples:
+            shutdown = _run_command(fsion_runner.command + ["daemon", "stop"], work_dir, base_env, args.timeout)
+            if shutdown["exit"] != 0:
+                raise SystemExit(f"benchmark daemon did not stop: {shutdown['stderr']!r}")
+            phases = _measure_phases(fsion_runner, data, work_dir, base_env, args.timeout, salt, args.phase_samples)
     finally:
         try:
             subprocess.run(
@@ -670,8 +864,36 @@ def main(argv: list[str]) -> int:
             }
         )
 
+    thresholds = {}
+    baselines = {WORKLOAD_TYPICAL: 84.9, WORKLOAD_DIVERSE: 75.6}
+    for name in (WORKLOAD_HELLO, WORKLOAD_TYPICAL, WORKLOAD_DIVERSE):
+        stats = aggregates.get(name, {})
+        if "fsion" not in stats:
+            continue
+        median = stats["fsion"]["median"]
+        if "dotnet-fsi" in stats:
+            speedup = stats["dotnet-fsi"]["median"] / median
+            limit = 50 if name == WORKLOAD_HELLO else 40
+            thresholds[f"{name} FSI speedup"] = (speedup, f">= {limit}x", speedup >= limit)
+        if name == WORKLOAD_HELLO and "bun" in stats:
+            bun = stats["bun"]["median"]
+            thresholds["hello fsion minus bun ms"] = (median - bun, "<= 3 ms or <= 1.05x bun", median <= max(bun + 3, 1.05 * bun))
+        if name in baselines:
+            baseline = baselines[name]
+            thresholds[f"{name} fsion median ms"] = (median, f"< {baseline} ms", median < baseline)
+    if burst:
+        ratio = burst["runners"]["fsion"]["median"] / typical["fsion"]["median"]
+        maximum = burst["runners"]["fsion"]["max"]
+        alive = burst["after"]["aliveDisposedSessions"]
+        thresholds["burst median vs spaced typical"] = (ratio, "<= 1.25x", ratio <= 1.25)
+        thresholds["burst max ms"] = (maximum, "< 750 ms", maximum < 750)
+        thresholds["burst alive disposed"] = (alive, "zero", alive == 0)
+
     results = {
-        "schema": 1,
+        "schema": 2,
+        "burst": burst,
+        "phases": phases,
+        "goal0006": thresholds,
         "startedAt": started_at,
         "finishedAt": _datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "salt": salt,

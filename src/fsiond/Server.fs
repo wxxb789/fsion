@@ -56,6 +56,7 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
 
                 let started = Stopwatch.GetTimestamp()
                 let report = hooks.Execute request disconnects.Token
+                let daemonMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
 
                 if report.Wedged then
                     hooks.Retire ()
@@ -85,6 +86,9 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
                      + string report.Outcome.TimedOut
                      + " wedged="
                      + string report.Wedged
+                     + (if options.Oneshot then " totalExecuted=" + string (hooks.Status().Executed) else "")
+                     + " daemonMs="
+                     + daemonMs.ToString("F3", CultureInfo.InvariantCulture)
                      + " elapsedMs="
                      + string (int elapsedMs))
 
@@ -110,6 +114,8 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
         new SessionHost(
             { PoolSize = options.PoolSize
               SessionTtlMinutes = options.SessionTtlMinutes
+              Oneshot = options.Oneshot
+              LogPath = options.LogPath
               Prelude = options.Prelude }
         )
 

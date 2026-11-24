@@ -57,7 +57,7 @@ let private usage =
     + "  --reset               discard the named session before this run (requires --session)\n"
     + "  --session-ttl <min>   auto-started daemon named-session idle TTL (env: FSION_SESSION_TTL_MINUTES, default 15)\n"
     + "  --pool-size <n>       warm session pool size for the auto-started daemon; 0 disables warm sessions\n"
-    + "                        (env: FSION_POOL_SIZE, default 3)\n"
+    + "                        (env: FSION_POOL_SIZE, default " + string DefaultPoolSize + ")\n"
     + "  --timeout <ms>        cancel after this deadline; scripts observe fsionFsiState.CancellationToken; exit 124\n"
     + "  --prelude <path>      evaluate this prelude.fsx in warm sessions (env: FSION_PRELUDE)\n"
     + "  --no-prelude          do not load the Fsion module or the user prelude\n"
@@ -265,8 +265,8 @@ let private daemonArguments
         match sessionTtlMinutes with
         | Some minutes -> [ "--session-ttl"; minutes.ToString(CultureInfo.InvariantCulture) ]
         | None -> []
-    let poolArguments =
-        [ "--pool-size"; (resolvePoolSize options).ToString(CultureInfo.InvariantCulture) ]
+    let poolSize = if idleTtlMinutes.IsNone then 1 else resolvePoolSize options
+    let poolArguments = [ "--pool-size"; poolSize.ToString(CultureInfo.InvariantCulture) ]
     let preludeArguments =
         if options.NoPrelude then
             [ "--no-prelude" ]
@@ -414,6 +414,19 @@ let private writeJsonResult (elapsedMs: float) (result: ExecutionResult) =
     writer.WriteEndObject()
     writer.Flush()
 
+let private redirectBoth = lazy (Console.IsOutputRedirected && Console.IsErrorRedirected)
+
+let private consoleWriter openStream defaultWriter =
+    if redirectBoth.Value then
+        let writer = new StreamWriter(openStream (), UTF8Encoding(false), leaveOpen = true)
+        writer.AutoFlush <- true
+        writer :> TextWriter
+    else
+        defaultWriter ()
+
+let private standardOut = lazy (consoleWriter Console.OpenStandardOutput (fun () -> Console.Out))
+let private standardError = lazy (consoleWriter Console.OpenStandardError (fun () -> Console.Error))
+
 let private emitFailure (options: Options) (elapsedMs: float) (message: string) : int =
     if options.Json then
         writeJsonResult
@@ -424,8 +437,8 @@ let private emitFailure (options: Options) (elapsedMs: float) (message: string) 
               Diagnostics = [||]
               TimedOut = false }
     else
-        Console.Error.Write("fsion: " + message + Environment.NewLine)
-        Console.Error.Flush()
+        standardError.Value.Write("fsion: " + message + Environment.NewLine)
+        standardError.Value.Flush()
 
     1
 
@@ -436,13 +449,13 @@ let private emit (options: Options) (elapsedMs: float) (response: Response) : in
             writeJsonResult elapsedMs result
         else
             if result.StandardOut.Length > 0 then
-                Console.Out.Write result.StandardOut
+                standardOut.Value.Write result.StandardOut
 
             if result.StandardError.Length > 0 then
-                Console.Error.Write result.StandardError
+                standardError.Value.Write result.StandardError
 
-            Console.Out.Flush()
-            Console.Error.Flush()
+            standardOut.Value.Flush()
+            standardError.Value.Flush()
 
         result.ExitCode
     | Failure message -> emitFailure options elapsedMs message
@@ -498,16 +511,16 @@ let private runWarmup (options: Options) (endpoint: Endpoint) : int =
         | Delivered Pong ->
             match fetchStatus endpoint with
             | Some status ->
-                Console.Out.Write($"fsiond ready (pid={status.Pid}, endpoint={status.Endpoint}, warm={status.Warm})" + Environment.NewLine)
+                standardOut.Value.Write($"fsiond ready (pid={status.Pid}, endpoint={status.Endpoint}, warm={status.Warm})" + Environment.NewLine)
                 0
             | None ->
-                Console.Out.Write("fsiond ready" + Environment.NewLine)
+                standardOut.Value.Write("fsiond ready" + Environment.NewLine)
                 0
         | Delivered (Failure message) ->
-            Console.Error.Write("fsion: " + message + Environment.NewLine)
+            standardError.Value.Write("fsion: " + message + Environment.NewLine)
             1
         | _ ->
-            Console.Error.Write("fsion: fsiond did not answer the warmup ping" + Environment.NewLine)
+            standardError.Value.Write("fsion: fsiond did not answer the warmup ping" + Environment.NewLine)
             1
     finally
         stream.Dispose()
@@ -517,36 +530,36 @@ let rec private runDaemonCommand (options: Options) (endpoint: Endpoint) (input:
     | DaemonStatus ->
         match fetchStatus endpoint with
         | Some status ->
-            Console.Out.Write(statusLine status + Environment.NewLine)
+            standardOut.Value.Write(statusLine status + Environment.NewLine)
             0
         | None ->
-            Console.Out.Write("fsiond not running (endpoint " + endpoint.Name + ")" + Environment.NewLine)
+            standardOut.Value.Write("fsiond not running (endpoint " + endpoint.Name + ")" + Environment.NewLine)
             0
     | DaemonStart ->
         match fetchStatus endpoint with
         | Some status ->
-            Console.Out.Write($"fsiond already running (pid={status.Pid}, endpoint={status.Endpoint})" + Environment.NewLine)
+            standardOut.Value.Write($"fsiond already running (pid={status.Pid}, endpoint={status.Endpoint})" + Environment.NewLine)
             0
         | None ->
             let stream = ensureDaemon options endpoint
             stream.Dispose()
             match fetchStatus endpoint with
             | Some status ->
-                Console.Out.Write($"fsiond started (pid={status.Pid}, endpoint={status.Endpoint})" + Environment.NewLine)
+                standardOut.Value.Write($"fsiond started (pid={status.Pid}, endpoint={status.Endpoint})" + Environment.NewLine)
                 0
             | None ->
-                Console.Out.Write("fsiond started (endpoint " + endpoint.Name + ")" + Environment.NewLine)
+                standardOut.Value.Write("fsiond started (endpoint " + endpoint.Name + ")" + Environment.NewLine)
                 0
     | DaemonStop ->
         if stopDaemon endpoint then
-            Console.Out.Write($"fsiond stopped (endpoint {endpoint.Name})" + Environment.NewLine)
+            standardOut.Value.Write($"fsiond stopped (endpoint {endpoint.Name})" + Environment.NewLine)
             0
         else
-            Console.Error.Write($"fsion: fsiond did not stop within the timeout (endpoint {endpoint.Name})" + Environment.NewLine)
+            standardError.Value.Write($"fsion: fsiond did not stop within the timeout (endpoint {endpoint.Name})" + Environment.NewLine)
             1
     | DaemonRestart ->
         if not (stopDaemon endpoint) then
-            Console.Error.Write($"fsion: fsiond did not stop within the timeout (endpoint {endpoint.Name})" + Environment.NewLine)
+            standardError.Value.Write($"fsion: fsiond did not stop within the timeout (endpoint {endpoint.Name})" + Environment.NewLine)
             1
         else
             runDaemonCommand options endpoint DaemonStart
@@ -588,17 +601,18 @@ let private executeInput
 let main argv =
     let started = Stopwatch.StartNew()
 
-    try
-        Console.OutputEncoding <- UTF8Encoding(false)
-    with _ ->
-        ()
+    if not redirectBoth.Value then
+        try
+            Console.OutputEncoding <- UTF8Encoding(false)
+        with _ ->
+            ()
 
     let elapsedMs () = started.Elapsed.TotalMilliseconds
 
     match parse argv with
     | Error message ->
-        Console.Error.Write("fsion: " + message + Environment.NewLine + usage)
-        Console.Error.Flush()
+        standardError.Value.Write("fsion: " + message + Environment.NewLine + usage)
+        standardError.Value.Flush()
         1
     | Ok (options, input) ->
         let resolvedOptions =
@@ -625,12 +639,12 @@ let main argv =
 
                 match input with
                 | ShowHelp ->
-                    Console.Out.Write usage
-                    Console.Out.Flush()
+                    standardOut.Value.Write usage
+                    standardOut.Value.Flush()
                     0
                 | ShowVersion ->
-                    Console.Out.Write("fsion " + version + Environment.NewLine)
-                    Console.Out.Flush()
+                    standardOut.Value.Write("fsion " + version + Environment.NewLine)
+                    standardOut.Value.Flush()
                     0
                 | RunScript (path, args) ->
                     executeInput

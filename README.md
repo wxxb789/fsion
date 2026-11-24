@@ -14,53 +14,34 @@ bindings alive across agent turns.
 
 ## Measured performance
 
-Interleaved, byte-verified 30-round benchmark on the Windows development host
-(`CPC-lhan-XF3D0M`, AMD64, 64 GB, .NET SDK 11.0.100, bun 1.4.5, node v26.13.1,
-Python 3.15.2). Every round renders brand-new F# / TS / JS / Python source with a fresh
-nonce for both workloads, and a round's timings are recorded only after all runners
-produced byte-identical stdout. Full report and raw per-round data:
-[`docs/evidence/0005-benchmark-report.md`](docs/evidence/0005-benchmark-report.md),
-[`docs/evidence/0005-benchmark-results.json`](docs/evidence/0005-benchmark-results.json).
+Goal 0006 measured the Windows `win-x64` package on `CPC-lhan-XF3D0M`: 30 interleaved rounds
+per workload after three warmups. Every round generated fresh F# / TS / JS / Python source and
+verified byte-identical stdout across all five runners. The table shows process wall time in ms.
 
-`typical` workload (JSON parse + `BENCH_DOMAIN` + filter/sort + formatted stdout), ms per
-process invocation, n = 30:
+| Workload | `fsion` median / p95 | `dotnet fsi` median | `bun` median | `node` median | `python` median |
+|---|---:|---:|---:|---:|---:|
+| `hello` (formatted write) | **49.0 / 193.6** | 3059.0 | 53.6 | 76.2 | 48.1 |
+| `typical` (JSON parse, env, filter/sort, formatted stdout) | **69.6 / 548.4** | 3246.4 | 53.4 | 76.6 | 69.9 |
+| `diverse` (rotating F# constructs) | **50.3 / 76.5** | 3253.9 | 53.7 | 79.4 | 48.9 |
 
-| Runner | Median | Mean | Stdev | Min | p95 | Max | vs fsion median |
-|---|---|---|---|---|---|---|---|
-| `fsion` (warm pool, unseen script per round) | **71.8** | 73.6 | 5.6 | 67.9 | 85.5 | 92.9 | — |
-| `dotnet fsi` (fresh process per round) | 3023.3 | 3112.2 | 222.4 | 2955.8 | 3687.2 | 3897.5 | **42.1x slower** |
-| `bun` 1.4.5 (`bun run *.ts`) | 47.2 | 48.2 | 3.5 | 45.4 | 56.4 | 63.0 | 1.52x faster |
-| `node` v26.13.1 (`*.js`) | 71.2 | 73.0 | 7.0 | 67.9 | 85.4 | 103.8 | 1.01x faster |
-| `python` 3.15.2 (`*.py`) | 61.9 | 73.0 | 35.1 | 60.2 | 198.2 | 201.4 | 1.16x faster |
+`fsion` was 62.4x, 46.6x, and 64.6x faster than `dotnet fsi` at the median, respectively.
+It beat `bun` by 4.6 ms on `hello` but was 1.304x `bun` on `typical`, missing the separate
+AC-07 `<= 1.00x` criterion. A separate 12-sample logged `typical` probe measured medians of
+72.8 ms wall, 36.3 ms client + IPC, 7.9 ms daemon claim/gate/release, and 26.8 ms FCS
+compile + execution. The phase medians need not sum to the wall-time median.
 
-`hello` workload (single formatted write), median / p95, n = 30: `fsion` **54.4** / 95.8
-(`52.5x` faster than `dotnet fsi`), `dotnet fsi` 2857.1 / 3197.2, `bun` 46.3 / 66.8, `node`
-71.9 / 100.7, `python` 44.1 / 57.5.
+In the 12-script zero-gap burst, `fsion` measured 66.7 ms median and 215.9 ms max, down from
+109.9 ms and 2,366.2 ms on the same-harness baseline. The packaged daemon added zero cold
+claims and reported zero live disposed sessions after idle. The `bun` burst measured
+54.9 ms median and 188.9 ms max. All nine Goal 0006 thresholds passed.
 
-**AC-07 outcome on this host.** The `>= 20x` median speedup over `dotnet fsi` is met with
-wide margin (**42.1x** on `typical`, **52.5x** on `hello`), and warm `fsion` matches `node`
-(71.8 ms vs 71.2 ms on `typical`, and 17.5 ms faster than `node` on `hello`). On `hello`,
-`fsion` is within 8.1 ms (`1.18x`) of `bun`; on `typical`, the strict `<= 1.00x bun` bar is
-**not** met (`fsion` 71.8 ms vs `bun` 47.2 ms, `1.52x`). The measured breakdown of the
-71.8 ms is: ~28 ms Windows process spawn + NativeAOT client + Named Pipe round-trip, ~2 ms
-process-state transition, ~32 ms in-memory F# parse + Hindley-Milner typecheck + IL emit +
-Tier-0 execution of the unseen script, and ~6–10 ms `releaseSession` (the Gen-0 finalizer
-sweep that closes handles left open by throwaway scripts). The remaining ~25 ms gap to `bun`
-on `typical` is F#'s static Hindley-Milner typecheck + IL emission vs `bun`'s zero-typecheck
-TS type-stripping. The harness reports this verdict itself: `--require-ac07` exits 1 when
-`<= 1.00x bun` is missed, and the committed report records `FAIL` for that sub-bar honestly.
-
-Reproduce it yourself after building (the harness needs the published client and the
-built daemon on the same machine):
-
-```powershell
-pwsh -NoProfile -File eng/gate.ps1      # build + publish + test the repo
-python bench/run-bench.py --require-ac07
-```
-
-`bench/run-bench.py` writes the committed report to
-[`docs/evidence/0005-benchmark-report.md`](docs/evidence/0005-benchmark-report.md) plus
-the raw per-round timings. Never run the benchmark while the test suite is running.
+After the build and test gate has finished, run `python bench/run-bench.py` from the repository
+root. It writes the [Goal 0006 report](docs/evidence/0006-benchmark-report.md) and
+[raw results](docs/evidence/0006-benchmark-results.json) without changing the historical
+Goal 0005 files. Exit 0 means the run completed and output parity held; check the threshold
+verdicts separately. See [Goal 0006 evidence](docs/evidence/0006-evidence.md) for the
+same-harness baseline and exact packaged command. Never run the benchmark concurrently with
+the test suite.
 
 ## Architecture
 
@@ -79,7 +60,7 @@ black-box testing seam are in
 
 - **Zero disk-emitted assemblies on the hot path.** Scripts are compiled and executed in
   memory (`--optimize- --multiemit-`), so Windows Defender never scans a per-run `.dll`.
-- **Collectible pool with background replenishment.** `fsiond` keeps 3 warm sessions
+- **Collectible pool with background replenishment.** `fsiond` defaults to 12 warm sessions per retained prelude
   (`--pool-size`, `FSION_POOL_SIZE`) that already imported core BCL metadata and the
   `Fsion` prelude; the pool refills in the background while the agent does other work.
 - **Stateful named sessions.** `--session <id>` persists bindings across calls until
@@ -119,12 +100,13 @@ captures the Visual Studio locator's stderr), prepend
 pwsh -NoProfile -File eng/package.ps1 -Framework net10.0
 ```
 
-Publishes the NativeAOT client and the framework-dependent daemon side by side into
+Publishes the NativeAOT client and the framework-dependent ReadyToRun daemon side by side into
 `artifacts/package/fsion-<rid>-<tfm>/`, archives it (`.zip`/`.tar.gz`), and runs the
 bundle end to end from a fresh temporary directory (warmup, script file, `Fsion` helpers,
 exit-code passthrough, `--json` diagnostics, daemon stop). `-Runtime <win-x64|linux-x64|osx-arm64>`
 defaults to the host RID; NativeAOT cannot cross-compile to another OS, so run the script
-on each OS (the 3-OS CI matrix does exactly that).
+on each OS (the 3-OS CI matrix does exactly that). ReadyToRun applies to this host-RID bundle;
+ordinary builds keep the standard framework-dependent daemon.
 
 ### 3-OS CI
 
@@ -156,7 +138,7 @@ fsion --timeout 2000 slow.fsx     # cooperative cancel, exit 124 on timeout
 | `- [args...]` | Run code read from redirected stdin; `args[0]` is `stdin.fsx` |
 | `warmup` | Start the daemon and wait for the pool to fill (`fsiond ready ... warm=True`) |
 | `daemon <start\|stop\|restart\|status>` | Explicit daemon lifecycle management |
-| `--no-daemon` | Run a single-shot daemon for this invocation only (cannot combine with `--session`) |
+| `--no-daemon` | Run a single-shot daemon with one session (cannot combine with `--session`) |
 | `--json` | Emit one JSON document: `exitCode`, `stdout`, `stderr`, `timedOut`, `elapsedMs`, `diagnostics[]` |
 | `--session <id>` | Bind the run to a named stateful session (created on first use) |
 | `--reset` | Discard the named session before this run (requires `--session`) |
@@ -166,7 +148,7 @@ fsion --timeout 2000 slow.fsx     # cooperative cancel, exit 124 on timeout
 | `--pipe <name>` | Daemon endpoint name (env: `FSION_PIPE`, default `fsion-<user>`) |
 | `--idle-ttl <minutes>` | Auto-started daemon idle TTL (env: `FSION_IDLE_TTL_MINUTES`, default 30) |
 | `--session-ttl <min>` | Named-session idle TTL (env: `FSION_SESSION_TTL_MINUTES`, default 15) |
-| `--pool-size <n>` | Warm session pool size for the auto-started daemon; `0` disables warm sessions (env: `FSION_POOL_SIZE`, default 3) |
+| `--pool-size <n>` | Warm session target per retained prelude for the auto-started daemon; `0` disables warm sessions (env: `FSION_POOL_SIZE`, default 12) |
 | `-h`, `--help`, `--version` | Help / version |
 
 Other environment variables: `FSIOND_PATH` (daemon binary), `FSION_CONFIG_DIR` (default
@@ -187,10 +169,11 @@ build time so scripts using them do not pay the first-use import cost.
 A `prelude.fsx` evaluated once per warm session (not per run) can define helpers, `open`
 namespaces, or reference packages with `#r "nuget: ..."`. Resolution order: `--prelude`
 flag → `FSION_PRELUDE` → `<FSION_CONFIG_DIR>/prelude.fsx` → `%APPDATA%/fsion/prelude.fsx`
-on Windows (`~/.config/fsion/prelude.fsx` elsewhere) → built-in prelude only. The daemon
-tags each warm session with the SHA-256 of the prelude it evaluated, so editing
-`prelude.fsx` refreshes the pool without a restart; a broken prelude fails session
-creation instead of silently running without it.
+on Windows (`$XDG_CONFIG_HOME/fsion/prelude.fsx` or `~/.config/fsion/prelude.fsx` elsewhere)
+→ built-in prelude only. The daemon retains the two most recent prelude pools and tags
+file-backed sessions with the SHA-256 of the prelude they evaluated. Timestamp or size
+changes trigger a refresh without a restart; a broken prelude fails session creation
+instead of silently running without it.
 
 Repeated top-level `#r "nuget: ..."` directives resolve through the official
 `FSharp.Compiler.Service` dependency manager once and are then served from a persistent

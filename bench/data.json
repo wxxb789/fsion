@@ -11,8 +11,10 @@
   },
   "workloads": [
     "hello",
-    "typical"
+    "typical",
+    "diverse"
   ],
+  "burstRuns": 12,
   "typical": {
     "rows": 8,
     "scoreModulus": 97,

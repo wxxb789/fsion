@@ -12,7 +12,7 @@ let [<Literal>] IdleTtlEnvironmentVariable = "FSION_IDLE_TTL_MINUTES"
 
 let [<Literal>] PoolSizeEnvironmentVariable = "FSION_POOL_SIZE"
 
-let [<Literal>] DefaultPoolSize = 3
+let [<Literal>] DefaultPoolSize = 12
 
 let [<Literal>] SessionTtlEnvironmentVariable = "FSION_SESSION_TTL_MINUTES"
 

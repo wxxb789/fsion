@@ -3,6 +3,7 @@ module Fsiond.SessionHost
 open System
 open System.Collections.Concurrent
 open System.Collections.Generic
+open System.Diagnostics
 open System.Globalization
 open System.IO
 open System.Reflection
@@ -31,6 +32,8 @@ type ExecutionReport =
 type SessionHostOptions =
     { PoolSize: int
       SessionTtlMinutes: float
+      Oneshot: bool
+      LogPath: string option
       Prelude: Prelude.Spec }
 
 type private RunTextWriter() =
@@ -136,6 +139,8 @@ type private WarmSession() =
     member val ExitMarker: string = "" with get, set
     member val Prelude: Prelude.Tag = Prelude.Tag.Builtin with get, set
     member val CompilerDirectory: string = "" with get, set
+    member val SetCompilerDirectory: (string -> unit) option = None with get, set
+    member val PreludeTypes = HashSet<Type>() with get, set
     member val ProcessExitHandlers: Delegate[] = [||] with get, set
     member val UnmanagedDllHandlers: Delegate[] = [||] with get, set
     member val AssemblyResolveHandlers: Delegate[] = [||] with get, set
@@ -250,7 +255,7 @@ let private clearCheckerCaches (session: FsiEvaluationSession) =
         match checkerField.GetValue session with
         | null -> ()
         | checker ->
-            match checker.GetType().GetMethod("ClearLanguageServiceRootCachesAndCollectAndFinalizeAllTransients") with
+            match checker.GetType().GetMethod("InvalidateAll", Type.EmptyTypes) with
             | null -> ()
             | method -> method.Invoke(checker, [||]) |> ignore
     with _ ->
@@ -267,10 +272,10 @@ let private scriptAssemblies () =
 // `let reader = new StreamReader(...)` keeps its Windows file handle locked until the binding is
 // disposed or the field is nulled (initonly fields cannot be nulled, so they must be disposed).
 // Nulling the rest lets GC unload the assembly and finalize any remaining streams.
-let private clearScriptStatics (assemblies: Assembly[]) =
+let private clearScriptStatics (preludeTypes: HashSet<Type>) (assemblies: Assembly[]) =
     for assembly in assemblies do
         try
-            for scriptType in assembly.GetTypes() do
+            for scriptType in assembly.GetTypes() |> Array.filter (preludeTypes.Contains >> not) do
                 for field in scriptType.GetFields(BindingFlags.Static ||| BindingFlags.Public ||| BindingFlags.NonPublic) do
                     if
                         not field.IsLiteral
@@ -313,17 +318,27 @@ let private clearCompilerAsyncLocals () =
         valueProperty.SetValue(local, Activator.CreateInstance valueType)
 
 let private sweepFinalizers () =
-    GC.Collect(2, GCCollectionMode.Forced, true, true)
+    GC.Collect(2, GCCollectionMode.Forced, true, false)
     GC.WaitForPendingFinalizers()
-    GC.Collect(2, GCCollectionMode.Forced, true, true)
+    GC.Collect(2, GCCollectionMode.Forced, true, false)
 
-// Top-level IDisposable bindings are disposed by clearScriptStatics; this Gen-0 sweep finalizes
-// throwaway streams created inside functions so their Windows handles close before the response
-// while the collectible unload (checker caches, session dispose, full sweep) stays off the
-// request's critical path.
-let private sweepTransientFinalizers () =
-    GC.Collect(0, GCCollectionMode.Forced, true, false)
+let private sweepTransientFinalizers collectionsBefore =
+    // Any intervening collection, even Gen-0, can promote a stream opened by the script.
+    let collect generation = GC.Collect(generation, GCCollectionMode.Forced, true, false)
+    match collectionsBefore with
+    | ValueSome(struct (gen0, gen1)) when GC.CollectionCount 1 = gen1 ->
+        let collectGen1 () =
+            collect 1
+            if GC.CollectionCount 1 <> gen1 + 1 then collect 2
+
+        if GC.CollectionCount 0 = gen0 then
+            collect 0
+            if GC.CollectionCount 0 <> gen0 + 1 then collectGen1 ()
+        else
+            collectGen1 ()
+    | _ -> collect 2
     GC.WaitForPendingFinalizers()
+
 let private severityText (severity: FSharpDiagnosticSeverity) =
     match severity with
     | FSharpDiagnosticSeverity.Error -> "error"
@@ -558,13 +573,21 @@ module Fsion =
         |> List.map (fun warmType -> warmType.Assembly.GetName().Name)
 
     let private warmTypicalJsonPipeline =
-        let root = (System.Text.Json.JsonDocument.Parse "[{\"a\":1,\"b\":\"x\",\"ok\":true}]").RootElement
+        use document = System.Text.Json.JsonDocument.Parse "[{\"a\":1,\"b\":\"x\",\"ok\":true}]"
+        let root = document.RootElement
         root.EnumerateArray()
         |> Seq.filter (fun item -> item.GetProperty("ok").GetBoolean())
         |> Seq.map (fun item -> item.GetProperty("b").GetString(), item.GetProperty("a").GetInt32())
         |> Seq.sortBy (fun (label, score) -> -score, label)
         |> Seq.toArray
         |> Array.length
+
+    type private WarmInput = { Number: int }
+    type private WarmExpression = | Input of WarmInput | Constant of int
+    let private warmCodegen =
+        let value = match Input { Number = warmTypicalJsonPipeline } with Input row -> row.Number | Constant n -> n
+        let text = System.Text.StringBuilder().Append(sprintf "%d" value).Append(' ').Append(0).ToString()
+        try text.Split() |> Array.sumBy int with _ -> 0
 
     let cwd () : string = System.IO.Directory.GetCurrentDirectory()
     let path (rel: string) : string = System.IO.Path.GetFullPath rel
@@ -587,80 +610,87 @@ let private environmentComparer =
     else
         StringComparer.Ordinal
 
-let private applyEnvironment (snapshot: (string * string)[]) =
-    let desired = Dictionary<string, string>(environmentComparer)
-
+let private environmentMap (snapshot: (string * string)[]) =
+    let variables = Dictionary<string, string>(snapshot.Length, environmentComparer)
     for key, value in snapshot do
-        desired.[key] <- value
+        variables.[key] <- value
+    variables
 
-    let current = Environment.GetEnvironmentVariables()
-
-    for entry in current.Keys do
-        let key = entry :?> string
-
-        if key.Length > 0 && key.IndexOf '=' < 0 && not (desired.ContainsKey key) then
+let private applyEnvironment (current: Dictionary<string, string>) (desired: Dictionary<string, string>) =
+    for key in current.Keys do
+        if not (desired.ContainsKey key) then
             Environment.SetEnvironmentVariable(key, null, EnvironmentVariableTarget.Process)
 
-    for key, value in snapshot do
-        Environment.SetEnvironmentVariable(key, value, EnvironmentVariableTarget.Process)
+    for KeyValue(key, value) in desired do
+        match current.TryGetValue key with
+        | true, existing when String.Equals(existing, value, StringComparison.Ordinal) -> ()
+        | _ -> Environment.SetEnvironmentVariable(key, value, EnvironmentVariableTarget.Process)
 
-let private environmentEquals (left: (string * string)[]) (right: (string * string)[]) =
-    if left.Length <> right.Length then
-        false
-    else
-        let map = Dictionary<string, string>(environmentComparer)
-
-        for key, value in left do
-            map.[key] <- value
-
-        right
-        |> Array.forall (fun (key, value) ->
-            match map.TryGetValue key with
-            | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
-            | _ -> false)
-
-// Process working directory and environment are OS-global. Runs that need the same
-// (directory, environment) share one epoch and execute concurrently; a run that needs a
-// different epoch waits for all active runs before transitioning. FSI's #cd only updates
-// per-session compiler state, so script directories do not need to be part of the key.
 type private ProcessStateGate() =
     let sync = obj ()
     let daemonDirectory = Directory.GetCurrentDirectory()
-    let daemonEnvironment = environmentSnapshot ()
     let mutable activeRuns = 0
+    let mutable lastExit = Environment.TickCount64
     let mutable currentDirectory = daemonDirectory
-    let mutable currentEnvironment = daemonEnvironment
+    let mutable currentEnvironment = environmentMap (environmentSnapshot ())
 
     member _.Enter(directory: string, environment: (string * string)[]) =
         lock sync (fun () ->
             let matches () =
-                currentDirectory = directory && environmentEquals currentEnvironment environment
+                currentDirectory = directory
+                && currentEnvironment.Count = environment.Length
+                && (environment |> Array.forall (fun (key, value) ->
+                    match currentEnvironment.TryGetValue key with
+                    | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
+                    | _ -> false))
 
             while activeRuns > 0 && not (matches ()) do
                 Monitor.Wait sync |> ignore
 
             if activeRuns = 0 then
-                Directory.SetCurrentDirectory directory
-                applyEnvironment environment
-                currentDirectory <- directory
-                currentEnvironment <- environment
+                if currentDirectory <> directory then
+                    Directory.SetCurrentDirectory directory
+                    currentDirectory <- directory
+
+                let desired = environmentMap environment
+                applyEnvironment (environmentMap (environmentSnapshot ())) desired
+                currentEnvironment <- desired
 
             activeRuns <- activeRuns + 1)
 
     member _.Exit() =
         lock sync (fun () ->
             activeRuns <- activeRuns - 1
+            lastExit <- Environment.TickCount64
 
             if activeRuns = 0 then
-                applyEnvironment daemonEnvironment
                 Directory.SetCurrentDirectory daemonDirectory
                 currentDirectory <- daemonDirectory
-                currentEnvironment <- daemonEnvironment
                 Monitor.PulseAll sync)
 
+    member _.IsQuiet(quietMs: int64) =
+        lock sync (fun () -> activeRuns = 0 && Environment.TickCount64 - lastExit >= quietMs)
+
+    member _.CollectWhenIdle(action) =
+        lock sync (fun () ->
+            if activeRuns = 0 && Environment.TickCount64 - lastExit >= 500L then
+                action ())
+
+type private PreludePool(spec: Prelude.Spec, tag: Prelude.Tag) =
+    member _.Spec = spec
+    member val Tag = tag with get, set
+    member val Warm = Queue<WarmSession>()
+    member val Failure: string option = None with get, set
+
 type SessionHost(options: SessionHostOptions) =
-    let targetPoolSize = max 0 options.PoolSize
-    let pool = ConcurrentQueue<WarmSession>()
+    let targetPoolSize = if options.Oneshot then 1 else max 0 options.PoolSize
+    let poolGate = obj ()
+    let pools = ResizeArray<PreludePool>()
+    let mutable desiredSpec = options.Prelude
+    let fileTags = Dictionary<string, struct (int64 * int64 * Prelude.Tag)>(StringComparer.Ordinal)
+    let mutable claimWaiters = 0
+    let mutable ensureWarmActive = 0
+    let mutable sessionsCreated = 0
     let creationGate = new SemaphoreSlim(1, 1)
     let replenishSignal = new SemaphoreSlim(0)
     let pendingCleanups = ConcurrentQueue<CleanupWork>()
@@ -668,8 +698,7 @@ type SessionHost(options: SessionHostOptions) =
     let processState = ProcessStateGate()
     let coldClaims = ref 0
     let executed = ref 0
-    let mutable pendingCreations = 0
-    let mutable stopped = false
+    let logDetail message = options.LogPath |> Option.iter (fun _ -> Log.info options.LogPath message)
 
     let evaluateUserPrelude (session: FsiEvaluationSession) (path: string) : Prelude.Tag * string =
         match Prelude.readAndHashFile path with
@@ -691,13 +720,13 @@ type SessionHost(options: SessionHostOptions) =
                 if mayMutateCompilerDirectory text then "" else directory
 
             Prelude.Tag.File(path, contentHash), trackedDirectory
-    let releaseSession (claimed: WarmSession) =
+    let releaseSessionWith collectionsBefore (claimed: WarmSession) =
         match claimed.Session with
-        | Some session -> clearScriptStatics session.DynamicAssemblies
+        | Some session -> clearScriptStatics claimed.PreludeTypes session.DynamicAssemblies
         | None -> ()
 
         clearCompilerAsyncLocals ()
-        sweepTransientFinalizers ()
+        claimed.PreludeTypes.Clear()
 
         pendingCleanups.Enqueue
             { Session = claimed.Session
@@ -711,9 +740,13 @@ type SessionHost(options: SessionHostOptions) =
         claimed.ExitedProperty <- None
         claimed.ExitCodeProperty <- None
         claimed.CancellationTokenProperty <- None
+        claimed.SetCompilerDirectory <- None
         claimed.ProcessExitHandlers <- [||]
         claimed.UnmanagedDllHandlers <- [||]
         claimed.AssemblyResolveHandlers <- [||]
+        sweepTransientFinalizers collectionsBefore
+
+    let releaseSession = releaseSessionWith ValueNone
 
     let createWarmSession (spec: Prelude.Spec) : WarmSession =
         let processExitBefore = processExitSnapshot ()
@@ -732,6 +765,8 @@ type SessionHost(options: SessionHostOptions) =
                 collectible = true
             )
 
+        let created = Interlocked.Increment(&sessionsCreated)
+        logDetail ("session-created total=" + string created)
         let processExitHandlers = addedHandlers processExitBefore (processExitSnapshot ())
         let unmanagedDllHandlers = addedHandlers unmanagedDllBefore (unmanagedDllSnapshot ())
         let assemblyResolveHandlers = addedHandlers assemblyResolveBefore (assemblyResolveSnapshot ())
@@ -789,46 +824,109 @@ type SessionHost(options: SessionHostOptions) =
             warm.ExitMarker <- exitMarker
             warm.Prelude <- preludeTag
             warm.CompilerDirectory <- compilerDirectory
+            if not (isNull tcConfigBField) then
+                let builder = tcConfigBField.GetValue session
+                let property = builder.GetType().GetProperty("implicitIncludeDir", BindingFlags.Instance ||| BindingFlags.Public ||| BindingFlags.NonPublic)
+                if not (isNull property) && property.CanWrite then
+                    warm.CompilerDirectory <- property.GetValue builder :?> string
+                    warm.SetCompilerDirectory <- Some(fun directory -> property.SetValue(builder, directory))
+            match spec with
+            | Prelude.Spec.File _ -> ()
+            | _ ->
+                for assembly in session.DynamicAssemblies do
+                    warm.PreludeTypes.UnionWith(assembly.GetTypes())
             succeeded <- true
             warm
         finally
             if not succeeded then
                 releaseSession warm
                 replenishSignal.Release() |> ignore
-    let desiredGate = obj ()
-    let mutable desiredSpec = options.Prelude
-    let mutable failedTag: Prelude.Tag option = None
-    let mutable failedError: string option = None
 
-    let rec claimSession (tag: Prelude.Tag) (cancelToken: CancellationToken) : WarmSession =
-        match pool.TryDequeue() with
-        | true, warm when warm.Prelude = tag -> warm
-        | true, warm ->
-            releaseSession warm
-            claimSession tag cancelToken
-        | _ ->
-            Interlocked.Increment(&coldClaims.contents) |> ignore
-            creationGate.Wait(cancelToken)
+    let tagOfSpec spec =
+        match spec with
+        | Prelude.Spec.File path ->
+            let info = FileInfo path
+            try
+                let ticks = info.LastWriteTimeUtc.Ticks
+                let length = info.Length
+                match fileTags.TryGetValue path with
+                | true, struct (cachedTicks, cachedLength, tag) when ticks = cachedTicks && length = cachedLength -> tag
+                | _ ->
+                    let tag = Prelude.tagOfSpec spec
+                    if tag <> Prelude.Tag.File(path, "unreadable") then
+                        fileTags.[path] <- struct (ticks, length, tag)
+                    tag
+            with :? IOException ->
+                fileTags.Remove path |> ignore
+                Prelude.Tag.File(path, "unreadable")
+        | _ -> Prelude.tagOfSpec spec
 
-            let created =
+    let discard = ConcurrentQueue<WarmSession>()
+
+    let clearPool (slot: PreludePool) =
+        while slot.Warm.Count > 0 do
+            discard.Enqueue(slot.Warm.Dequeue())
+
+    let refreshTag (slot: PreludePool) =
+        let tag = tagOfSpec slot.Spec
+        if slot.Tag <> tag then
+            clearPool slot
+            slot.Tag <- tag
+            slot.Failure <- None
+        tag
+
+    let activateSpec spec =
+        lock poolGate (fun () ->
+            desiredSpec <- spec
+            let index = pools.FindIndex(fun slot -> slot.Spec = spec)
+            let slot =
+                if index >= 0 then
+                    let existing = pools.[index]
+                    pools.RemoveAt index
+                    existing
+                else
+                    if pools.Count = 2 then
+                        let evicted = pools.[0]
+                        clearPool evicted
+                        match evicted.Spec with
+                        | Prelude.Spec.File path -> fileTags.Remove path |> ignore
+                        | _ -> ()
+                        pools.RemoveAt 0
+                    PreludePool(spec, tagOfSpec spec)
+            pools.Add slot
+            slot, refreshTag slot)
+
+    let poolCount () = lock poolGate (fun () -> pools |> Seq.sumBy (fun slot -> slot.Warm.Count))
+
+    let claimSession (slot: PreludePool) (cancelToken: CancellationToken) : WarmSession =
+        let tryClaim () =
+            lock poolGate (fun () ->
+                refreshTag slot |> ignore
+                if slot.Warm.Count = 0 then None else Some(slot.Warm.Dequeue()))
+
+        match tryClaim () with
+        | Some warm -> warm
+        | None ->
+            Interlocked.Increment(&claimWaiters) |> ignore
+            try
+                logDetail "session-claim waiting"
+                creationGate.Wait(cancelToken)
                 try
-                    createWarmSession (Prelude.specOfTag tag)
+                    match tryClaim () with
+                    | Some warm -> warm
+                    | None ->
+                        Interlocked.Increment(&coldClaims.contents) |> ignore
+                        try
+                            let warm = createWarmSession slot.Spec
+                            lock poolGate (fun () -> slot.Failure <- None)
+                            warm
+                        with ex ->
+                            lock poolGate (fun () -> slot.Failure <- Some ex.Message)
+                            reraise ()
                 finally
                     creationGate.Release() |> ignore
-
-            let cleared =
-                lock desiredGate (fun () ->
-                    if failedTag.IsSome then
-                        failedTag <- None
-                        failedError <- None
-                        true
-                    else
-                        false)
-
-            if cleared then
-                replenishSignal.Release() |> ignore
-
-            created
+            finally
+                Interlocked.Decrement(&claimWaiters) |> ignore
 
     let removeHandlers (work: CleanupWork) =
         removeProcessExit work.ProcessExitHandlers
@@ -848,7 +946,9 @@ type SessionHost(options: SessionHostOptions) =
 
         survivors.Count
 
-    let drainPendingCleanups () =
+    let mutable totalReleased = 0
+
+    let disposePendingCleanups () =
         let mutable work = Unchecked.defaultof<CleanupWork>
         let mutable drained = 0
 
@@ -869,18 +969,23 @@ type SessionHost(options: SessionHostOptions) =
 
             removeHandlers work
 
-        if drained > 0 then
-            sweepFinalizers ()
-            drainReleasedSessions () |> ignore
+        drained
 
-    // Handler removal and collectible-session disposal need creationGate so delegate adds and
-    // removes never interleave, but a run must not stall behind a slow background session
-    // creation. The replenisher drains this queue after refilling the warm pool (it runs with
-    // --pool-size 0 too), and Metrics drains it before sampling.
+    let drainPendingCleanups () =
+        let drained = disposePendingCleanups ()
+        if drained > 0 then
+            totalReleased <- totalReleased + drained
+            sweepFinalizers ()
+            let alive = drainReleasedSessions ()
+            logDetail ($"unload released={totalReleased} alive={alive}")
+
     let drainCleanups () =
-        if creationGate.Wait 0 then
+        if not pendingCleanups.IsEmpty && creationGate.Wait 0 then
             try
-                drainPendingCleanups ()
+                if pendingCleanups.Count >= 16 then
+                    drainPendingCleanups ()
+                elif Volatile.Read(&claimWaiters) = 0 then
+                    processState.CollectWhenIdle drainPendingCleanups
             finally
                 creationGate.Release() |> ignore
 
@@ -959,7 +1064,9 @@ type SessionHost(options: SessionHostOptions) =
 
         let changeDirectory (directory: string) =
             if not (String.Equals(claimed.CompilerDirectory, directory, StringComparison.Ordinal)) then
-                session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
+                match claimed.SetCompilerDirectory with
+                | Some setDirectory when Path.IsPathFullyQualified directory && Directory.Exists directory -> setDirectory directory
+                | _ -> session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
                 claimed.CompilerDirectory <- directory
 
         let escapedSource = request.Source.Replace("\"", "\"\"")
@@ -1033,14 +1140,13 @@ type SessionHost(options: SessionHostOptions) =
                     // FCS `EvalInteraction` returns without throwing on syntax/indentation errors (printing
                     // `): error FSxxxx:` without emitting any CLR types), whereas warning-only empty/stray-`;`
                     // interactions print only `warning FSxxxx:` and must stay exit 0.
-                    if emittedTypeCount () = typesBeforeCurrentEval then
-                        let errAfter = errWriter.SafeText()
-
-                        if
-                            errAfter.Length > errLenBefore
-                            && errAfter.IndexOf("): error FS", errLenBefore, StringComparison.Ordinal) >= 0
-                        then
-                            raise (FsiCompilationException("compile error", None))
+                    let errAfter = errWriter.SafeText()
+                    if
+                        errAfter.Length > errLenBefore
+                        && errAfter.IndexOf("): error FS", errLenBefore, StringComparison.Ordinal) >= 0
+                        && emittedTypeCount () = typesBeforeCurrentEval
+                    then
+                        raise (FsiCompilationException("compile error", None))
             finally
                 if mayMutateCompilerDirectory code then
                     claimed.CompilerDirectory <- ""
@@ -1186,158 +1292,103 @@ type SessionHost(options: SessionHostOptions) =
                     finally
                         entry.Gate.Release() |> ignore
 
-    let setDesiredSpec (spec: Prelude.Spec) =
-        let changed =
-            lock desiredGate (fun () ->
-                if desiredSpec = spec then
-                    false
-                else
-                    desiredSpec <- spec
-                    failedTag <- None
-                    failedError <- None
-                    true)
-
-        if changed then
-            replenishSignal.Release() |> ignore
-
-    let recycleStalePoolSessions () =
-        let current = lock desiredGate (fun () -> Prelude.tagOfSpec desiredSpec)
-        let retained = ResizeArray<WarmSession>()
-        let mutable warm = Unchecked.defaultof<WarmSession>
-
-        while pool.TryDequeue(&warm) do
-            if warm.Prelude = current then
-                retained.Add warm
-            else
-                try
-                    releaseSession warm
-                with ex ->
-                    Log.error None ("replenisher failed to release a stale warm session: " + ex.Message)
-
-        for warm in retained do
-            pool.Enqueue warm
-
     let replenish () =
-        while not stopped do
-            replenishSignal.Wait 250 |> ignore
-            recycleStalePoolSessions ()
+        while true do
+            replenishSignal.Wait 125 |> ignore
+            drainCleanups ()
+            let mutable stale = Unchecked.defaultof<WarmSession>
+            while discard.TryDequeue(&stale) do
+                releaseSession stale
 
-            let mutable working = true
-
-            while working && not stopped do
-                let spec, currentTag, skipBroken =
-                    lock desiredGate (fun () ->
-                        let tag = Prelude.tagOfSpec desiredSpec
-                        desiredSpec, tag, failedTag = Some tag)
-
-                if not skipBroken && pool.Count + pendingCreations < targetPoolSize then
-                    pendingCreations <- pendingCreations + 1
-
-                    let created =
-                        try
-                            try
-                                creationGate.Wait()
-
-                                try
-                                    let warm = createWarmSession spec
-
-                                    lock desiredGate (fun () ->
-                                        if failedTag = Some currentTag then
-                                            failedTag <- None
-                                            failedError <- None)
-
-                                    Some warm
-                                finally
-                                    creationGate.Release() |> ignore
-                            with ex ->
-                                Log.error None ("replenisher could not create a warm session: " + ex.Message)
-
-                                lock desiredGate (fun () ->
-                                    failedTag <- Some currentTag
-                                    failedError <- Some ex.Message)
-
-                                None
-                        finally
-                            pendingCreations <- pendingCreations - 1
-
-                    match created with
-                    | Some warm -> pool.Enqueue warm
-                    | None -> working <- false
-                else
-                    working <- false
-
-            if not pendingCleanups.IsEmpty && (pendingCleanups.Count >= 4 || pool.Count >= targetPoolSize || (lock desiredGate (fun () -> failedTag.IsSome))) then
+            let mutable filling = targetPoolSize > 0
+            while filling
+                  && Volatile.Read(&claimWaiters) = 0
+                  && (Volatile.Read(&ensureWarmActive) > 0 || processState.IsQuiet 250L)
+                  && creationGate.Wait 0 do
                 try
-                    drainCleanups ()
-                with ex ->
-                    Log.error None ("replenisher failed to drain cleanups: " + ex.Message)
+                    let next =
+                        lock poolGate (fun () ->
+                            for slot in pools do
+                                refreshTag slot |> ignore
+                            pools
+                            |> Seq.rev
+                            |> Seq.filter (fun slot -> slot.Failure.IsNone && slot.Warm.Count < targetPoolSize)
+                            |> Seq.sortBy (fun slot -> slot.Warm.Count)
+                            |> Seq.tryHead)
+                    match next with
+                    | None -> filling <- false
+                    | Some slot ->
+                        try
+                            let warm = createWarmSession slot.Spec
+                            if processState.IsQuiet 250L then
+                                GC.Collect(1, GCCollectionMode.Optimized, false)
+                            lock poolGate (fun () ->
+                                if pools.Contains slot && refreshTag slot = warm.Prelude then
+                                    slot.Warm.Enqueue warm
+                                else
+                                    discard.Enqueue warm)
+                        with ex ->
+                            Log.error options.LogPath ("replenisher could not create a warm session: " + ex.Message)
+                            lock poolGate (fun () -> slot.Failure <- Some ex.Message)
+                finally
+                    creationGate.Release() |> ignore
+                drainCleanups ()
+
     do
-        Task.Factory.StartNew(replenish, TaskCreationOptions.LongRunning) |> ignore
-        replenishSignal.Release() |> ignore
-        if sessionTtlMs > 0L then
-            let sweepIntervalMs = max 250 (min 5000 (int (sessionTtlMs / 4L)))
+        if not options.Oneshot then
+            activateSpec options.Prelude |> ignore
+            Task.Factory.StartNew(replenish, TaskCreationOptions.LongRunning) |> ignore
+            replenishSignal.Release() |> ignore
+            if sessionTtlMs > 0L then
+                let sweepIntervalMs = max 250 (min 5000 (int (sessionTtlMs / 4L)))
+                Task.Factory.StartNew(
+                    (fun () ->
+                        while true do
+                            Thread.Sleep sweepIntervalMs
+                            sweepNamedSessions ()),
+                    TaskCreationOptions.LongRunning
+                )
+                |> ignore
 
-            Task.Factory.StartNew(
-                (fun () ->
-                    while true do
-                        Thread.Sleep sweepIntervalMs
-                        sweepNamedSessions ()),
-                TaskCreationOptions.LongRunning
-            )
-            |> ignore
+    let waitForWarm timeoutMs (slot: PreludePool) =
+        let deadline = Environment.TickCount64 + timeoutMs
+        let state () = lock poolGate (fun () -> slot.Warm.Count, slot.Failure, pools.Contains slot)
+        let mutable count, failure, retained = state ()
+        while count < targetPoolSize && failure.IsNone && retained && Environment.TickCount64 < deadline do
+            Thread.Sleep 5
+            let nextCount, nextFailure, nextRetained = state ()
+            count <- nextCount
+            failure <- nextFailure
+            retained <- nextRetained
+        failure
 
-    member _.DesiredSpec = lock desiredGate (fun () -> desiredSpec)
+    member _.DesiredSpec = lock poolGate (fun () -> desiredSpec)
 
     member _.EnsureWarm(spec: Prelude.Spec) =
-        lock desiredGate (fun () ->
-            desiredSpec <- spec
-            failedTag <- None
-            failedError <- None)
-
-        if targetPoolSize > 0 then
-            recycleStalePoolSessions ()
-            drainCleanups ()
-            replenishSignal.Release() |> ignore
-            let deadline = Environment.TickCount64 + 60000L
-            let mutable filling = true
-
-            while filling do
-                let broken =
-                    lock desiredGate (fun () -> failedTag = Some(Prelude.tagOfSpec desiredSpec))
-
-                filling <-
-                    not stopped
-                    && not broken
-                    && pool.Count < targetPoolSize
-                    && Environment.TickCount64 < deadline
-                if filling then
-                    Thread.Sleep 5
-
-            let failure =
-                lock desiredGate (fun () ->
-                    if failedTag = Some(Prelude.tagOfSpec desiredSpec) then
-                        Some(defaultArg failedError "configured prelude failed during warmup")
-                    else
-                        None)
-
-            match failure with
-            | Some message -> failwith message
-            | None -> ()
-        else
-            match spec with
-            | Prelude.Spec.File _ ->
-                creationGate.Wait()
-
-                let probe =
+        if not options.Oneshot then
+            let slot, _ = activateSpec spec
+            lock poolGate (fun () -> slot.Failure <- None)
+            if targetPoolSize > 0 then
+                Interlocked.Increment(&ensureWarmActive) |> ignore
+                try
+                    replenishSignal.Release() |> ignore
+                    match waitForWarm 60000L slot with
+                    | Some message -> failwith message
+                    | None -> ()
+                finally
+                    Interlocked.Decrement(&ensureWarmActive) |> ignore
+            else
+                match spec with
+                | Prelude.Spec.File _ ->
+                    creationGate.Wait()
                     try
-                        createWarmSession spec
+                        createWarmSession spec |> releaseSession
                     finally
                         creationGate.Release() |> ignore
+                    replenishSignal.Release() |> ignore
+                | _ -> ()
 
-                releaseSession probe
-                replenishSignal.Release() |> ignore
-            | _ -> ()
-    member _.IsWarm = pool.Count > 0
+    member _.IsWarm = poolCount () > 0
 
     member _.ExecutedCount = executed.Value
 
@@ -1395,8 +1446,14 @@ type SessionHost(options: SessionHostOptions) =
                 Some entry
 
         let runInSession (claimed: WarmSession) (stateless: bool) =
+            let started = Stopwatch.GetTimestamp()
+            let mutable evaluateMs = 0.0
+            let mutable collectionsBefore = ValueNone
+            let mutable entered = false
+
             try
                 processState.Enter(request.WorkingDirectory, request.Environment)
+                entered <- true
 
                 try
                     Ambient.set { Out = outWriter; Error = errWriter; In = TextReader.Null }
@@ -1429,9 +1486,14 @@ type SessionHost(options: SessionHostOptions) =
                                     else
                                         Unchecked.defaultof<Timer>
 
+                                if stateless then
+                                    collectionsBefore <- ValueSome(struct (GC.CollectionCount 0, GC.CollectionCount 1))
+
+                                let evaluateStarted = Stopwatch.GetTimestamp()
                                 let exitCode, diagnostics =
                                     evaluate claimed request prepared outWriter errWriter runCts.Token
 
+                                evaluateMs <- Stopwatch.GetElapsedTime(evaluateStarted).TotalMilliseconds
                                 Interlocked.Increment(&executed.contents) |> ignore
 
                                 { ExitCode = exitCode
@@ -1448,12 +1510,17 @@ type SessionHost(options: SessionHostOptions) =
                     finally
                         Ambient.clear ()
                 finally
-                    processState.Exit ()
+                    if entered then
+                        try
+                            if stateless then releaseSessionWith collectionsBefore claimed
+                        finally
+                            processState.Exit ()
             finally
-                if stateless then
-                    releaseSession claimed
-
-                replenishSignal.Release() |> ignore
+                if not entered && stateless then releaseSession claimed
+                if options.LogPath.IsSome then
+                    let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs
+                    logDetail ($"run-phases evalMs={evaluateMs:F3} gateReleaseMs={gateReleaseMs:F3}")
+                if not options.Oneshot then replenishSignal.Release() |> ignore
 
         let canceledOutcome () =
             Interlocked.Increment(&executed.contents) |> ignore
@@ -1466,14 +1533,13 @@ type SessionHost(options: SessionHostOptions) =
 
         let work () =
             let targetSpec = Prelude.specOfRequest request
-            setDesiredSpec targetSpec
-            let expectedTag = Prelude.tagOfSpec targetSpec
+            let slot, expectedTag = activateSpec targetSpec
 
             let outcome =
                 try
                     match request.SessionId with
                     | None ->
-                        let claimed = claimSession expectedTag disconnectToken
+                        let claimed = claimSession slot disconnectToken
 
                         try
                             runInSession claimed true
@@ -1504,7 +1570,7 @@ type SessionHost(options: SessionHostOptions) =
                                 | _ -> ()
 
                                 if entry.Session.IsNone then
-                                    entry.Session <- Some(claimSession expectedTag disconnectToken)
+                                    entry.Session <- Some(claimSession slot disconnectToken)
 
                                 let outcome =
                                     try
@@ -1573,19 +1639,11 @@ type SessionHost(options: SessionHostOptions) =
                       Wedged = false }
 
     member _.Metrics() : MetricsInfo =
-        if targetPoolSize > 0 then
-            let shouldWait () =
-                let broken =
-                    lock desiredGate (fun () -> failedTag = Some(Prelude.tagOfSpec desiredSpec))
-
-                not stopped && not broken && pool.Count < targetPoolSize
-
-            if shouldWait () then
-                replenishSignal.Release() |> ignore
-                let deadline = Environment.TickCount64 + 30000L
-
-                while shouldWait () && Environment.TickCount64 < deadline do
-                    Thread.Sleep 10
+        if not options.Oneshot && targetPoolSize > 0 then
+            let slots = lock poolGate (fun () -> pools.ToArray())
+            replenishSignal.Release() |> ignore
+            for slot in slots do
+                waitForWarm 30000L slot |> ignore
 
         drainCleanupsBlocking ()
         sweepFinalizers ()
@@ -1594,7 +1652,7 @@ type SessionHost(options: SessionHostOptions) =
         let aliveDisposedSessions = drainReleasedSessions ()
 
         { PoolTarget = targetPoolSize
-          PoolWarm = pool.Count
+          PoolWarm = poolCount ()
           ColdClaims = coldClaims.Value
           Executed = executed.Value
           ManagedHeapBytes = GC.GetTotalMemory true

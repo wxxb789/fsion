@@ -10,6 +10,30 @@ open Fsion.Tests.TestInfra
 
 type PreludeTests(output: ITestOutputHelper) =
     [<Fact>]
+    member _.``alternating six builtin and bare turns retain both warmed pools`` () =
+        withContext "prelude-tag-alternation" (fun context _ ->
+            let run args = context.Run(args, timeoutMs = 120000)
+            let bare = [ "--no-prelude" ]
+            for flags in [ []; bare ] do
+                let warm = run (flags @ [ "warmup" ])
+                Assert.True(warm.ExitCode = 0, warm.Stderr)
+                Assert.Contains("warm=True", warm.Stdout)
+
+            let before = context.MetricsOrFail()
+            for i in 1 .. 6 do
+                let result =
+                    if i % 2 = 1 then
+                        run [ "-e"; $"System.Console.Write(Fsion.envOr \"FSION_TEST_ALTERNATION_6\" \"builtin-{i}\")" ]
+                    else
+                        run (bare @ [ "-e"; $"System.Console.Write(\"bare-{i}\")" ])
+                Assert.True(result.ExitCode = 0, result.Stderr)
+                Assert.Equal((if i % 2 = 1 then $"builtin-{i}" else $"bare-{i}"), result.Stdout)
+
+            let after = context.MetricsOrFail()
+            Assert.Equal(before.Executed + 6, after.Executed)
+            Assert.Equal(before.ColdClaims, after.ColdClaims))
+
+    [<Fact>]
     member _.``built-in Fsion helpers are preloaded on warm sessions and --no-prelude hides them`` () =
         withContext "prelude-builtin" (fun context directory ->
             let warmup = context.Run([ "warmup" ], timeoutMs = 180000)

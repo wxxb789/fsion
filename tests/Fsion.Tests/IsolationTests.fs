@@ -15,6 +15,24 @@ let private median (values: float seq) =
     let sorted = values |> Seq.sort |> Seq.toArray
     sorted.[sorted.Length / 2]
 
+let private readLog (path: string) =
+    if File.Exists path then
+        use stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)
+        use reader = new StreamReader(stream)
+        reader.ReadToEnd()
+    else
+        ""
+
+let private awaitCondition message (condition: unit -> bool) =
+    Assert.True(SpinWait.SpinUntil(Func<bool>(condition), TimeSpan.FromSeconds 30.0), message)
+
+let private assertRun (result: ProcessResult) =
+    Assert.True(result.ExitCode = 0, result.Stderr)
+
+let private assertFileUnlocked path =
+    use stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None)
+    Assert.True(stream.Length > 0L)
+
 type IsolationTests(output: ITestOutputHelper) =
     [<Fact>]
     member _.``stateless runs do not leak let bindings across invocations`` () =
@@ -299,7 +317,162 @@ type IsolationTests(output: ITestOutputHelper) =
                 + string metrics.ColdClaims
             )
 
-            Assert.Equal(3, metrics.PoolTarget)
+            Assert.Equal(12, metrics.PoolTarget)
             Assert.Equal(5, metrics.Executed)
             Assert.Equal(0, metrics.ColdClaims)
             Assert.True(measuredMedian < 500.0, "median warm run wall time was " + string measuredMedian + " ms"))
+
+    [<Theory>]
+    [<InlineData(1)>]
+    [<InlineData(2)>]
+    member _.``promoted local streams unlock before a stateless response`` (generation: int) =
+        withContext "promoted-handles" (fun context directory ->
+            let path = Path.Combine(directory, "promoted.txt")
+            writeFile directory "promoted.txt" "payload"
+            let code =
+                String.concat "\n"
+                    [ "open System"
+                      "open System.IO"
+                      "let run () ="
+                      "    let stream = new FileStream(fsi.CommandLineArgs.[1], FileMode.Open, FileAccess.Read, FileShare.Read)"
+                      $"    let target = {generation}"
+                      "    for _ in 1 .. 4 do"
+                      "        if GC.GetGeneration stream < target then GC.Collect(GC.GetGeneration stream, GCCollectionMode.Forced, true, false)"
+                      "    if GC.GetGeneration stream < target then failwith \"stream was not promoted\""
+                      "    Console.Write(stream.ReadByte())"
+                      "    GC.KeepAlive stream"
+                      "run ()" ]
+            let log = Path.Combine(directory, "daemon.log")
+            let result = context.Run([ "--pool-size"; "0"; "-e"; code; path ], timeoutMs = 120000, extraEnv = [ "FSIOND_LOG", log ])
+            assertRun result
+            Assert.Equal("112", result.Stdout)
+            try
+                assertFileUnlocked path
+            finally
+                output.WriteLine(readLog log)
+            File.Delete path)
+
+    [<Fact>]
+    member _.``local streams unlock despite an aggregate handle drop`` () =
+        withContext "handle-drop" (fun context directory ->
+            let path = Path.Combine(directory, "leaked.txt")
+            let log = Path.Combine(directory, "daemon.log")
+            let run args =
+                context.Run([ "--pool-size"; "0" ] @ args, timeoutMs = 120000, extraEnv = [ "FSIOND_LOG", log ])
+            writeFile directory "leaked.txt" "payload"
+            run [ "--session"; "setup"; "-e"
+                  "System.AppDomain.CurrentDomain.SetData(\"handle-drop\", Array.init 64 (fun _ -> new System.Threading.ManualResetEvent(false)))" ]
+            |> assertRun
+            for i in 1 .. 3 do
+                run [ "-e"; $"let value{i} = {i} * 2" ] |> assertRun
+
+            let code =
+                String.concat "\n"
+                    [ "open System"
+                      "open System.Diagnostics"
+                      "open System.IO"
+                      "open System.Threading"
+                      "let run () ="
+                      "    use daemon = Process.GetCurrentProcess()"
+                      "    let handles () = daemon.Refresh(); daemon.HandleCount"
+                      "    let before = if OperatingSystem.IsWindows() then handles () else 0"
+                      "    let stream = File.OpenRead(fsi.CommandLineArgs.[1])"
+                      "    let events = AppDomain.CurrentDomain.GetData(\"handle-drop\") :?> ManualResetEvent array"
+                      "    for handle in events do handle.Dispose()"
+                      "    AppDomain.CurrentDomain.SetData(\"handle-drop\", null)"
+                      "    if OperatingSystem.IsWindows() then"
+                      "        let after = handles ()"
+                      "        if after >= before then failwith $\"expected a handle drop: {before} -> {after}\""
+                      "    Console.Write(stream.ReadByte())"
+                      "    GC.KeepAlive stream"
+                      "run ()" ]
+            let leaked = run [ "-e"; code; path ]
+            assertRun leaked
+            Assert.Equal("112", leaked.Stdout)
+            assertFileUnlocked path
+            File.Delete path)
+
+    [<Fact>]
+    member _.``an empty pool claimant takes the session made by its in-flight producer`` () =
+        withContext "single-producer" (fun context directory ->
+            let log = Path.Combine(directory, "daemon.log")
+            let prelude = Path.Combine(directory, "prelude.fsx")
+            let block = Path.Combine(directory, "block")
+            let creating = Path.Combine(directory, "creating")
+            let active = Path.Combine(directory, "active")
+            let env = [ "FSIOND_LOG", log ]
+            let run args = context.Run([ "--pool-size"; "2"; "--prelude"; prelude ] @ args, timeoutMs = 120000, extraEnv = env)
+            let literal path = "@\"" + path + "\""
+            writeFile directory "prelude.fsx"
+                (String.concat "\n"
+                     [ "open System.IO"
+                       "open System.Threading"
+                       "if File.Exists " + literal block + " then"
+                       "    File.WriteAllText(" + literal creating + ", \"creating\")"
+                       "    while File.Exists " + literal block + " do Thread.Sleep 10"
+                       "let greeting = \"hello\"" ])
+            run [ "warmup" ] |> assertRun
+            let before = context.MetricsOrFail()
+            Assert.Equal(2, before.PoolWarm)
+            writeFile directory "block" ""
+            try
+                let first = Task.Run(fun () -> run [ "-e"; "System.Console.Write(greeting)" ])
+                assertRun first.Result
+                awaitCondition "replenishment did not start" (fun () -> File.Exists creating)
+                let second = run [ "-e"; "System.Console.Write(greeting + \"2\")" ]
+                assertRun second
+                Assert.Equal("hello2", second.Stdout)
+                let third = Task.Run(fun () -> run [ "-e"; "System.IO.File.WriteAllText(" + literal active + ", greeting)" ])
+                awaitCondition "empty-pool claimant did not wait for the in-flight producer" (fun () -> (readLog log).Contains("session-claim waiting"))
+                Assert.False(File.Exists active)
+                File.Delete block
+                assertRun third.Result
+                Assert.Equal("hello", File.ReadAllText active)
+                let after = context.MetricsOrFail()
+                Assert.Equal(before.Executed + 3, after.Executed)
+                Assert.Equal(before.ColdClaims, after.ColdClaims)
+                Assert.Equal(2, after.PoolWarm)
+                let creations = (readLog log).Split('\n') |> Array.filter (fun line -> line.Contains "session-created total=")
+                Assert.Equal(5, creations.Length)
+            finally
+                File.Delete block)
+
+    [<Fact>]
+    member _.``no-daemon creates just the one session it executes`` () =
+        withContext "oneshot-creation-count" (fun context directory ->
+            let log = Path.Combine(directory, "oneshot.log")
+            let result =
+                context.Run(
+                    [ "--no-daemon"; "--pool-size"; "5"; "-e"; "System.Console.Write(42)" ],
+                    timeoutMs = 120000,
+                    extraEnv = [ "FSIOND_LOG", log ])
+            assertRun result
+            Assert.Equal("42", result.Stdout)
+            awaitCondition "oneshot daemon did not report one execution" (fun () -> (readLog log).Contains "totalExecuted=1")
+            let creations = (readLog log).Split('\n') |> Array.filter (fun line -> line.Contains "session-created total=")
+            Assert.Single creations |> ignore
+            Assert.Contains("total=1", creations.[0]))
+
+    [<Fact>]
+    member _.``twenty unseen zero-gap runs unload their collectible sessions`` () =
+        withContext "zero-gap-unload" (fun context directory ->
+            let log = Path.Combine(directory, "daemon.log")
+            let run args = context.Run(args, timeoutMs = 120000, extraEnv = [ "FSIOND_LOG", log ])
+            run [ "warmup" ] |> assertRun
+            let before = context.MetricsOrFail()
+            for i in 1 .. 20 do
+                writeFile directory $"burst-{i}.fsx" $"let value = {i} * 2\nSystem.Console.Write(value)\n"
+            for i in 1 .. 20 do
+                let result = run [ Path.Combine(directory, $"burst-{i}.fsx") ]
+                assertRun result
+                Assert.Equal(string (i * 2), result.Stdout)
+
+            awaitCondition "background unload did not reach zero released sessions"
+                (fun () -> (readLog log).Contains "unload released=20 alive=0")
+            let after = context.MetricsOrFail()
+            Assert.Equal(before.Executed + 20, after.Executed)
+            Assert.Equal(0, after.AliveDisposedSessions)
+            Assert.True(after.ScriptAssemblies <= after.PoolTarget)
+            Assert.InRange(after.ManagedHeapBytes, 1L, 400L * 1024L * 1024L)
+            Assert.True(after.ManagedHeapBytes - before.ManagedHeapBytes < 64L * 1024L * 1024L)
+            output.WriteLine($"heap {before.ManagedHeapBytes} -> {after.ManagedHeapBytes}; assemblies {after.ScriptAssemblies}; cold claims {after.ColdClaims - before.ColdClaims}"))

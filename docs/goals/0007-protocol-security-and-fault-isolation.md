@@ -16,7 +16,7 @@ Read [../core-design.md](../core-design.md) and [../specs/2026-11-22-fsion-core-
 
 ## Prerequisite
 
-Accepted completion of [0006-hot-path-and-burst-resilience.md](0006-hot-path-and-burst-resilience.md).
+Accepted completion of [0006-hot-path-and-burst-resilience.md](archive/0006-hot-path-and-burst-resilience.md).
 
 ## Material Scope, Constraints, and Assumptions
 

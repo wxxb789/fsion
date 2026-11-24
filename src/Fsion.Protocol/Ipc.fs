@@ -24,7 +24,12 @@ let sanitizeName (name: string) =
             else '_')
     new String(mapped)
 
-let defaultEndpointName () = "fsion-" + sanitizeName Environment.UserName
+let defaultEndpointName () =
+    let user =
+        match Environment.GetEnvironmentVariable(if isWindows then "USERNAME" else "USER") with
+        | null | "" -> Environment.UserName
+        | name -> name
+    "fsion-" + sanitizeName user
 
 let validateEndpointName (name: string) =
     if name.Contains '\\' || name.Contains '/' then
@@ -65,7 +70,7 @@ let connect (endpoint: Endpoint) (timeout: TimeSpan) : Stream =
             let candidate =
                 if isWindows then
                     let pipe =
-                        new NamedPipeClientStream(".", endpoint.Name, PipeDirection.InOut, PipeOptions.Asynchronous)
+                        new NamedPipeClientStream(".", endpoint.Name, PipeDirection.InOut, PipeOptions.None)
                     try
                         pipe.Connect 250
                         pipe :> Stream

@@ -10,6 +10,7 @@ Usage (from the repository root, after `eng/gate.ps1` has published the binaries
 
     python bench/run-bench.py
     python bench/run-bench.py --rounds 30 --warmup 3 --require-ac07
+    python bench/run-bench.py --require-goal0006
 
 See bench/data.json for the workload, environment, and runner definitions.
 """
@@ -636,7 +637,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--timeout", type=float, default=120.0, help="per-run timeout in seconds")
     parser.add_argument("--phase-samples", type=int, default=0, help="separate spaced typical runs with daemon phase logging")
-    parser.add_argument("--require-ac07", action="store_true", help="exit non-zero when a measured threshold fails")
+    parser.add_argument("--require-ac07", action="store_true", help="exit 1 when an AC-07 threshold fails")
+    parser.add_argument("--require-goal0006", action="store_true", help="exit 1 when a Goal 0006 threshold fails")
     parser.add_argument("--keep", action="store_true", help="keep the generated script directory")
     parser.add_argument(
         "--work-dir",
@@ -672,9 +674,25 @@ def main(argv: list[str]) -> int:
     if not any(runner.id == "fsion" for runner in runners):
         raise SystemExit("the fsion runner is required for this benchmark")
 
+    present_ids = {runner.id for runner in runners}
+    for enabled, flag, required_workloads, min_rounds in (
+        (args.require_ac07, "--require-ac07", (WORKLOAD_TYPICAL,), data["defaults"]["rounds"]),
+        (args.require_goal0006, "--require-goal0006", (WORKLOAD_HELLO, WORKLOAD_TYPICAL, WORKLOAD_DIVERSE), 30),
+    ):
+        if not enabled:
+            continue
+        if args.dry_run:
+            raise SystemExit(f"--dry-run cannot satisfy {flag} (no timings or comparisons were measured)")
+        missing = [f"workload '{name}' is required" for name in required_workloads if name not in workloads]
+        if rounds < min_rounds:
+            missing.append(f"--rounds must be >= {min_rounds} (got {rounds})")
+        for required_runner in ("fsion", "dotnet-fsi", "bun"):
+            if required_runner not in present_ids:
+                missing.append(f"runner '{required_runner}' is missing")
+        if missing:
+            raise SystemExit(f"{flag} preconditions not met: " + "; ".join(missing))
+
     if args.dry_run:
-        if args.require_ac07:
-            raise SystemExit("--dry-run cannot satisfy --require-ac07 (no timings or comparisons were measured)")
         salt = secrets.token_hex(4)
         for runner in runners:
             nonce, seed = _nonce(salt, 1, WORKLOAD_TYPICAL)
@@ -682,19 +700,6 @@ def main(argv: list[str]) -> int:
             print(f"===== {runner.id} (round 1, {WORKLOAD_TYPICAL}) =====")
             print(_render_source(runner, WORKLOAD_TYPICAL, nonce, seed, rows))
         return 0
-
-    if args.require_ac07:
-        present_ids = {runner.id for runner in runners}
-        missing_ac07: list[str] = []
-        if WORKLOAD_TYPICAL not in workloads:
-            missing_ac07.append("workload 'typical' is required")
-        if rounds < data["defaults"]["rounds"]:
-            missing_ac07.append(f"--rounds must be >= {data['defaults']['rounds']} (got {rounds})")
-        for required_runner in ("fsion", "dotnet-fsi", "bun"):
-            if required_runner not in present_ids:
-                missing_ac07.append(f"runner '{required_runner}' is missing")
-        if missing_ac07:
-            raise SystemExit("--require-ac07 preconditions not met: " + "; ".join(missing_ac07))
 
     parent_dir = Path(args.work_dir).resolve() if args.work_dir else (BENCH_DIR / ".work")
     parent_dir.mkdir(parents=True, exist_ok=True)
@@ -922,6 +927,8 @@ def main(argv: list[str]) -> int:
 
     failed = [verdict for verdict in verdicts if not verdict["pass"]]
     if args.require_ac07 and (failed or not verdicts):
+        return 1
+    if args.require_goal0006 and (not thresholds or not all(passed for _, _, passed in thresholds.values())):
         return 1
     return 0
 

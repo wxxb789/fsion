@@ -15,30 +15,31 @@ bindings alive across agent turns.
 ## Measured performance
 
 Goal 0006 measured the Windows `win-x64` (`net10.0`) package on `CPC-lhan-XF3D0M`: 30 interleaved rounds
-per workload after three warmups (`--phase-samples 12 --require-goal0006`, salt `2b6c3b6f`, exit `0`).
+per workload after three warmups (`--phase-samples 12 --require-goal0006`, salt `53018206`, exit `0`).
 Every round generated fresh F# / TS / JS / Python source and verified byte-identical stdout across all
 five runners (`fsion`, `dotnet-fsi`, `bun`, `node`, `python`), followed by a 12-script zero-gap burst.
 
 | Workload | `fsion` median | `bun` median | `node` median | `python` median | `dotnet fsi` median | `fsion` vs `dotnet fsi` |
 |---|---:|---:|---:|---:|---:|---:|
-| `hello` (fresh script) | **48.4 ms** | 54.0 ms | 76.0 ms | 47.0 ms | 3017.1 ms | **62.3x faster** (faster than `bun`) |
-| `typical` (JSON filter/sort + env) | **68.8 ms** | 53.0 ms | 77.5 ms | 66.5 ms | 3233.9 ms | **47.0x faster** (faster than `node`) |
-| `diverse` (DU / pipeline / StringBuilder / try) | **50.3 ms** | 50.3 ms | 75.6 ms | 46.3 ms | 3154.6 ms | **62.7x faster** (ties `bun`) |
-| `burst` (12 back-to-back unseen `typical` scripts) | **70.5 ms** (max 222.8 ms) | 49.2 ms (max 211.0 ms) | — | — | — | 0 cold claims, 0 leaked sessions |
+| `hello` (fresh script) | **46.6 ms** | 47.1 ms | 72.4 ms | 44.1 ms | 2898.2 ms | **62.1x faster** (faster than `bun`) |
+| `typical` (JSON filter/sort + env) | **69.0 ms** | 47.8 ms | 71.1 ms | 62.5 ms | 3045.9 ms | **44.2x faster** (faster than `node`) |
+| `diverse` (DU / pipeline / StringBuilder / try) | **47.5 ms** | 47.5 ms | 70.9 ms | 44.1 ms | 3039.2 ms | **63.9x faster** (ties `bun`) |
+| `burst` (12 back-to-back unseen `typical` scripts) | **64.6 ms** (max 195.3 ms) | 47.3 ms (max 58.8 ms) | — | — | — | 0 cold claims, 0 leaked sessions |
 
 All nine Goal 0006 thresholds passed (`9/9 PASS`). On the separate historical AC-07 check, `fsion`
-passes `>= 20x` over `dotnet fsi` (`47.03x`) while `typical <= 1.00x bun` remains `FAIL` (`1.297x`:
-Windows process spawn + named-pipe IPC accounts for ~32–37 ms and full F# Hindley-Milner typechecking
-+ in-memory IL emit + execution accounts for ~29–45 ms). See the
+passes `>= 20x` over `dotnet fsi` (`44.17x`) while `typical <= 1.00x bun` remains `FAIL` (`1.442x`:
+the 12-sample phase probe attributes ~35.2 ms to Windows process spawn + named-pipe IPC and ~47.5 ms
+to full F# Hindley-Milner typechecking + in-memory IL emit + execution). See the
 [Goal 0006 benchmark report](docs/evidence/0006-benchmark-report.md) and
 [Goal 0006 evidence](docs/evidence/0006-evidence.md) for full distributions and package SHA-256s.
+
 After the build and test gate has finished, run `python bench/run-bench.py` from the repository
 root. It writes the [Goal 0006 report](docs/evidence/0006-benchmark-report.md) and
 [raw results](docs/evidence/0006-benchmark-results.json) without changing the historical
 Goal 0005 files. By default, exit 0 means the run completed and output parity held. Use
 `--require-goal0006` to fail on any Goal 0006 threshold; it requires `hello`, `typical`,
-`diverse`, at least 30 measured rounds, and `fsion`, `dotnet-fsi`, and `bun`. Use
-`--require-ac07` to enforce the separate historical AC-07 thresholds. See
+`diverse`, at least 30 measured rounds, `--phase-samples >= 1`, and all five runners (`fsion`,
+`dotnet-fsi`, `bun`, `node`, `python`). Use `--require-ac07` to enforce the separate historical AC-07 thresholds. See
 [Goal 0006 evidence](docs/evidence/0006-evidence.md) for the same-harness baseline and exact
 packaged command. Never run the benchmark concurrently with
 the test suite.

@@ -25,11 +25,7 @@ let sanitizeName (name: string) =
     new String(mapped)
 
 let defaultEndpointName () =
-    let user =
-        match Environment.GetEnvironmentVariable(if isWindows then "USERNAME" else "USER") with
-        | null | "" -> Environment.UserName
-        | name -> name
-    "fsion-" + sanitizeName user
+    "fsion-" + sanitizeName Environment.UserName
 
 let validateEndpointName (name: string) =
     if name.Contains '\\' || name.Contains '/' then

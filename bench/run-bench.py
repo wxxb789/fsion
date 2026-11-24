@@ -686,9 +686,16 @@ def main(argv: list[str]) -> int:
         missing = [f"workload '{name}' is required" for name in required_workloads if name not in workloads]
         if rounds < min_rounds:
             missing.append(f"--rounds must be >= {min_rounds} (got {rounds})")
-        for required_runner in ("fsion", "dotnet-fsi", "bun"):
+        required_runners = (
+            ("fsion", "dotnet-fsi", "bun", "node", "python")
+            if flag == "--require-goal0006"
+            else ("fsion", "dotnet-fsi", "bun")
+        )
+        for required_runner in required_runners:
             if required_runner not in present_ids:
                 missing.append(f"runner '{required_runner}' is missing")
+        if flag == "--require-goal0006" and args.phase_samples < 1:
+            missing.append("--phase-samples must be >= 1 when --require-goal0006 is set")
         if missing:
             raise SystemExit(f"{flag} preconditions not met: " + "; ".join(missing))
 

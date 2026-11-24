@@ -381,3 +381,28 @@ type PreludeTests(output: ITestOutputHelper) =
 
             Assert.True(refilled, "warm pool did not resume replenishing after transient prelude recovery")
             Assert.Equal(daemonPid, context.DaemonPid()))
+
+    [<Fact>]
+    member _.``same-length prelude edit within the settle window invalidates warm sessions and does not loop replenisher`` () =
+        withContext "prelude-same-length-edit" (fun context directory ->
+            let preludePath = Path.Combine(directory, "prelude.fsx")
+            writeFile directory "prelude.fsx" "let sameLen () = \"A\"\n"
+
+            let warmup = context.Run([ "--prelude"; preludePath; "warmup" ], timeoutMs = 120000)
+            Assert.True(warmup.ExitCode = 0, warmup.Stderr)
+
+            let first = context.Run([ "--prelude"; preludePath; "-e"; "System.Console.Write(sameLen())" ], timeoutMs = 60000)
+            Assert.True(first.ExitCode = 0, first.Stderr)
+            Assert.Equal("A", first.Stdout)
+
+            let stamped = File.GetLastWriteTimeUtc preludePath
+            writeFile directory "prelude.fsx" "let sameLen () = \"B\"\n"
+            File.SetLastWriteTimeUtc(preludePath, stamped)
+
+            let second = context.Run([ "--prelude"; preludePath; "-e"; "System.Console.Write(sameLen())" ], timeoutMs = 60000)
+            Assert.True(second.ExitCode = 0, second.Stderr)
+            Assert.Equal("B", second.Stdout)
+
+            let settled = context.MetricsOrFail()
+            Assert.Equal(settled.PoolTarget, settled.PoolWarm)
+            Assert.Equal(0, settled.AliveDisposedSessions))

@@ -250,6 +250,16 @@ let private detachSessionCallback (session: FsiEvaluationSession) =
     with _ ->
         ()
 
+let private fxClearStaticCaches =
+    match typeof<FsiEvaluationSession>.Assembly.GetType("FSharp.Compiler.FxResolver") with
+    | null -> null
+    | resolverType ->
+        resolverType.GetMethod(
+            "ClearStaticCaches",
+            BindingFlags.Static ||| BindingFlags.Public ||| BindingFlags.NonPublic,
+            Type.EmptyTypes
+        )
+
 let private clearCheckerCaches (session: FsiEvaluationSession) =
     try
         match checkerField.GetValue session with
@@ -260,6 +270,12 @@ let private clearCheckerCaches (session: FsiEvaluationSession) =
             | method -> method.Invoke(checker, [||]) |> ignore
     with _ ->
         ()
+
+    if not (isNull fxClearStaticCaches) then
+        try
+            fxClearStaticCaches.Invoke(null, [||]) |> ignore
+        with _ ->
+            ()
 
 let private scriptAssemblies () =
     AppDomain.CurrentDomain.GetAssemblies()
@@ -708,7 +724,6 @@ type SessionHost(options: SessionHostOptions) =
     let poolGate = obj ()
     let pools = ResizeArray<PreludePool>()
     let mutable desiredSpec = options.Prelude
-    let fileTags = Dictionary<string, struct (int64 * int64 * Prelude.Tag)>(StringComparer.Ordinal)
     let mutable claimWaiters = 0
     let mutable ensureWarmActive = 0
     let mutable sessionsCreated = 0
@@ -741,7 +756,7 @@ type SessionHost(options: SessionHostOptions) =
                 if mayMutateCompilerDirectory text then "" else directory
 
             Prelude.Tag.File(path, contentHash), trackedDirectory
-    let releaseSessionWith collectionsBefore (claimed: WarmSession) =
+    let enqueueCleanup (claimed: WarmSession) =
         match claimed.Session with
         | Some session -> clearScriptStatics claimed.PreludeTypes session.DynamicAssemblies
         | None -> ()
@@ -765,6 +780,9 @@ type SessionHost(options: SessionHostOptions) =
         claimed.ProcessExitHandlers <- [||]
         claimed.UnmanagedDllHandlers <- [||]
         claimed.AssemblyResolveHandlers <- [||]
+
+    let releaseSessionWith collectionsBefore (claimed: WarmSession) =
+        enqueueCleanup claimed
         sweepTransientFinalizers collectionsBefore
 
     let releaseSession = releaseSessionWith ValueNone
@@ -860,24 +878,7 @@ type SessionHost(options: SessionHostOptions) =
                 releaseSession warm
                 replenishSignal.Release() |> ignore
 
-    let tagOfSpec spec =
-        match spec with
-        | Prelude.Spec.File path ->
-            let info = FileInfo path
-            try
-                let ticks = info.LastWriteTimeUtc.Ticks
-                let length = info.Length
-                match fileTags.TryGetValue path with
-                | true, struct (cachedTicks, cachedLength, tag) when ticks = cachedTicks && length = cachedLength -> tag
-                | _ ->
-                    let tag = Prelude.tagOfSpec spec
-                    if tag <> Prelude.Tag.File(path, "unreadable") then
-                        fileTags.[path] <- struct (ticks, length, tag)
-                    tag
-            with :? IOException ->
-                fileTags.Remove path |> ignore
-                Prelude.Tag.File(path, "unreadable")
-        | _ -> Prelude.tagOfSpec spec
+    let tagOfSpec spec = Prelude.tagOfSpec spec
 
     let discard = ConcurrentQueue<WarmSession>()
 
@@ -885,15 +886,18 @@ type SessionHost(options: SessionHostOptions) =
         while slot.Warm.Count > 0 do
             discard.Enqueue(slot.Warm.Dequeue())
 
-    let refreshTag (slot: PreludePool) =
-        let tag = tagOfSpec slot.Spec
+    let refreshTagWith tag (slot: PreludePool) =
         if slot.Tag <> tag then
             clearPool slot
             slot.Tag <- tag
             slot.Failure <- None
         tag
 
+    let refreshTag (slot: PreludePool) =
+        refreshTagWith (tagOfSpec slot.Spec) slot
+
     let activateSpec spec =
+        let tag = tagOfSpec spec
         lock poolGate (fun () ->
             desiredSpec <- spec
             let index = pools.FindIndex(fun slot -> slot.Spec = spec)
@@ -906,20 +910,17 @@ type SessionHost(options: SessionHostOptions) =
                     if pools.Count = 2 then
                         let evicted = pools.[0]
                         clearPool evicted
-                        match evicted.Spec with
-                        | Prelude.Spec.File path -> fileTags.Remove path |> ignore
-                        | _ -> ()
                         pools.RemoveAt 0
-                    PreludePool(spec, tagOfSpec spec)
+                    PreludePool(spec, tag)
             pools.Add slot
-            slot, refreshTag slot)
-
+            slot, refreshTagWith tag slot)
     let poolCount () = lock poolGate (fun () -> pools |> Seq.sumBy (fun slot -> slot.Warm.Count))
 
     let claimSession (slot: PreludePool) (cancelToken: CancellationToken) : WarmSession =
         let tryClaim () =
+            let tag = tagOfSpec slot.Spec
             lock poolGate (fun () ->
-                refreshTag slot |> ignore
+                refreshTagWith tag slot |> ignore
                 if slot.Warm.Count = 0 then None else Some(slot.Warm.Dequeue()))
 
         match tryClaim () with
@@ -1310,13 +1311,16 @@ type SessionHost(options: SessionHostOptions) =
                     finally
                         entry.Gate.Release() |> ignore
 
+    let drainDiscarded () =
+        let mutable stale = Unchecked.defaultof<WarmSession>
+        while discard.TryDequeue(&stale) do
+            enqueueCleanup stale
+
     let replenish () =
         while true do
             replenishSignal.Wait 125 |> ignore
+            drainDiscarded ()
             drainCleanups ()
-            let mutable stale = Unchecked.defaultof<WarmSession>
-            while discard.TryDequeue(&stale) do
-                releaseSession stale
 
             let mutable filling = targetPoolSize > 0
             while filling
@@ -1325,9 +1329,12 @@ type SessionHost(options: SessionHostOptions) =
                   && creationGate.Wait 0 do
                 try
                     let next =
+                        let snapshot = lock poolGate (fun () -> pools.ToArray())
+                        let tags = [| for candidate in snapshot -> candidate, tagOfSpec candidate.Spec |]
                         lock poolGate (fun () ->
-                            for slot in pools do
-                                refreshTag slot |> ignore
+                            for candidate, tag in tags do
+                                if pools.Contains candidate then
+                                    refreshTagWith tag candidate |> ignore
                             pools
                             |> Seq.rev
                             |> Seq.filter (fun slot -> slot.Failure.IsNone && slot.Warm.Count < targetPoolSize)
@@ -1340,8 +1347,9 @@ type SessionHost(options: SessionHostOptions) =
                             let warm = createWarmSession slot.Spec
                             if processState.IsQuiet 250L then
                                 GC.Collect(1, GCCollectionMode.Optimized, false)
+                            let currentTag = tagOfSpec slot.Spec
                             lock poolGate (fun () ->
-                                if pools.Contains slot && refreshTag slot = warm.Prelude then
+                                if pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
                                     slot.Warm.Enqueue warm
                                 else
                                     discard.Enqueue warm)
@@ -1350,6 +1358,7 @@ type SessionHost(options: SessionHostOptions) =
                             lock poolGate (fun () -> slot.Failure <- Some ex.Message)
                 finally
                     creationGate.Release() |> ignore
+                drainDiscarded ()
                 drainCleanups ()
 
     do

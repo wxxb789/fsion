@@ -254,3 +254,35 @@ let ``fsion discovers fsiond next to its own binary without FSIOND_PATH`` () =
     finally
         tryDeleteDirectory deployDirectory
         tryDeleteDirectory workingDirectory
+
+[<Fact>]
+let ``defaultEndpointName ignores USERNAME and USER environment overrides`` () =
+    let workingDirectory = createTempDir "endpoint-user-override"
+
+    try
+        let envVar = if OperatingSystem.IsWindows() then "USERNAME" else "USER"
+        let first =
+            runProcess
+                fsionBinary
+                [ "daemon"; "status" ]
+                workingDirectory
+                [ "FSION_PIPE", null; envVar, "spoofed-alpha" ]
+                None
+                30000
+
+        let second =
+            runProcess
+                fsionBinary
+                [ "daemon"; "status" ]
+                workingDirectory
+                [ "FSION_PIPE", null; envVar, "spoofed-beta" ]
+                None
+                30000
+
+        Assert.Equal(0, first.ExitCode)
+        Assert.Equal(0, second.ExitCode)
+        Assert.Equal(first.Stdout, second.Stdout)
+        Assert.DoesNotContain("spoofed-alpha", first.Stdout)
+        Assert.DoesNotContain("spoofed-beta", second.Stdout)
+    finally
+        tryDeleteDirectory workingDirectory

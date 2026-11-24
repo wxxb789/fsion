@@ -71,9 +71,12 @@ eng/gate.ps1` (build, NativeAOT publish for both TFMs, black-box tests for both 
 `pwsh -NoProfile -File eng/package.ps1 -Framework net10.0` (fresh-temp smoke test) → upload the
 archive.
 
-Verified on GitHub Actions (`PR #5`, run `45285361941`): `ubuntu-latest` (`70/70` `net10.0`, `70/70`
-`net11.0`, `PACKAGE OK`) and `macos-latest` (`70/70` `net10.0`, `70/70` `net11.0`, `PACKAGE OK`), plus
-`windows-latest` (`70/70` `net10.0`, `70/70` `net11.0`, `* text=auto eol=lf` in `.gitattributes`).
+GitHub Actions CI (`.github/workflows/ci.yml`) runs on every pull request and push to `main` and is a
+merge-blocking check (`windows-latest`, `macos-latest`, and `ubuntu-latest` must all pass `eng/gate.ps1`
+and `eng/package.ps1 -Framework net10.0` on the PR head SHA before merge; run `45285361941` passed
+`ubuntu-latest` and `macos-latest` end to end and caught missing `* text=auto eol=lf` in
+`.gitattributes` on `windows-latest`, fixed in `0467ee4`, after which run `45289320135` passed
+`windows-latest` and `ubuntu-latest` end to end).
 
 ## Clause 3 — Unseen-Script Benchmark Harness and AC-07
 
@@ -198,8 +201,8 @@ than the live queue depth, and in steady state the wait ran on nearly every turn
 ## Known Limits
 
 - Only the `win-x64` bundle was built locally on this Windows host; `linux-x64` and `osx-arm64`
-  NativeAOT bundles and `70/70` test suites are built and smoke-verified by the 3-OS GitHub Actions CI
-  matrix (`.github/workflows/ci.yml`).
+  NativeAOT bundles and `70/70` test suites are built and smoke-verified by the merge-blocking 3-OS
+  GitHub Actions CI matrix (`.github/workflows/ci.yml`) on the PR head SHA.
 - The benchmark is a Windows-host measurement. `bun` is path-sensitive on this host (`Q:\tmp` costs it
   ~50 ms) while the other runtimes are not; the committed run uses the repo-local work directory,
   which is the fair carrier, and the literal bun-class bar fails there.

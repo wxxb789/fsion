@@ -301,10 +301,10 @@ if ($IsWindows) {
     Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -CompressionLevel Optimal
 } else {
     & tar -czf $archive -C $stage .
-}
 
-if ($LASTEXITCODE -ne 0) {
-    throw "archiving $archive exited with code $LASTEXITCODE"
+    if ($LASTEXITCODE -ne 0) {
+        throw "archiving $archive exited with code $LASTEXITCODE"
+    }
 }
 
 $bundleBytes = (Get-ChildItem -LiteralPath $stage -Recurse -File | Measure-Object -Property Length -Sum).Sum

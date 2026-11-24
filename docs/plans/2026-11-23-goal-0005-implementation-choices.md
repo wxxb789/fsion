@@ -108,8 +108,7 @@ test pins that the flag reaches the daemon.
 - `actions/setup-dotnet` installs `10.0.x` **and** `11.0.x`: the net10.0 test host needs the
   Microsoft.NETCore.App 10 runtime while the 11.0 SDK drives the build. Ubuntu additionally installs
   `clang` and `zlib1g-dev` for NativeAOT before the gate.
-- The workflow is static configuration on this host (no push is authorized), so its Linux/macOS
-  behavior is a residual risk recorded in the evidence, not a verified claim.
+- Runs on every pull request and push to `main` as the merge-blocking 3-OS release gate.
 
 ## Documentation
 

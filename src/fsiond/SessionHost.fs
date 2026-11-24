@@ -398,7 +398,10 @@ let private appendTrailingUnit (padded: string) =
         padded + "\n" + (if unitIndent > 0 then String(' ', unitIndent) else "") + "()"
 
 let private splitInteractions (source: string) (scriptName: string) : string[] =
-    if source.IndexOf(";;", StringComparison.Ordinal) < 0 then
+    if
+        source.IndexOf(";;", StringComparison.Ordinal) < 0
+        && not (source.TrimStart().StartsWith(";", StringComparison.Ordinal))
+    then
         [| appendTrailingUnit source |]
     else
         let chunks = ResizeArray<string>()
@@ -425,15 +428,16 @@ let private splitInteractions (source: string) (scriptName: string) : string[] =
         let mutable lexState = FSharpTokenizerLexState.Initial
         let mutable hashIfDepth = 0
         let mutable interpDepth = 0
+        let mutable chunkHasNonWs = false
         let mutable chunkStart = 0
         let mutable chunkStartLines = 0
         let mutable chunkStartCols = 0
         let mutable chunkOpenIfs = 0
 
-        let emitChunk endExclusive nextStart nextLines nextCols closeIfs reopenIfs =
+        let emitChunk endExclusive nextStart nextLines nextCols closeIfs reopenIfs forceEmit =
             let body = source.Substring(chunkStart, endExclusive - chunkStart)
 
-            if chunks.Count = 0 || body.Trim().Length > 0 || chunkOpenIfs > 0 then
+            if forceEmit || chunks.Count = 0 || body.Trim().Length > 0 || chunkOpenIfs > 0 then
                 let hasCodeOnFirstLine =
                     let nl = body.IndexOf '\n'
                     let firstLine = if nl >= 0 then body.Substring(0, nl) else body
@@ -445,27 +449,23 @@ let private splitInteractions (source: string) (scriptName: string) : string[] =
                     else
                         ""
 
-                let prefix =
+                let openLines =
                     if chunkOpenIfs > 0 then
                         String.replicate chunkOpenIfs "#if INTERACTIVE\n"
-                        + "#line "
-                        + string (chunkStartLines + 1)
-                        + " @\""
-                        + Prelude.escapeVerbatim scriptName
-                        + "\"\n"
-                    elif chunkStartLines > 0 then
-                        String('\n', chunkStartLines)
                     else
                         ""
 
-                let withUnit = appendTrailingUnit (prefix + colPrefix + body)
+                let padNewlines = max 0 (chunkStartLines - chunkOpenIfs)
+                let prefix = openLines + (if padNewlines > 0 then String('\n', padNewlines) else "")
+                let combined = prefix + colPrefix + body
+                let withUnit = if forceEmit then combined else appendTrailingUnit combined
                 let suffix = if closeIfs > 0 then String.replicate closeIfs "\n#endif" else ""
                 chunks.Add(withUnit + suffix)
-
             chunkStart <- nextStart
             chunkStartLines <- nextLines
             chunkStartCols <- nextCols
             chunkOpenIfs <- reopenIfs
+            chunkHasNonWs <- false
 
         for lineIdx = 0 to lineStarts.Count - 1 do
             let lStart = lineStarts.[lineIdx]
@@ -477,6 +477,10 @@ let private splitInteractions (source: string) (scriptName: string) : string[] =
                 match lineTokenizer.ScanToken state with
                 | Some tok, nextState ->
                     match tok.TokenName with
+                    | "WHITESPACE"
+                    | "LINE_COMMENT"
+                    | "COMMENT"
+                    | "INACTIVECODE" -> ()
                     | "HASH_IF" ->
                         let slice = lineText.Substring tok.LeftColumn
 
@@ -485,14 +489,19 @@ let private splitInteractions (source: string) (scriptName: string) : string[] =
                         elif slice.StartsWith("#endif", StringComparison.Ordinal) then
                             hashIfDepth <- max 0 (hashIfDepth - 1)
                     | "INTERP_STRING_BEGIN_PART" ->
+                        chunkHasNonWs <- true
                         interpDepth <- interpDepth + 1
                     | "INTERP_STRING_END" ->
                         interpDepth <- max 0 (interpDepth - 1)
+                    | "SEMICOLON" when interpDepth = 0 && not chunkHasNonWs ->
+                        let nextStart = lStart + tok.RightColumn + 1
+                        emitChunk nextStart nextStart lineIdx (tok.RightColumn + 1) hashIfDepth hashIfDepth true
                     | "SEMICOLON_SEMICOLON" when interpDepth = 0 ->
                         let semiStart = lStart + tok.LeftColumn
                         let nextStart = lStart + tok.RightColumn + 1
-                        emitChunk semiStart nextStart lineIdx (tok.RightColumn + 1) hashIfDepth hashIfDepth
-                    | _ -> ()
+                        emitChunk semiStart nextStart lineIdx (tok.RightColumn + 1) hashIfDepth hashIfDepth false
+                    | _ ->
+                        chunkHasNonWs <- true
 
                     scanLine nextState
                 | None, nextState -> nextState
@@ -502,7 +511,7 @@ let private splitInteractions (source: string) (scriptName: string) : string[] =
         if chunkStart < length || chunks.Count = 0 || chunkOpenIfs > 0 then
             let lastLine = lineStarts.Count - 1
             let tailCols = if chunkStart >= lineStarts.[lastLine] then chunkStart - lineStarts.[lastLine] else 0
-            emitChunk length length lastLine tailCols 0 0
+            emitChunk length length lastLine tailCols 0 0 false
 
         chunks.ToArray()
 // The throwing Eval* APIs print diagnostics to the session's error writer but construct
@@ -977,7 +986,6 @@ type SessionHost(options: SessionHostOptions) =
 
         let evalCode (code: string) (scriptName: string) (normalizeWindowsHeader: bool) =
             let chunks = splitInteractions code scriptName
-
             try
                 for chunk in chunks do
                     checkedSource <- true
@@ -985,6 +993,7 @@ type SessionHost(options: SessionHostOptions) =
                     attemptedScriptName <- scriptName
                     typesBeforeCurrentEval <- emittedTypeCount ()
                     precheckedDiagnostics <- None
+                    let errLenBefore = errWriter.SafeText().Length
 
                     if request.IncludeDiagnostics && chunk.IndexOf("#load", StringComparison.Ordinal) >= 0 then
                         let checkResults =
@@ -1020,6 +1029,18 @@ type SessionHost(options: SessionHostOptions) =
                             session.EvalInteraction(chunk, scriptName, cancellationToken = cancellationToken)
                     else
                         session.EvalInteraction(chunk, scriptName, cancellationToken = cancellationToken)
+
+                    // FCS `EvalInteraction` returns without throwing on syntax/indentation errors (printing
+                    // `): error FSxxxx:` without emitting any CLR types), whereas warning-only empty/stray-`;`
+                    // interactions print only `warning FSxxxx:` and must stay exit 0.
+                    if emittedTypeCount () = typesBeforeCurrentEval then
+                        let errAfter = errWriter.SafeText()
+
+                        if
+                            errAfter.Length > errLenBefore
+                            && errAfter.IndexOf("): error FS", errLenBefore, StringComparison.Ordinal) >= 0
+                        then
+                            raise (FsiCompilationException("compile error", None))
             finally
                 if mayMutateCompilerDirectory code then
                     claimed.CompilerDirectory <- ""
@@ -1094,12 +1115,7 @@ type SessionHost(options: SessionHostOptions) =
 
         try
             run ()
-
-            if checkedSource && emittedTypeCount () = typesBeforeCurrentEval && errWriter.SafeText().Length > 0 then
-                let diagnostics = if request.IncludeDiagnostics then compileDiagnostics () else [||]
-                1, diagnostics
-            else
-                0, [||]
+            0, [||]
         with :? FsiCompilationException ->
             if claimed.ExitedProperty.Value.GetValue state :?> bool then
                 let text = errWriter.SafeText()

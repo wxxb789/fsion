@@ -36,14 +36,21 @@ let ``file mode matches dotnet fsi byte for byte`` () =
             + "printfn \"active=%d|%s\" insideActive interp\n"
             + "#endif\n"
             + "let full = System.IO.Path.Combine(__SOURCE_DIRECTORY__, __SOURCE_FILE__)\n"
-            + "eprintfn \"%s(\" full;;\n"
-            + "printfn \"after-semi=%d\" (``a;;b`` + 1)\n"
+            + "eprintfn \"%s(\" full;;;\n"
+            + ";\n"
+            + "printfn \"after-semi=%d\" (``a;;b`` + 1);;\n"
             + "exit 7\n"
 
         writeFile directory "multi.fsx" multiScript
         let expectedMulti = runFsi directory [ "multi.fsx" ] None
         let actualMulti = context.Run [ "multi.fsx" ]
         assertSameOutput expectedMulti actualMulti
+
+        let straySemiZero = "printfn \"a\";;; printfn \"b\"\n"
+        writeFile directory "stray0.fsx" straySemiZero
+        let expectedStray = runFsi directory [ "stray0.fsx" ] None
+        let actualStray = context.Run [ "stray0.fsx" ]
+        assertSameOutput expectedStray actualStray
 
         let sameLineErrScript = "printfn \"a\";; let y : int = \"nope\"\n"
         writeFile directory "sameline.fsx" sameLineErrScript

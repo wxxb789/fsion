@@ -1,7 +1,7 @@
 # Goal 0006 Evidence — Hot Path and Zero-Gap Burst
 
-Contract: [0006-hot-path-and-burst-resilience.md](../goals/archive/0006-hot-path-and-burst-resilience.md)  
-Implementation choices: [2026-11-24-goal-0006-implementation-choices.md](../plans/2026-11-24-goal-0006-implementation-choices.md)  
+Contract: [0006-hot-path-and-burst-resilience.md](../goals/archive/0006-hot-path-and-burst-resilience.md)
+Implementation choices: [2026-11-24-goal-0006-implementation-choices.md](../plans/2026-11-24-goal-0006-implementation-choices.md)
 Campaign: [benchmark report](0006-benchmark-report.md) and [raw results](0006-benchmark-results.json)
 
 **Status: COMPLETE.** Both full suites passed all five black-box clauses. The retained Windows package passed its smoke test, and the packaged benchmark passed all nine Goal 0006 thresholds. The separate historical AC-07 `typical`/`bun` criterion still fails.
@@ -12,7 +12,7 @@ Host: `CPC-lhan-XF3D0M`, Windows 11 build 26300, AMD64, .NET SDK 11.0.100. Candi
 
 | ID | Command | Exit | Evidence |
 |---|---|---:|---|
-| G | `pwsh -NoProfile -File eng/gate.ps1` | 0 | Run once during closeout. `GATE PASSED`; full output in local `artifacts/gate-goal-0006-closeout.log`. |
+| G | `pwsh -NoProfile -File eng/gate.ps1` | 0 | Rerun after applying the accepted findings. `GATE PASSED`; full output in local `artifacts/apply-0006/gate.log`. |
 | P | `pwsh -NoProfile -File eng/package.ps1 -Framework net10.0` | 0 | Prior run, as recorded by the operator. Six smoke operations: warmup, file execution, exit 7 passthrough, exit 1 JSON diagnostic, stop, and status after stop. Kept the intact `win-x64` package; did not republish during closeout. |
 | B | `FSION_BINARY=Q:/repos/fsion/artifacts/package/fsion-win-x64-net10.0/fsion.exe FSIOND_PATH=Q:/repos/fsion/artifacts/package/fsion-win-x64-net10.0/fsiond.exe python bench/run-bench.py --phase-samples 12` | 0 | Prior run, as recorded by the operator. Salt `6de4f2db`; 30 measured rounds after 3 warmups, byte parity for all 90 workload/round pairs across five runners, 12 paired zero-gap runs, and 12 separate phase samples. Did not rerun during closeout. |
 
@@ -20,9 +20,9 @@ Host: `CPC-lhan-XF3D0M`, Windows 11 build 26300, AMD64, .NET SDK 11.0.100. Candi
 |---|---|
 | Release build, both TFMs | 0 warnings, 0 errors |
 | NativeAOT publish, both TFMs | Both clients published under `artifacts/publish/fsion/`; no AOT or trim warnings reported |
-| `net10.0` CLI/IPC suite | 77 passed, 0 failed, 0 skipped (15 m 40 s) |
-| `net11.0` CLI/IPC suite | 77 passed, 0 failed, 0 skipped (15 m 21 s) |
-| LF check | 63 tracked and 67 non-ignored paths clean at gate time |
+| `net10.0` CLI/IPC suite | 78 passed, 0 failed, 0 skipped (15 m 55 s) |
+| `net11.0` CLI/IPC suite | 78 passed, 0 failed, 0 skipped (15 m 57 s) |
+| LF check | 67 tracked and 67 non-ignored paths clean at gate time |
 
 The retained ZIP and extracted bundle match byte-for-byte for `fsion.exe`, `fsiond.exe`, and `fsiond.dll`. The packaged client also matches G's `net10.0` client byte-for-byte. The benchmark records the paths, client size (4,180,480 bytes), and default pool target (12), all consistent with the retained package. The benchmark JSON does not contain binary hashes; these are closeout fingerprints, not independently captured run-time hashes:
 
@@ -35,7 +35,7 @@ The retained ZIP and extracted bundle match byte-for-byte for `fsion.exe`, `fsio
 
 ## Clause verification
 
-All rows below ran in both TFMs under G (exit 0). The observations in the last column were carried forward from pre-fix and focused runs, not rerun during closeout.
+All rows below ran in both TFMs under G (exit 0). The observations in the last column were carried forward from pre-fix and focused runs, not rerun during the apply stage.
 
 | Clause | Black-box test and passing assertion | Pre-fix observation or replacement proof |
 |---|---|---|

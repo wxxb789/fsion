@@ -309,7 +309,7 @@ def _run_once(runner: Runner, script: Path, work_dir: Path, env: dict, timeout: 
 def _read_metrics(endpoint: str, env: dict, timeout: float) -> dict:
     request = struct.pack("<iiB", 5, 4, 5)
 
-    def read_response(stream) -> tuple:
+    def read_response(stream) -> list[int]:
         def read_exact(size: int) -> bytes:
             data = bytearray()
             while len(data) < size:
@@ -764,6 +764,8 @@ def main(argv: list[str]) -> int:
                 for runner in order:
                     source = _render_source(runner, workload, nonce, seed, rows)
                     script = _write_script(work_dir, f"round{round_index + 1:03d}-{workload}-{runner.id}.{runner.ext}", source)
+                    if measured_round and runner.id == "fsion":
+                        fsion_source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
                     result = _run_once(runner, script, work_dir, base_env, args.timeout)
                     if result["exit"] != 0:
                         raise SystemExit(
@@ -788,9 +790,7 @@ def main(argv: list[str]) -> int:
                     fsion_per_round[workload].append(timings["fsion"])
                     round_entry["workloads"][workload] = {
                         "nonce": nonce,
-                        "fsharpSourceSha256": hashlib.sha256(
-                            _render_source(fsion_runner, workload, nonce, seed, rows).encode("utf-8")
-                        ).hexdigest(),
+                        "fsharpSourceSha256": fsion_source_hash,
                         "outputSha256": hashlib.sha256(expected_bytes).hexdigest(),
                         "verified": True,
                         "timingsMs": timings,

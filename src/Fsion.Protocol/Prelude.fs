@@ -31,7 +31,12 @@ let userPreludePath () : string option =
                 if OperatingSystem.IsWindows() then
                     specialFolder "APPDATA" Environment.SpecialFolder.ApplicationData
                 else
-                    specialFolder "XDG_CONFIG_HOME" Environment.SpecialFolder.ApplicationData
+                    match environment "XDG_CONFIG_HOME" with
+                    | Some directory -> directory
+                    | None ->
+                        match environment "HOME" with
+                        | Some directory when OperatingSystem.IsLinux() -> Path.Combine(directory, ".config")
+                        | _ -> Environment.GetFolderPath Environment.SpecialFolder.ApplicationData
 
             Path.Combine(home, "fsion")
 

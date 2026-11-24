@@ -156,6 +156,23 @@ type PreludeTests(output: ITestOutputHelper) =
                 tryDeleteDirectory cacheDirectory)
 
     [<Fact>]
+    member _.``default user prelude loads from platform config home when FSION_CONFIG_DIR is unset`` () =
+        withContext "prelude-platform-config" (fun context directory ->
+            let configHome = Path.Combine(directory, "config-home")
+            let configVariable = if OperatingSystem.IsWindows() then "APPDATA" else "XDG_CONFIG_HOME"
+            writeFile configHome "fsion/prelude.fsx" "let platformPreludeValue = \"platform-config\"\n"
+
+            let result =
+                context.Run(
+                    [ "-e"; "System.Console.Write(platformPreludeValue)" ],
+                    timeoutMs = 120000,
+                    extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; configVariable, configHome ]
+                )
+
+            Assert.True(result.ExitCode = 0, result.Stderr)
+            Assert.Equal("platform-config", result.Stdout))
+
+    [<Fact>]
     member _.``prelude resolution prefers the flag, then the environment, then the config directory`` () =
         withContext "prelude-precedence" (fun context directory ->
             let configDirectory = Path.Combine(directory, "fsion-config")

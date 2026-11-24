@@ -782,32 +782,28 @@ type SessionHost(options: SessionHostOptions) =
             let creationOut = new StringWriter()
             let creationErr = new StringWriter()
             Ambient.set { Out = creationOut; Error = creationErr; In = TextReader.Null }
-            let mutable preludeTag = Prelude.Tag.Builtin
-            let mutable compilerDirectory = ""
-
-            try
+            let preludeTag, compilerDirectory =
                 try
-                    match spec with
-                    | Prelude.Spec.Bare ->
-                        session.EvalInteraction(prelude exitMarker)
-                        preludeTag <- Prelude.Tag.Bare
-                    | Prelude.Spec.Builtin ->
-                        session.EvalInteraction(prelude exitMarker + builtinPrelude)
-                        preludeTag <- Prelude.Tag.Builtin
-                    | Prelude.Spec.File path ->
-                        session.EvalInteraction(prelude exitMarker + builtinPrelude)
-                        let fileTag, fileDirectory = evaluateUserPrelude session path
-                        preludeTag <- fileTag
-                        compilerDirectory <- fileDirectory
-                with :? FsiCompilationException ->
-                    let diagnostics = creationErr.ToString()
+                    try
+                        match spec with
+                        | Prelude.Spec.Bare ->
+                            session.EvalInteraction(prelude exitMarker)
+                            Prelude.Tag.Bare, ""
+                        | Prelude.Spec.Builtin ->
+                            session.EvalInteraction(prelude exitMarker + builtinPrelude)
+                            Prelude.Tag.Builtin, ""
+                        | Prelude.Spec.File path ->
+                            session.EvalInteraction(prelude exitMarker + builtinPrelude)
+                            evaluateUserPrelude session path
+                    with :? FsiCompilationException ->
+                        let diagnostics = creationErr.ToString()
 
-                    if diagnostics.Trim().Length = 0 then
-                        reraise ()
-                    else
-                        failwith ("configured prelude did not compile:" + Environment.NewLine + diagnostics)
-            finally
-                Ambient.clear ()
+                        if diagnostics.Trim().Length = 0 then
+                            reraise ()
+                        else
+                            failwith ("configured prelude did not compile:" + Environment.NewLine + diagnostics)
+                finally
+                    Ambient.clear ()
 
             let state =
                 match session.TryFindBoundValue "fsionFsiState" with
@@ -1360,6 +1356,8 @@ type SessionHost(options: SessionHostOptions) =
             count <- nextCount
             failure <- nextFailure
             retained <- nextRetained
+        if not retained then
+            failwith "requested prelude pool was evicted during warmup"
         failure
 
     member _.DesiredSpec = lock poolGate (fun () -> desiredSpec)

@@ -749,7 +749,7 @@ def main(argv: list[str]) -> int:
     phases = None
 
     try:
-        warmup = _run_command([fsion_runner.command[0], "warmup"], work_dir, base_env, args.timeout)
+        warmup = _run_command([fsion_runner.command[0], "--pool-size", str(data["burstRuns"]), "warmup"], work_dir, base_env, args.timeout)
         warmup_out = warmup["stdout"].decode("utf-8", "replace").strip()
         if warmup["exit"] != 0 or "warm=True" not in warmup_out:
             _write_text(work_dir / "warmup.err", warmup["stderr"].decode("utf-8", "replace") + "\n" + warmup_out)

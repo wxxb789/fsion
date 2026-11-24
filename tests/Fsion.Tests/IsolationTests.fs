@@ -393,7 +393,7 @@ type IsolationTests(output: ITestOutputHelper) =
                 + string metrics.ColdClaims
             )
 
-            Assert.Equal(12, metrics.PoolTarget)
+            Assert.Equal(4, metrics.PoolTarget)
             Assert.Equal(5, metrics.Executed)
             Assert.Equal(0, metrics.ColdClaims)
             Assert.True(measuredMedian < 500.0, "median warm run wall time was " + string measuredMedian + " ms"))

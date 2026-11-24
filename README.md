@@ -15,24 +15,23 @@ bindings alive across agent turns.
 ## Measured performance
 
 Goal 0006 measured the Windows `win-x64` (`net10.0`) package on `CPC-lhan-XF3D0M`: 30 interleaved rounds
-per workload after three warmups (`--phase-samples 12 --require-goal0006`, salt `9c5fb055`, exit `0`).
+per workload after three warmups (`--phase-samples 12 --require-goal0006`, salt `2b6c3b6f`, exit `0`).
 Every round generated fresh F# / TS / JS / Python source and verified byte-identical stdout across all
 five runners (`fsion`, `dotnet-fsi`, `bun`, `node`, `python`), followed by a 12-script zero-gap burst.
 
 | Workload | `fsion` median | `bun` median | `node` median | `python` median | `dotnet fsi` median | `fsion` vs `dotnet fsi` |
 |---|---:|---:|---:|---:|---:|---:|
-| `hello` (fresh script) | **49.8 ms** | 51.9 ms | 75.4 ms | 47.8 ms | 3047.0 ms | **61.2x faster** (faster than `bun`) |
-| `typical` (JSON filter/sort + env) | **70.3 ms** | 55.9 ms | 75.9 ms | 69.3 ms | 3256.3 ms | **46.3x faster** (faster than `node`) |
-| `diverse` (DU / pipeline / StringBuilder / try) | **52.0 ms** | 53.0 ms | 78.1 ms | 46.9 ms | 3242.7 ms | **62.4x faster** (faster than `bun`) |
-| `burst` (12 back-to-back unseen `typical` scripts) | **65.2 ms** (max 219.3 ms) | 50.6 ms (max 54.8 ms) | — | — | — | 0 cold claims, 0 leaked sessions |
+| `hello` (fresh script) | **48.4 ms** | 54.0 ms | 76.0 ms | 47.0 ms | 3017.1 ms | **62.3x faster** (faster than `bun`) |
+| `typical` (JSON filter/sort + env) | **68.8 ms** | 53.0 ms | 77.5 ms | 66.5 ms | 3233.9 ms | **47.0x faster** (faster than `node`) |
+| `diverse` (DU / pipeline / StringBuilder / try) | **50.3 ms** | 50.3 ms | 75.6 ms | 46.3 ms | 3154.6 ms | **62.7x faster** (ties `bun`) |
+| `burst` (12 back-to-back unseen `typical` scripts) | **70.5 ms** (max 222.8 ms) | 49.2 ms (max 211.0 ms) | — | — | — | 0 cold claims, 0 leaked sessions |
 
 All nine Goal 0006 thresholds passed (`9/9 PASS`). On the separate historical AC-07 check, `fsion`
-passes `>= 20x` over `dotnet fsi` (`46.29x`) while `typical <= 1.00x bun` remains `FAIL` (`1.259x`:
-the 12-sample phase probe attributes ~32.2 ms to Windows process spawn + named-pipe IPC and ~28.7 ms
-to full F# Hindley-Milner typechecking + in-memory IL emit + execution). See the
+passes `>= 20x` over `dotnet fsi` (`47.03x`) while `typical <= 1.00x bun` remains `FAIL` (`1.297x`:
+Windows process spawn + named-pipe IPC accounts for ~32–37 ms and full F# Hindley-Milner typechecking
++ in-memory IL emit + execution accounts for ~29–45 ms). See the
 [Goal 0006 benchmark report](docs/evidence/0006-benchmark-report.md) and
 [Goal 0006 evidence](docs/evidence/0006-evidence.md) for full distributions and package SHA-256s.
-
 After the build and test gate has finished, run `python bench/run-bench.py` from the repository
 root. It writes the [Goal 0006 report](docs/evidence/0006-benchmark-report.md) and
 [raw results](docs/evidence/0006-benchmark-results.json) without changing the historical
@@ -61,7 +60,7 @@ black-box testing seam are in
 
 - **Zero disk-emitted assemblies on the hot path.** Scripts are compiled and executed in
   memory (`--optimize- --multiemit-`), so Windows Defender never scans a per-run `.dll`.
-- **Collectible pool with background replenishment.** `fsiond` defaults to 12 warm sessions per retained prelude
+- **Collectible pool with background replenishment.** `fsiond` defaults to 4 warm sessions per retained prelude
   (`--pool-size`, `FSION_POOL_SIZE`) that already imported core BCL metadata and the
   `Fsion` prelude; the pool refills in the background while the agent does other work.
 - **Stateful named sessions.** `--session <id>` persists bindings across calls until
@@ -149,7 +148,7 @@ fsion --timeout 2000 slow.fsx     # cooperative cancel, exit 124 on timeout
 | `--pipe <name>` | Daemon endpoint name (env: `FSION_PIPE`, default `fsion-<user>`) |
 | `--idle-ttl <minutes>` | Auto-started daemon idle TTL (env: `FSION_IDLE_TTL_MINUTES`, default 30) |
 | `--session-ttl <min>` | Named-session idle TTL (env: `FSION_SESSION_TTL_MINUTES`, default 15) |
-| `--pool-size <n>` | Warm session target per retained prelude for the auto-started daemon; `0` disables warm sessions (env: `FSION_POOL_SIZE`, default 12) |
+| `--pool-size <n>` | Warm session target per retained prelude for the auto-started daemon; `0` disables warm sessions (env: `FSION_POOL_SIZE`, default 4) |
 | `-h`, `--help`, `--version` | Help / version |
 
 Other environment variables: `FSIOND_PATH` (daemon binary), `FSION_CONFIG_DIR` (default

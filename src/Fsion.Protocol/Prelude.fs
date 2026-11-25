@@ -52,12 +52,19 @@ let private cachedPosixPasswdConfigDirectory =
     lazy (
         let accountHome = posixAccountHomeDirectory ()
         if accountHome.Length > 0 then Path.Combine(accountHome, ".config") else "")
-
+let private cachedMacApplicationSupportDirectory =
+    lazy (
+        if OperatingSystem.IsMacOS() then
+            let accountHome = posixAccountHomeDirectory ()
+            if accountHome.Length > 0 then Path.Combine(accountHome, "Library", "Application Support") else ""
+        else
+            "")
 let initializeProcessCaches () =
     if OperatingSystem.IsWindows() then
         cachedWindowsApplicationData.Value |> ignore
     else
         cachedPosixPasswdConfigDirectory.Value |> ignore
+        cachedMacApplicationSupportDirectory.Value |> ignore
 
 let userPreludePathFrom
     (includeConfiguredConfigDir: bool)
@@ -69,18 +76,36 @@ let userPreludePathFrom
         | Some directory ->
             if includeConfiguredConfigDir then Some directory else None
         | None ->
-            let home =
-                if OperatingSystem.IsWindows() then
-                    cachedWindowsApplicationData.Value
+            if OperatingSystem.IsWindows() then
+                if cachedWindowsApplicationData.Value.Length > 0 then
+                    Some(Path.Combine(cachedWindowsApplicationData.Value, "fsion"))
                 else
-                    match lookup "XDG_CONFIG_HOME" with
-                    | Some directory -> directory
-                    | None ->
+                    None
+            else
+                match lookup "XDG_CONFIG_HOME" with
+                | Some directory -> Some(Path.Combine(directory, "fsion"))
+                | None ->
+                    let xdgBase =
                         match lookup "HOME" with
                         | Some directory -> Path.Combine(directory, ".config")
                         | None -> cachedPosixPasswdConfigDirectory.Value
-
-            if home.Length > 0 then Some(Path.Combine(home, "fsion")) else None
+                    let xdgCandidate = if xdgBase.Length > 0 then Some(Path.Combine(xdgBase, "fsion")) else None
+                    if OperatingSystem.IsMacOS() then
+                        let appSupportBase =
+                            match lookup "HOME" with
+                            | Some directory -> Path.Combine(directory, "Library", "Application Support")
+                            | None -> cachedMacApplicationSupportDirectory.Value
+                        match xdgCandidate with
+                        | Some dir when File.Exists(Path.Combine(dir, "prelude.fsx")) -> Some dir
+                        | _ when appSupportBase.Length > 0 ->
+                            let appSupportDir = Path.Combine(appSupportBase, "fsion")
+                            if File.Exists(Path.Combine(appSupportDir, "prelude.fsx")) then
+                                Some appSupportDir
+                            else
+                                xdgCandidate
+                        | _ -> xdgCandidate
+                    else
+                        xdgCandidate
 
     match configDirectoryOpt with
     | None -> None
@@ -91,7 +116,6 @@ let userPreludePathFrom
                 Path.GetFullPath(Path.Combine(configDirectory, "prelude.fsx"), baseDir)
             | _ -> Path.GetFullPath(Path.Combine(configDirectory, "prelude.fsx"))
         if File.Exists candidate then Some candidate else None
-
 let userPreludePath () : string option = userPreludePathFrom true None environment
 
 let userPreludePathForEnvironment (workingDirectory: string) (snapshot: (string * string)[]) : string option =

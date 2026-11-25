@@ -360,8 +360,21 @@ def _read_metrics(endpoint: str, env: dict, timeout: float) -> dict:
         return metrics
 
     if os.name == "nt":
-        with open(r"\\.\pipe" + "\\" + endpoint, "r+b", buffering=0) as stream:
-            metrics = read_response(stream)
+        import concurrent.futures
+
+        def _win_pipe_read() -> list[int]:
+            with open(r"\\.\pipe" + "\\" + endpoint, "r+b", buffering=0) as stream:
+                return read_response(stream)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_win_pipe_read)
+        try:
+            metrics = future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError(f"timed out reading metrics from {endpoint} after {timeout}s") from exc
+        else:
+            executor.shutdown(wait=True)
     else:
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(timeout)

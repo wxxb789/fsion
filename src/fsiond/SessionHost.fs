@@ -669,35 +669,13 @@ type private ProcessStateGate() =
             | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
             | _ -> false))
 
-    let matchesBaseline (baseline: Dictionary<string, string>) (candidate: Dictionary<string, string>) =
-        baseline.Count = candidate.Count
-        && (baseline |> Seq.forall (fun (KeyValue(key, value)) ->
-            match candidate.TryGetValue key with
-            | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
-            | _ -> false))
-
-    let matchesBaselineArray (environment: (string * string)[]) =
-        environment.Length = daemonBaseline.Count
-        && (environment |> Array.forall (fun (key, value) ->
-            match daemonBaseline.TryGetValue key with
-            | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
-            | _ -> false))
-
-    let isBaselineState () =
-        String.Equals(currentDirectory, daemonDirectory, StringComparison.Ordinal)
-        && matchesBaseline daemonBaseline currentEnvironment
-
     member _.Enter(directory: string, environment: (string * string)[]) =
         lock sync (fun () ->
-            let requestIsBaseline =
-                String.Equals(directory, daemonDirectory, StringComparison.Ordinal)
-                && matchesBaselineArray environment
-
-            while (activeRuns > 0 && (currentDirectory <> directory || not (matchesEnvironment environment)))
-                  || (activeFilePreludes > 0 && not requestIsBaseline) do
+            while activeFilePreludes > 0
+                  || (activeRuns > 0 && (currentDirectory <> directory || not (matchesEnvironment environment))) do
                 Monitor.Wait sync |> ignore
 
-            if activeRuns = 0 && activeFilePreludes = 0 then
+            if activeRuns = 0 then
                 if not (String.Equals(Directory.GetCurrentDirectory(), directory, StringComparison.Ordinal)) then
                     Directory.SetCurrentDirectory directory
                 currentDirectory <- directory
@@ -715,19 +693,21 @@ type private ProcessStateGate() =
             lastExit <- Environment.TickCount64
 
             if activeRuns = 0 then
-                Directory.SetCurrentDirectory daemonDirectory
-                currentDirectory <- daemonDirectory
-                Monitor.PulseAll sync)
+                try
+                    Directory.SetCurrentDirectory daemonDirectory
+                    currentDirectory <- daemonDirectory
+                finally
+                    Monitor.PulseAll sync)
 
     member _.EnterFilePreludeBlocking() =
         lock sync (fun () ->
-            while activeRuns > 0 && not (isBaselineState ()) do
+            while activeRuns > 0 do
                 Monitor.Wait sync |> ignore
 
-            if activeRuns = 0 && activeFilePreludes = 0 then
-                if currentDirectory <> daemonDirectory then
+            if activeFilePreludes = 0 then
+                if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
                     Directory.SetCurrentDirectory daemonDirectory
-                    currentDirectory <- daemonDirectory
+                currentDirectory <- daemonDirectory
                 applyEnvironment (readProcessEnvironment ()) daemonBaseline
                 currentEnvironment <- daemonBaseline
 
@@ -737,14 +717,11 @@ type private ProcessStateGate() =
         lock sync (fun () ->
             if activeRuns = 0 then
                 if activeFilePreludes = 0 then
-                    if currentDirectory <> daemonDirectory then
+                    if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
                         Directory.SetCurrentDirectory daemonDirectory
-                        currentDirectory <- daemonDirectory
+                    currentDirectory <- daemonDirectory
                     applyEnvironment (readProcessEnvironment ()) daemonBaseline
                     currentEnvironment <- daemonBaseline
-                activeFilePreludes <- activeFilePreludes + 1
-                true
-            elif isBaselineState () then
                 activeFilePreludes <- activeFilePreludes + 1
                 true
             else
@@ -754,38 +731,37 @@ type private ProcessStateGate() =
         lock sync (fun () ->
             activeFilePreludes <- activeFilePreludes - 1
             if activeFilePreludes = 0 then
-                if activeRuns = 0 then
-                    Directory.SetCurrentDirectory daemonDirectory
-                    currentDirectory <- daemonDirectory
-                Monitor.PulseAll sync)
+                try
+                    if activeRuns = 0 then
+                        Directory.SetCurrentDirectory daemonDirectory
+                        currentDirectory <- daemonDirectory
+                finally
+                    Monitor.PulseAll sync)
 
     member _.CanEnterFilePreludeNow() =
-        lock sync (fun () -> activeRuns = 0 || isBaselineState ())
+        lock sync (fun () -> activeRuns = 0)
+
     member _.EnsureBaselineWhenIdle() =
         lock sync (fun () ->
             if activeRuns = 0 && activeFilePreludes = 0 then
-                if currentDirectory <> daemonDirectory then
+                if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
                     Directory.SetCurrentDirectory daemonDirectory
-                    currentDirectory <- daemonDirectory
+                currentDirectory <- daemonDirectory
                 applyEnvironment (readProcessEnvironment ()) daemonBaseline
                 currentEnvironment <- daemonBaseline)
+
     member _.RespawnEnvironment() =
         daemonBaseline |> Seq.map (fun (KeyValue(key, value)) -> key, value) |> Seq.toArray
 
     member _.IsQuiet(quietMs: int64) =
         lock sync (fun () -> activeRuns = 0 && Environment.TickCount64 - lastExit >= quietMs)
 
-    member _.CollectWhenIdle(action) =
-        lock sync (fun () ->
-            if activeRuns = 0 && Environment.TickCount64 - lastExit >= 500L then
-                action ())
-
 type private PreludePool(spec: Prelude.Spec, tag: Prelude.Tag) =
     member _.Spec = spec
     member val Tag = tag with get, set
     member val Warm = Queue<WarmSession>()
     member val Failure: string option = None with get, set
-
+    member val Claimers = 0 with get, set
 exception private PreludeEvaluationFailure of attemptedTag: Prelude.Tag * inner: exn
 
 type SessionHost(options: SessionHostOptions) =
@@ -986,50 +962,89 @@ type SessionHost(options: SessionHostOptions) =
                     pools.RemoveAt index
                     existing
                 else
-                    if pools.Count = 2 then
-                        let evicted = pools.[0]
-                        clearPool evicted
-                        pools.RemoveAt 0
+                    if pools.Count >= 2 then
+                        let evictIdx = pools.FindIndex(fun candidate -> candidate.Claimers = 0)
+                        if evictIdx >= 0 then
+                            let evicted = pools.[evictIdx]
+                            clearPool evicted
+                            pools.RemoveAt evictIdx
                     PreludePool(spec, tag)
             pools.Add slot
             slot, refreshTagWith tag slot)
     let poolCount () = lock poolGate (fun () -> pools |> Seq.sumBy (fun slot -> slot.Warm.Count))
 
     let claimSession (slot: PreludePool) (cancelToken: CancellationToken) : WarmSession =
-        let tryClaim () =
-            let tag = tagOfSpec slot.Spec
-            lock poolGate (fun () ->
-                refreshTagWith tag slot |> ignore
-                if slot.Warm.Count = 0 then None else Some(slot.Warm.Dequeue()))
+        lock poolGate (fun () ->
+            slot.Claimers <- slot.Claimers + 1
+            if not (pools.Contains slot) then
+                if pools.Count >= 2 then
+                    let evictIdx = pools.FindIndex(fun candidate -> candidate.Claimers = 0)
+                    if evictIdx >= 0 then
+                        let evicted = pools.[evictIdx]
+                        clearPool evicted
+                        pools.RemoveAt evictIdx
+                pools.Add slot)
 
-        match tryClaim () with
-        | Some warm -> warm
-        | None ->
-            Interlocked.Increment(&claimWaiters) |> ignore
-            try
-                logDetail "session-claim waiting"
-                let mutable claimedOpt = None
-                while claimedOpt.IsNone do
-                    creationGate.Wait(cancelToken)
-                    let mutable releaseCreationGate = true
-                    try
-                        match tryClaim () with
-                        | Some warm -> claimedOpt <- Some warm
-                        | None ->
-                            let canCreateNow =
-                                match slot.Spec with
-                                | Prelude.Spec.File _ -> processState.TryEnterFilePrelude()
-                                | _ -> true
-                            if not canCreateNow then
-                                creationGate.Release() |> ignore
-                                releaseCreationGate <- false
-                                processState.EnterFilePreludeBlocking()
-                                try
-                                    creationGate.Wait(cancelToken)
-                                    releaseCreationGate <- true
-                                    match tryClaim () with
-                                    | Some warm -> claimedOpt <- Some warm
-                                    | None ->
+        try
+            let tryClaim () =
+                let tag = tagOfSpec slot.Spec
+                lock poolGate (fun () ->
+                    refreshTagWith tag slot |> ignore
+                    if slot.Warm.Count = 0 then None else Some(slot.Warm.Dequeue()))
+
+            match tryClaim () with
+            | Some warm -> warm
+            | None ->
+                Interlocked.Increment(&claimWaiters) |> ignore
+                try
+                    logDetail "session-claim waiting"
+                    let mutable claimedOpt = None
+                    while claimedOpt.IsNone do
+                        creationGate.Wait(cancelToken)
+                        let mutable releaseCreationGate = true
+                        try
+                            match tryClaim () with
+                            | Some warm -> claimedOpt <- Some warm
+                            | None ->
+                                let canCreateNow =
+                                    match slot.Spec with
+                                    | Prelude.Spec.File _ -> processState.TryEnterFilePrelude()
+                                    | _ -> true
+                                if not canCreateNow then
+                                    creationGate.Release() |> ignore
+                                    releaseCreationGate <- false
+                                    processState.EnterFilePreludeBlocking()
+                                    try
+                                        creationGate.Wait(cancelToken)
+                                        releaseCreationGate <- true
+                                        match tryClaim () with
+                                        | Some warm -> claimedOpt <- Some warm
+                                        | None ->
+                                            Interlocked.Increment(&coldClaims.contents) |> ignore
+                                            try
+                                                let warm = createWarmSession false slot.Spec
+                                                let currentTag = tagOfSpec slot.Spec
+                                                lock poolGate (fun () ->
+                                                    if refreshTagWith currentTag slot = warm.Prelude then
+                                                        slot.Failure <- None)
+                                                claimedOpt <- Some warm
+                                            with
+                                            | PreludeEvaluationFailure (exactTag, inner) ->
+                                                let currentTag = tagOfSpec slot.Spec
+                                                lock poolGate (fun () ->
+                                                    if refreshTagWith currentTag slot = exactTag then
+                                                        slot.Failure <- Some inner.Message)
+                                                raise inner
+                                            | ex ->
+                                                let fallbackTag = tagOfSpec slot.Spec
+                                                lock poolGate (fun () ->
+                                                    if refreshTagWith fallbackTag slot = fallbackTag then
+                                                        slot.Failure <- Some ex.Message)
+                                                reraise ()
+                                    finally
+                                        processState.ExitFilePrelude()
+                                else
+                                    try
                                         Interlocked.Increment(&coldClaims.contents) |> ignore
                                         try
                                             let warm = createWarmSession false slot.Spec
@@ -1051,41 +1066,24 @@ type SessionHost(options: SessionHostOptions) =
                                                 if refreshTagWith fallbackTag slot = fallbackTag then
                                                     slot.Failure <- Some ex.Message)
                                             reraise ()
-                                finally
-                                    processState.ExitFilePrelude()
-                            else
-                                try
-                                    Interlocked.Increment(&coldClaims.contents) |> ignore
-                                    try
-                                        let warm = createWarmSession false slot.Spec
-                                        let currentTag = tagOfSpec slot.Spec
-                                        lock poolGate (fun () ->
-                                            if refreshTagWith currentTag slot = warm.Prelude then
-                                                slot.Failure <- None)
-                                        claimedOpt <- Some warm
-                                    with
-                                    | PreludeEvaluationFailure (exactTag, inner) ->
-                                        let currentTag = tagOfSpec slot.Spec
-                                        lock poolGate (fun () ->
-                                            if refreshTagWith currentTag slot = exactTag then
-                                                slot.Failure <- Some inner.Message)
-                                        raise inner
-                                    | ex ->
-                                        let fallbackTag = tagOfSpec slot.Spec
-                                        lock poolGate (fun () ->
-                                            if refreshTagWith fallbackTag slot = fallbackTag then
-                                                slot.Failure <- Some ex.Message)
-                                        reraise ()
-                                finally
-                                    match slot.Spec with
-                                    | Prelude.Spec.File _ -> processState.ExitFilePrelude()
-                                    | _ -> ()
-                    finally
-                        if releaseCreationGate then
-                            creationGate.Release() |> ignore
-                claimedOpt.Value
-            finally
-                Interlocked.Decrement(&claimWaiters) |> ignore
+                                    finally
+                                        match slot.Spec with
+                                        | Prelude.Spec.File _ -> processState.ExitFilePrelude()
+                                        | _ -> ()
+                        finally
+                            if releaseCreationGate then
+                                creationGate.Release() |> ignore
+                    claimedOpt.Value
+                finally
+                    Interlocked.Decrement(&claimWaiters) |> ignore
+        finally
+            lock poolGate (fun () ->
+                slot.Claimers <- slot.Claimers - 1
+                while pools.Count > 2 && pools.Exists(fun candidate -> candidate.Claimers = 0) do
+                    let evictIdx = pools.FindIndex(fun candidate -> candidate.Claimers = 0)
+                    let evicted = pools.[evictIdx]
+                    clearPool evicted
+                    pools.RemoveAt evictIdx)
 
     let removeHandlers (work: CleanupWork) =
         removeProcessExit work.ProcessExitHandlers
@@ -1143,8 +1141,8 @@ type SessionHost(options: SessionHostOptions) =
             try
                 if pendingCleanups.Count >= 16 then
                     drainPendingCleanups ()
-                elif Volatile.Read(&claimWaiters) = 0 then
-                    processState.CollectWhenIdle drainPendingCleanups
+                elif Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L then
+                    drainPendingCleanups ()
             finally
                 creationGate.Release() |> ignore
 
@@ -1513,7 +1511,7 @@ type SessionHost(options: SessionHostOptions) =
                                         if processState.TryEnterFilePrelude() then ValueSome true else ValueNone
                                     | _ -> ValueSome false
                                 match entered with
-                                | ValueNone -> ()
+                                | ValueNone -> filling <- false
                                 | ValueSome isFile ->
                                     try
                                         try
@@ -1522,7 +1520,8 @@ type SessionHost(options: SessionHostOptions) =
                                                 GC.Collect(1, GCCollectionMode.Optimized, false)
                                             let currentTag = tagOfSpec slot.Spec
                                             lock poolGate (fun () ->
-                                                if pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
+                                                if (pools.Contains slot || slot.Claimers > 0)
+                                                   && refreshTagWith currentTag slot = warm.Prelude then
                                                     slot.Warm.Enqueue warm
                                                 else
                                                     discard.Enqueue warm)
@@ -1743,11 +1742,12 @@ type SessionHost(options: SessionHostOptions) =
                     finally
                         Ambient.clear ()
                 finally
-                    let wasEntered = entered
-                    if wasEntered then
-                        processState.Exit ()
-                    if stateless then
-                        if wasEntered then releaseSessionWith collectionsBefore claimed else releaseSession claimed
+                    try
+                        if entered then
+                            processState.Exit ()
+                    finally
+                        if stateless then
+                            if entered then releaseSessionWith collectionsBefore claimed else releaseSession claimed
             finally
                 if options.LogPath.IsSome then
                     let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs

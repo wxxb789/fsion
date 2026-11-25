@@ -486,38 +486,33 @@ type IsolationTests(output: ITestOutputHelper) =
                        "    File.WriteAllText(" + literal creating + ", \"creating\")"
                        "    while File.Exists " + literal block + " do Thread.Sleep 10"
                        "let greeting = \"hello\"" ])
-            let daemonDir = Path.GetDirectoryName Fsion.Tests.TestInfra.fsiondBinary
-            let runFromDaemonDir args =
-                runProcess
-                    Fsion.Tests.TestInfra.fsionBinary
-                    ([ "--pool-size"; "2"; "--prelude"; prelude ] @ args)
-                    daemonDir
-                    (context.Environment @ env)
-                    None
-                    120000
-            runFromDaemonDir [ "warmup" ] |> assertRun
+            let run args =
+                context.Run(
+                    [ "--pool-size"; "1"; "--prelude"; prelude ] @ args,
+                    timeoutMs = 120000,
+                    extraEnv = env
+                )
+            run [ "warmup" ] |> assertRun
             let before = context.MetricsOrFail()
-            Assert.Equal(2, before.PoolWarm)
+            Assert.Equal(1, before.PoolWarm)
             writeFile directory "block" ""
             try
-                let first = Task.Run(fun () -> runFromDaemonDir [ "-e"; "System.Console.Write(greeting)" ])
-                assertRun first.Result
+                let first = run [ "-e"; "System.Console.Write(greeting)" ]
+                assertRun first
+                Assert.Equal("hello", first.Stdout)
                 awaitCondition "replenishment did not start" (fun () -> File.Exists creating)
-                let second = runFromDaemonDir [ "-e"; "System.Console.Write(greeting + \"2\")" ]
-                assertRun second
-                Assert.Equal("hello2", second.Stdout)
-                let third = Task.Run(fun () -> runFromDaemonDir [ "-e"; "System.IO.File.WriteAllText(" + literal active + ", greeting)" ])
+                let second = Task.Run(fun () -> run [ "-e"; "System.IO.File.WriteAllText(" + literal active + ", greeting + \"2\")" ])
                 awaitCondition "empty-pool claimant did not wait for the in-flight producer" (fun () -> (readLog log).Contains("session-claim waiting"))
                 Assert.False(File.Exists active)
                 File.Delete block
-                assertRun third.Result
-                Assert.Equal("hello", File.ReadAllText active)
+                assertRun second.Result
+                Assert.Equal("hello2", File.ReadAllText active)
                 let after = context.MetricsOrFail()
-                Assert.Equal(before.Executed + 3, after.Executed)
+                Assert.Equal(before.Executed + 2, after.Executed)
                 Assert.Equal(before.ColdClaims, after.ColdClaims)
-                Assert.Equal(2, after.PoolWarm)
+                Assert.Equal(1, after.PoolWarm)
                 let creations = (readLog log).Split('\n') |> Array.filter (fun line -> line.Contains "session-created total=")
-                Assert.Equal(5, creations.Length)
+                Assert.Equal(3, creations.Length)
             finally
                 File.Delete block)
 

@@ -288,30 +288,93 @@ let private scriptAssemblies () =
 // `let reader = new StreamReader(...)` keeps its Windows file handle locked until the binding is
 // disposed or the field is nulled (initonly fields cannot be nulled, so they must be disposed).
 // Nulling the rest lets GC unload the assembly and finalize any remaining streams.
+let rec private disposeValueGraph (visited: HashSet<obj>) (depth: int) (value: obj) =
+    if not (isNull value) && depth < 16 then
+        let valueType = value.GetType()
+
+        if
+            not valueType.IsPrimitive
+            && not valueType.IsEnum
+            && not valueType.IsPointer
+            && valueType <> typeof<string>
+        then
+            let canProceed =
+                if valueType.IsValueType then
+                    true
+                else
+                    visited.Add value
+
+            if canProceed then
+                match value with
+                | :? IDisposable as disposable ->
+                    try
+                        disposable.Dispose()
+                    with _ ->
+                        ()
+                | _ -> ()
+
+                match value with
+                | :? Array as arrayValue ->
+                    let elementType = valueType.GetElementType()
+
+                    if
+                        not (isNull elementType)
+                        && not elementType.IsPrimitive
+                        && not elementType.IsEnum
+                        && elementType <> typeof<string>
+                    then
+                        let enumerator = arrayValue.GetEnumerator()
+
+                        while enumerator.MoveNext() do
+                            disposeValueGraph visited (depth + 1) enumerator.Current
+                | _ ->
+                    let mutable currentType = valueType
+
+                    while not (isNull currentType) && currentType <> typeof<obj> && currentType <> typeof<ValueType> do
+                        for field in currentType.GetFields(BindingFlags.Instance ||| BindingFlags.Public ||| BindingFlags.NonPublic) do
+                            let fieldType = field.FieldType
+
+                            if
+                                not fieldType.IsPrimitive
+                                && not fieldType.IsEnum
+                                && not fieldType.IsPointer
+                                && fieldType <> typeof<string>
+                            then
+                                try
+                                    disposeValueGraph visited (depth + 1) (field.GetValue value)
+                                with _ ->
+                                    ()
+
+                        currentType <- currentType.BaseType
+
 let private clearScriptStatics (preludeTypes: HashSet<Type>) (assemblies: Assembly[]) =
+    let visited = HashSet<obj>(ReferenceEqualityComparer.Instance)
+
     for assembly in assemblies do
         try
             for scriptType in assembly.GetTypes() |> Array.filter (preludeTypes.Contains >> not) do
                 for field in scriptType.GetFields(BindingFlags.Static ||| BindingFlags.Public ||| BindingFlags.NonPublic) do
                     if
                         not field.IsLiteral
-                        && not field.FieldType.IsValueType
+                        && not field.FieldType.IsPrimitive
+                        && not field.FieldType.IsEnum
                         && not field.FieldType.IsPointer
+                        && field.FieldType <> typeof<string>
                     then
                         try
-                            match field.GetValue null with
-                            | :? IDisposable as disposable ->
-                                try
-                                    disposable.Dispose()
-                                with _ ->
-                                    ()
-                            | _ -> ()
+                            disposeValueGraph visited 0 (field.GetValue null)
                         with _ ->
                             ()
 
                         if not field.IsInitOnly then
                             try
-                                field.SetValue(null, null)
+                                let resetValue =
+                                    if field.FieldType.IsValueType then
+                                        Activator.CreateInstance field.FieldType
+                                    else
+                                        null
+
+                                field.SetValue(null, resetValue)
                             with _ ->
                                 ()
         with _ ->
@@ -996,10 +1059,14 @@ type SessionHost(options: SessionHostOptions) =
 
         try
             let tryClaim () =
-                let tag = tagOfSpec slot.Spec
-                lock poolGate (fun () ->
-                    refreshTagWith tag slot |> ignore
-                    if slot.Warm.Count = 0 then None else Some(slot.Warm.Dequeue()))
+                let hasCandidates = lock poolGate (fun () -> slot.Warm.Count > 0)
+                if not hasCandidates then
+                    None
+                else
+                    let tag = tagOfSpec slot.Spec
+                    lock poolGate (fun () ->
+                        refreshTagWith tag slot |> ignore
+                        if slot.Warm.Count = 0 then None else Some(slot.Warm.Dequeue()))
 
             match tryClaim () with
             | Some warm -> warm
@@ -1017,6 +1084,27 @@ type SessionHost(options: SessionHostOptions) =
                                 match tryClaim () with
                                 | Some warm -> claimedOpt <- Some warm
                                 | None ->
+                                    let createCold () =
+                                        Interlocked.Increment(&coldClaims.contents) |> ignore
+                                        try
+                                            let warm = createWarmSession failedWarm slot.Spec
+                                            lock poolGate (fun () ->
+                                                if slot.Tag = warm.Prelude then
+                                                    slot.Failure <- None)
+                                            claimedOpt <- Some warm
+                                        with
+                                        | PreludeEvaluationFailure (exactTag, inner) ->
+                                            lock poolGate (fun () ->
+                                                if slot.Tag = exactTag then
+                                                    slot.Failure <- Some inner.Message)
+                                            raise inner
+                                        | ex ->
+                                            let fallbackTag = tagOfSpec slot.Spec
+                                            lock poolGate (fun () ->
+                                                if refreshTagWith fallbackTag slot = fallbackTag then
+                                                    slot.Failure <- Some ex.Message)
+                                            reraise ()
+
                                     let canCreateNow =
                                         match slot.Spec with
                                         | Prelude.Spec.File _ -> processState.TryEnterFilePrelude()
@@ -1030,53 +1118,12 @@ type SessionHost(options: SessionHostOptions) =
                                             releaseCreationGate <- true
                                             match tryClaim () with
                                             | Some warm -> claimedOpt <- Some warm
-                                            | None ->
-                                                Interlocked.Increment(&coldClaims.contents) |> ignore
-                                                try
-                                                    let warm = createWarmSession failedWarm slot.Spec
-                                                    let currentTag = tagOfSpec slot.Spec
-                                                    lock poolGate (fun () ->
-                                                        if refreshTagWith currentTag slot = warm.Prelude then
-                                                            slot.Failure <- None)
-                                                    claimedOpt <- Some warm
-                                                with
-                                                | PreludeEvaluationFailure (exactTag, inner) ->
-                                                    let currentTag = tagOfSpec slot.Spec
-                                                    lock poolGate (fun () ->
-                                                        if refreshTagWith currentTag slot = exactTag then
-                                                            slot.Failure <- Some inner.Message)
-                                                    raise inner
-                                                | ex ->
-                                                    let fallbackTag = tagOfSpec slot.Spec
-                                                    lock poolGate (fun () ->
-                                                        if refreshTagWith fallbackTag slot = fallbackTag then
-                                                            slot.Failure <- Some ex.Message)
-                                                    reraise ()
+                                            | None -> createCold ()
                                         finally
                                             processState.ExitFilePrelude()
                                     else
                                         try
-                                            Interlocked.Increment(&coldClaims.contents) |> ignore
-                                            try
-                                                let warm = createWarmSession failedWarm slot.Spec
-                                                let currentTag = tagOfSpec slot.Spec
-                                                lock poolGate (fun () ->
-                                                    if refreshTagWith currentTag slot = warm.Prelude then
-                                                        slot.Failure <- None)
-                                                claimedOpt <- Some warm
-                                            with
-                                            | PreludeEvaluationFailure (exactTag, inner) ->
-                                                let currentTag = tagOfSpec slot.Spec
-                                                lock poolGate (fun () ->
-                                                    if refreshTagWith currentTag slot = exactTag then
-                                                        slot.Failure <- Some inner.Message)
-                                                raise inner
-                                            | ex ->
-                                                let fallbackTag = tagOfSpec slot.Spec
-                                                lock poolGate (fun () ->
-                                                    if refreshTagWith fallbackTag slot = fallbackTag then
-                                                        slot.Failure <- Some ex.Message)
-                                                reraise ()
+                                            createCold ()
                                         finally
                                             match slot.Spec with
                                             | Prelude.Spec.File _ -> processState.ExitFilePrelude()
@@ -1105,21 +1152,25 @@ type SessionHost(options: SessionHostOptions) =
         removeUnmanagedDll work.UnmanagedDllHandlers
         removeAssemblyResolve work.AssemblyResolveHandlers
 
+    let releasedGate = obj ()
+
     let drainReleasedSessions () =
-        let survivors = ResizeArray<WeakReference>()
-        let mutable weak = Unchecked.defaultof<WeakReference>
+        lock releasedGate (fun () ->
+            let survivors = ResizeArray<WeakReference>()
+            let mutable weak = Unchecked.defaultof<WeakReference>
 
-        while releasedSessions.TryDequeue(&weak) do
-            if weak.IsAlive then
-                survivors.Add weak
+            while releasedSessions.TryDequeue(&weak) do
+                if weak.IsAlive then
+                    survivors.Add weak
 
-        for survivor in survivors do
-            releasedSessions.Enqueue survivor
+            for survivor in survivors do
+                releasedSessions.Enqueue survivor
 
-        survivors.Count
+            survivors.Count)
 
     let mutable totalReleased = 0
-    let mutable pendingUnloadSweep = 0
+    let mutable pendingUnloadPhase1 = 0
+    let mutable pendingUnloadPhase2 = 0
 
     let disposePendingCleanups () =
         let mutable work = Unchecked.defaultof<CleanupWork>
@@ -1132,7 +1183,7 @@ type SessionHost(options: SessionHostOptions) =
             | Some session ->
                 detachSessionCallback session
                 clearCheckerCaches session
-                releasedSessions.Enqueue(WeakReference(session))
+                lock releasedGate (fun () -> releasedSessions.Enqueue(WeakReference(session)))
 
                 try
                     (session :> IDisposable).Dispose()
@@ -1145,22 +1196,25 @@ type SessionHost(options: SessionHostOptions) =
         drained
 
     let completeUnloadSweep (forceSweep: bool) =
-        let pending = Interlocked.Exchange(&pendingUnloadSweep, 0)
-        if pending > 0 then
-            if forceSweep || (Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L) then
-                sweepFinalizers ()
-                let alive =
-                    if creationGate.Wait 0 then
-                        try
-                            drainReleasedSessions ()
-                        finally
-                            creationGate.Release() |> ignore
-                    else
-                        0
-                let cumulative = Interlocked.Add(&totalReleased, pending)
+        let isQuietNow () = forceSweep || (Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L)
+        let phase1 = Interlocked.Exchange(&pendingUnloadPhase1, 0)
+        if phase1 > 0 then
+            if isQuietNow () then
+                GC.Collect(2, GCCollectionMode.Forced, true, false)
+                GC.WaitForPendingFinalizers()
+                Interlocked.Add(&pendingUnloadPhase2, phase1) |> ignore
+            else
+                Interlocked.Add(&pendingUnloadPhase1, phase1) |> ignore
+
+        let phase2 = Interlocked.Exchange(&pendingUnloadPhase2, 0)
+        if phase2 > 0 then
+            if isQuietNow () then
+                GC.Collect(2, GCCollectionMode.Forced, true, false)
+                let alive = drainReleasedSessions ()
+                let cumulative = Interlocked.Add(&totalReleased, phase2)
                 logDetail ($"unload released={cumulative} alive={alive}")
             else
-                Interlocked.Add(&pendingUnloadSweep, pending) |> ignore
+                Interlocked.Add(&pendingUnloadPhase2, phase2) |> ignore
 
     let drainCleanups () =
         let mutable forceSweep = false
@@ -1171,15 +1225,15 @@ type SessionHost(options: SessionHostOptions) =
                     forceSweep <- true
                     let drained = disposePendingCleanups ()
                     if drained > 0 then
-                        Interlocked.Add(&pendingUnloadSweep, drained) |> ignore
+                        Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
                 elif Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L then
                     let drained = disposePendingCleanups ()
                     if drained > 0 then
-                        Interlocked.Add(&pendingUnloadSweep, drained) |> ignore
+                        Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
             finally
                 creationGate.Release() |> ignore
 
-        if Volatile.Read(&pendingUnloadSweep) > 0 then
+        if Volatile.Read(&pendingUnloadPhase1) > 0 || Volatile.Read(&pendingUnloadPhase2) > 0 then
             completeUnloadSweep forceSweep
 
     let drainCleanupsBlocking () =
@@ -1188,7 +1242,7 @@ type SessionHost(options: SessionHostOptions) =
         try
             let drained = disposePendingCleanups ()
             if drained > 0 then
-                Interlocked.Add(&pendingUnloadSweep, drained) |> ignore
+                Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
         finally
             creationGate.Release() |> ignore
 
@@ -1954,12 +2008,7 @@ type SessionHost(options: SessionHostOptions) =
         sweepFinalizers ()
 
         let scriptAssemblyCount = scriptAssemblies () |> Array.length
-        let aliveDisposedSessions =
-            creationGate.Wait()
-            try
-                drainReleasedSessions ()
-            finally
-                creationGate.Release() |> ignore
+        let aliveDisposedSessions = drainReleasedSessions ()
 
         { PoolTarget = targetPoolSize
           PoolWarm = poolCount ()

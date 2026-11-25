@@ -466,7 +466,33 @@ type IsolationTests(output: ITestOutputHelper) =
             assertRun leaked
             Assert.Equal("112", leaked.Stdout)
             assertFileUnlocked path
-            File.Delete path)
+            File.Delete path
+
+            let structPath = Path.Combine(directory, "struct-leaked.txt")
+            writeFile directory "struct-leaked.txt" "payload"
+            let holdEntered = Path.Combine(directory, "struct-hold-entered.txt")
+            let holdRelease = Path.Combine(directory, "struct-hold-release.txt")
+            let holdNamed =
+                System.Threading.Tasks.Task.Run(fun () ->
+                    run
+                        [ "--session"; "setup"; "-e"
+                          sprintf "System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20" holdEntered holdRelease ])
+            awaitCondition "named hold turn entered" (fun () -> File.Exists holdEntered)
+            try
+                let structCode =
+                    String.concat "\n"
+                        [ "[<Struct>]"
+                          "type StructHolder = { Stream: System.IO.FileStream }"
+                          "let holder = { Stream = System.IO.File.OpenRead(fsi.CommandLineArgs.[1]) }"
+                          "System.Console.Write(holder.Stream.ReadByte())" ]
+                let structRun = run [ "-e"; structCode; structPath ]
+                assertRun structRun
+                Assert.Equal("112", structRun.Stdout)
+                assertFileUnlocked structPath
+                File.Delete structPath
+            finally
+                writeFile directory "struct-hold-release.txt" "go"
+                holdNamed.GetAwaiter().GetResult() |> assertRun)
 
     [<Fact>]
     member _.``an empty pool claimant takes the session made by its in-flight producer`` () =
@@ -495,20 +521,22 @@ type IsolationTests(output: ITestOutputHelper) =
             run [ "warmup" ] |> assertRun
             let before = context.MetricsOrFail()
             Assert.Equal(2, before.PoolWarm)
-            let first = run [ "-e"; "System.Console.Write(greeting)" ]
-            assertRun first
-            Assert.Equal("hello", first.Stdout)
             writeFile directory "block" ""
             try
-                let second = run [ "-e"; "System.Console.Write(greeting + \"2\")" ]
-                assertRun second
-                Assert.Equal("hello2", second.Stdout)
+                let first = run [ "-e"; "System.Console.Write(greeting)" ]
+                assertRun first
+                Assert.Equal("hello", first.Stdout)
                 awaitCondition "replenishment did not start" (fun () -> File.Exists creating)
+                let second = Task.Run(fun () -> run [ "-e"; "System.Console.Write(greeting + \"2\")" ])
+                Thread.Sleep 150
                 let third = Task.Run(fun () -> run [ "-e"; "System.IO.File.WriteAllText(" + literal active + ", greeting)" ])
                 awaitCondition "empty-pool claimant did not wait for the in-flight producer" (fun () -> (readLog log).Contains("session-claim waiting"))
                 Assert.False(File.Exists active)
                 File.Delete block
-                assertRun third.Result
+                let secondRes = second.GetAwaiter().GetResult()
+                assertRun secondRes
+                Assert.Equal("hello2", secondRes.Stdout)
+                assertRun (third.GetAwaiter().GetResult())
                 Assert.Equal("hello", File.ReadAllText active)
                 let after = context.MetricsOrFail()
                 Assert.Equal(before.Executed + 3, after.Executed)

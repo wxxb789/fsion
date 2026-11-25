@@ -989,36 +989,70 @@ type SessionHost(options: SessionHostOptions) =
             Interlocked.Increment(&claimWaiters) |> ignore
             try
                 logDetail "session-claim waiting"
-                creationGate.Wait(cancelToken)
-                try
-                    match tryClaim () with
-                    | Some warm -> warm
-                    | None ->
-                        Interlocked.Increment(&coldClaims.contents) |> ignore
-                        let attemptedTag = tagOfSpec slot.Spec
-                        try
-                            let warm =
+                let mutable claimedOpt = None
+                while claimedOpt.IsNone do
+                    creationGate.Wait(cancelToken)
+                    let mutable releaseCreationGate = true
+                    try
+                        match tryClaim () with
+                        | Some warm -> claimedOpt <- Some warm
+                        | None ->
+                            let canCreateNow =
                                 match slot.Spec with
-                                | Prelude.Spec.File _ ->
-                                    processState.EnterFilePreludeBlocking()
+                                | Prelude.Spec.File _ -> processState.TryEnterFilePrelude()
+                                | _ -> true
+                            if not canCreateNow then
+                                creationGate.Release() |> ignore
+                                releaseCreationGate <- false
+                                processState.EnterFilePreludeBlocking()
+                                try
+                                    creationGate.Wait(cancelToken)
+                                    releaseCreationGate <- true
+                                    match tryClaim () with
+                                    | Some warm -> claimedOpt <- Some warm
+                                    | None ->
+                                        Interlocked.Increment(&coldClaims.contents) |> ignore
+                                        let attemptedTag = tagOfSpec slot.Spec
+                                        try
+                                            let warm = createWarmSession slot.Spec
+                                            let currentTag = tagOfSpec slot.Spec
+                                            lock poolGate (fun () ->
+                                                if refreshTagWith currentTag slot = warm.Prelude then
+                                                    slot.Failure <- None)
+                                            claimedOpt <- Some warm
+                                        with ex ->
+                                            let currentTag = tagOfSpec slot.Spec
+                                            lock poolGate (fun () ->
+                                                if refreshTagWith currentTag slot = attemptedTag then
+                                                    slot.Failure <- Some ex.Message)
+                                            reraise ()
+                                finally
+                                    processState.ExitFilePrelude()
+                            else
+                                try
+                                    Interlocked.Increment(&coldClaims.contents) |> ignore
+                                    let attemptedTag = tagOfSpec slot.Spec
                                     try
-                                        createWarmSession slot.Spec
-                                    finally
-                                        processState.ExitFilePrelude()
-                                | _ -> createWarmSession slot.Spec
-                            let currentTag = tagOfSpec slot.Spec
-                            lock poolGate (fun () ->
-                                if refreshTagWith currentTag slot = warm.Prelude then
-                                    slot.Failure <- None)
-                            warm
-                        with ex ->
-                            let currentTag = tagOfSpec slot.Spec
-                            lock poolGate (fun () ->
-                                if refreshTagWith currentTag slot = attemptedTag then
-                                    slot.Failure <- Some ex.Message)
-                            reraise ()
-                finally
-                    creationGate.Release() |> ignore
+                                        let warm = createWarmSession slot.Spec
+                                        let currentTag = tagOfSpec slot.Spec
+                                        lock poolGate (fun () ->
+                                            if refreshTagWith currentTag slot = warm.Prelude then
+                                                slot.Failure <- None)
+                                        claimedOpt <- Some warm
+                                    with ex ->
+                                        let currentTag = tagOfSpec slot.Spec
+                                        lock poolGate (fun () ->
+                                            if refreshTagWith currentTag slot = attemptedTag then
+                                                slot.Failure <- Some ex.Message)
+                                        reraise ()
+                                finally
+                                    match slot.Spec with
+                                    | Prelude.Spec.File _ -> processState.ExitFilePrelude()
+                                    | _ -> ()
+                    finally
+                        if releaseCreationGate then
+                            creationGate.Release() |> ignore
+                claimedOpt.Value
             finally
                 Interlocked.Decrement(&claimWaiters) |> ignore
 
@@ -1411,8 +1445,7 @@ type SessionHost(options: SessionHostOptions) =
                                let needsCheck =
                                    lock poolGate (fun () ->
                                        pools.Contains candidate
-                                       && candidate.Failure.IsNone
-                                       && candidate.Warm.Count < targetPoolSize)
+                                       && (candidate.Warm.Count < targetPoolSize || candidate.Failure.IsSome))
                                if needsCheck then
                                    yield candidate, tagOfSpec candidate.Spec |]
                     lock poolGate (fun () ->
@@ -1486,7 +1519,7 @@ type SessionHost(options: SessionHostOptions) =
                 )
                 |> ignore
 
-    let waitForWarm timeoutMs (slot: PreludePool) =
+    let waitForWarm timeoutMs failOnEvict (slot: PreludePool) =
         let deadline = Environment.TickCount64 + timeoutMs
         let state () = lock poolGate (fun () -> slot.Warm.Count, slot.Failure, pools.Contains slot)
         let mutable count, failure, retained = state ()
@@ -1497,12 +1530,16 @@ type SessionHost(options: SessionHostOptions) =
             failure <- nextFailure
             retained <- nextRetained
         if not retained then
-            failwith "requested prelude pool was evicted during warmup"
-        match failure with
-        | Some message -> Some message
-        | None when count < targetPoolSize ->
-            Some("timed out waiting for warm session pool to fill within " + string timeoutMs + " ms")
-        | None -> None
+            if failOnEvict then
+                Some "requested prelude pool was evicted during warmup"
+            else
+                None
+        else
+            match failure with
+            | Some message -> Some message
+            | None when count < targetPoolSize ->
+                Some("timed out waiting for warm session pool to fill within " + string timeoutMs + " ms")
+            | None -> None
 
     member _.DesiredSpec = lock poolGate (fun () -> desiredSpec)
 
@@ -1516,7 +1553,7 @@ type SessionHost(options: SessionHostOptions) =
                 Interlocked.Increment(&ensureWarmActive) |> ignore
                 try
                     replenishSignal.Release() |> ignore
-                    match waitForWarm 60000L slot with
+                    match waitForWarm 60000L true slot with
                     | Some message -> failwith message
                     | None -> ()
                 finally
@@ -1524,15 +1561,15 @@ type SessionHost(options: SessionHostOptions) =
             else
                 match spec with
                 | Prelude.Spec.File _ ->
-                    creationGate.Wait()
+                    processState.EnterFilePreludeBlocking()
                     try
-                        processState.EnterFilePreludeBlocking()
+                        creationGate.Wait()
                         try
                             createWarmSession spec |> releaseSession
                         finally
-                            processState.ExitFilePrelude()
+                            creationGate.Release() |> ignore
                     finally
-                        creationGate.Release() |> ignore
+                        processState.ExitFilePrelude()
                     replenishSignal.Release() |> ignore
                 | _ -> ()
 
@@ -1795,7 +1832,7 @@ type SessionHost(options: SessionHostOptions) =
             let slots = lock poolGate (fun () -> pools.ToArray())
             replenishSignal.Release() |> ignore
             for slot in slots do
-                waitForWarm 30000L slot |> ignore
+                waitForWarm 30000L false slot |> ignore
 
         drainCleanupsBlocking ()
         sweepFinalizers ()

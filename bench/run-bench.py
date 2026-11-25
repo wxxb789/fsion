@@ -33,7 +33,6 @@ import statistics
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -726,8 +725,11 @@ def main(argv: list[str]) -> int:
         for required_runner in required_runners:
             if required_runner not in present_ids:
                 missing.append(f"runner '{required_runner}' is missing")
-        if flag == "--require-goal0006" and args.phase_samples < 1:
-            missing.append("--phase-samples must be >= 1 when --require-goal0006 is set")
+        if flag == "--require-goal0006":
+            if args.phase_samples < 1:
+                missing.append("--phase-samples must be >= 1 when --require-goal0006 is set")
+            if int(data.get("burstRuns", 0)) < 12:
+                missing.append(f"data['burstRuns'] must be >= 12 when --require-goal0006 is set (got {data.get('burstRuns')})")
         if missing:
             raise SystemExit(f"{flag} preconditions not met: " + "; ".join(missing))
 

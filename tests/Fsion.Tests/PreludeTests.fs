@@ -524,6 +524,67 @@ type PreludeTests(output: ITestOutputHelper) =
             Assert.True(v2Run.ExitCode = 0, v2Run.Stderr)
             Assert.Equal("v2-ok", v2Run.Stdout)
 
+            writeFile directory "prelude.fsx" "failwith \"bg-broken\"\n"
+            let brokenWarm = context.Run([ "--pool-size"; "1"; "--prelude"; preludePath; "warmup" ], timeoutMs = 120000)
+            Assert.Equal(1, brokenWarm.ExitCode)
+            let statusBroken = context.Run([ "daemon"; "status" ], timeoutMs = 30000)
+            Assert.Contains("warm=False", statusBroken.Stdout)
+            writeFile directory "prelude.fsx" "let autoFixed () = \"bg-auto-ok\"\n"
+            waitFor "background replenisher auto-recovered fixed prelude" (fun () ->
+                let st = context.Run([ "daemon"; "status" ], timeoutMs = 30000)
+                st.Stdout.Contains("warm=True"))
+
+            let lockHoldEntered = Path.Combine(directory, "lock-hold-entered.txt")
+            let lockHoldRelease = Path.Combine(directory, "lock-hold-release.txt")
+            let coldFileDone = Path.Combine(directory, "cold-file-done.txt")
+            writeFile directory "prelude.fsx" "let unblockedFile () = \"file-cold-ok\"\n"
+            let poolZeroEndpoint = "fsion-test-p0-" + Guid.NewGuid().ToString("N")
+            let poolZeroEnv =
+                [ "FSION_PIPE", poolZeroEndpoint
+                  "FSIOND_PATH", Fsion.Tests.TestInfra.fsiondBinary
+                  "FSION_CONFIG_DIR", Path.Combine(directory, ".fsion-p0-config") ]
+            try
+                let startP0 = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--pool-size"; "0"; "daemon"; "start" ] callerSubdir poolZeroEnv None 60000
+                Assert.True(startP0.ExitCode = 0, startP0.Stderr)
+                let reqA =
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        runProcess
+                            Fsion.Tests.TestInfra.fsionBinary
+                            [ "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20; System.Console.Write(\"A-ok\")" lockHoldEntered lockHoldRelease ]
+                            callerSubdir
+                            poolZeroEnv
+                            None
+                            120000)
+                waitFor "reqA entered non-baseline cwd" (fun () -> File.Exists lockHoldEntered)
+                let reqB =
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        let r =
+                            runProcess
+                                Fsion.Tests.TestInfra.fsionBinary
+                                [ "--prelude"; preludePath; "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", unblockedFile()); System.Console.Write(unblockedFile())" coldFileDone ]
+                                callerSubdir
+                                poolZeroEnv
+                                None
+                                120000
+                        r)
+                System.Threading.Thread.Sleep 200
+                let reqC =
+                    runProcess
+                        Fsion.Tests.TestInfra.fsionBinary
+                        [ "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"go\"); System.Console.Write(\"C-ok\")" lockHoldRelease ]
+                        callerSubdir
+                        poolZeroEnv
+                        None
+                        60000
+                Assert.True(reqC.ExitCode = 0, reqC.Stderr)
+                Assert.Equal("C-ok", reqC.Stdout)
+                let resA = reqA.GetAwaiter().GetResult()
+                Assert.True(resA.ExitCode = 0, resA.Stderr)
+                let resB = reqB.GetAwaiter().GetResult()
+                Assert.True(resB.ExitCode = 0, resB.Stderr)
+                Assert.Equal("file-cold-ok", resB.Stdout)
+            finally
+                runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] callerSubdir poolZeroEnv None 20000 |> ignore
             let subProject = Path.Combine(directory, "sub-project")
             let relConfig = Path.Combine(subProject, ".fsion-rel")
             writeFile relConfig "prelude.fsx" "let relPrelude () = \"rel-ok\"\n"

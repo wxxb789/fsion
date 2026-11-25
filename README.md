@@ -15,20 +15,20 @@ bindings alive across agent turns.
 ## Measured performance
 
 Goal 0006 measured the Windows `win-x64` (`net10.0`) package on `CPC-lhan-XF3D0M`: 30 interleaved rounds
-per workload after three warmups (`--phase-samples 12 --require-goal0006`, salt `3fe83581`, exit `0`).
+per workload after three warmups (`--phase-samples 12 --require-goal0006`, salt `b59f5b2d`, exit `0`).
 Every round generated fresh F# / TS / JS / Python source and verified byte-identical stdout across all
 five runners (`fsion`, `dotnet-fsi`, `bun`, `node`, `python`), followed by a 12-script zero-gap burst.
 
 | Workload | `fsion` median | `bun` median | `node` median | `python` median | `dotnet fsi` median | `fsion` vs `dotnet fsi` |
 |---|---:|---:|---:|---:|---:|---:|
-| `hello` (fresh script) | **48.2 ms** | 56.1 ms | 82.0 ms | 50.2 ms | 3068.5 ms | **63.6x faster** (faster than `bun` & `python`) |
-| `typical` (JSON filter/sort + env) | **70.7 ms** | 57.4 ms | 79.8 ms | 76.5 ms | 3419.4 ms | **48.3x faster** (faster than `node` & `python`) |
-| `diverse` (DU / pipeline / StringBuilder / try) | **57.4 ms** | 55.5 ms | 83.9 ms | 60.1 ms | 3370.9 ms | **58.8x faster** (faster than `node` & `python`) |
-| `burst` (12 back-to-back unseen `typical` scripts) | **68.7 ms** (max 81.3 ms) | 57.0 ms (max 63.3 ms) | — | — | — | 0 cold claims, 0 leaked sessions |
+| `hello` (fresh script) | **50.2 ms** | 55.2 ms | 82.2 ms | 52.5 ms | 3064.5 ms | **61.0x faster** (faster than `bun` & `python`) |
+| `typical` (JSON filter/sort + env) | **70.0 ms** | 56.3 ms | 80.7 ms | 74.7 ms | 3247.8 ms | **46.4x faster** (faster than `node` & `python`) |
+| `diverse` (DU / pipeline / StringBuilder / try) | **51.5 ms** | 55.5 ms | 81.6 ms | 52.5 ms | 3193.0 ms | **62.0x faster** (faster than `bun` & `python`) |
+| `burst` (12 back-to-back unseen `typical` scripts) | **64.8 ms** (max 74.5 ms) | 51.4 ms (max 59.5 ms) | — | — | — | 0 cold claims, 0 leaked sessions |
 
 All nine Goal 0006 thresholds passed (`9/9 PASS`). On the separate historical AC-07 check, `fsion`
-passes `>= 20x` over `dotnet fsi` (`48.34x`) while `typical <= 1.00x bun` remains `FAIL` (`1.232x`:
-the 12-sample phase probe attributes ~39.8 ms to Windows process spawn + named-pipe IPC and ~43.8 ms
+passes `>= 20x` over `dotnet fsi` (`46.39x`) while `typical <= 1.00x bun` remains `FAIL` (`1.244x`:
+the 12-sample phase probe attributes ~31.9 ms to Windows process spawn + named-pipe IPC and ~48.6 ms
 to full F# Hindley-Milner typechecking + in-memory IL emit + execution). See the
 [Goal 0006 benchmark report](docs/evidence/0006-benchmark-report.md) and
 [Goal 0006 evidence](docs/evidence/0006-evidence.md) for full distributions and package SHA-256s.
@@ -170,8 +170,8 @@ build time so scripts using them do not pay the first-use import cost.
 A `prelude.fsx` evaluated once per warm session (not per run) can define helpers, `open`
 namespaces, or reference packages with `#r "nuget: ..."`. Resolution order: `--prelude`
 flag → `FSION_PRELUDE` → `<FSION_CONFIG_DIR>/prelude.fsx` → `%APPDATA%/fsion/prelude.fsx`
-on Windows (`$XDG_CONFIG_HOME/fsion/prelude.fsx` or `~/.config/fsion/prelude.fsx` elsewhere)
-→ built-in prelude only. The daemon retains the two most recent prelude pools and tags
+on Windows (`$XDG_CONFIG_HOME/fsion/prelude.fsx` when rooted, `~/Library/Application Support/fsion/prelude.fsx`
+on macOS, or `~/.config/fsion/prelude.fsx` on Linux) → built-in prelude only. The daemon retains
 file-backed sessions with the SHA-256 of the prelude they evaluated. Content SHA-256
 changes trigger a refresh without a restart; a broken prelude fails session creation
 instead of silently running without it.

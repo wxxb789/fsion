@@ -83,29 +83,24 @@ let userPreludePathFrom
                     None
             else
                 match lookup "XDG_CONFIG_HOME" with
-                | Some directory -> Some(Path.Combine(directory, "fsion"))
-                | None ->
-                    let xdgBase =
-                        match lookup "HOME" with
-                        | Some directory -> Path.Combine(directory, ".config")
-                        | None -> cachedPosixPasswdConfigDirectory.Value
-                    let xdgCandidate = if xdgBase.Length > 0 then Some(Path.Combine(xdgBase, "fsion")) else None
+                | Some directory when Path.IsPathRooted directory -> Some(Path.Combine(directory, "fsion"))
+                | _ ->
                     if OperatingSystem.IsMacOS() then
                         let appSupportBase =
                             match lookup "HOME" with
-                            | Some directory -> Path.Combine(directory, "Library", "Application Support")
-                            | None -> cachedMacApplicationSupportDirectory.Value
-                        match xdgCandidate with
-                        | Some dir when File.Exists(Path.Combine(dir, "prelude.fsx")) -> Some dir
-                        | _ when appSupportBase.Length > 0 ->
-                            let appSupportDir = Path.Combine(appSupportBase, "fsion")
-                            if File.Exists(Path.Combine(appSupportDir, "prelude.fsx")) then
-                                Some appSupportDir
-                            else
-                                xdgCandidate
-                        | _ -> xdgCandidate
+                            | Some directory when Path.IsPathRooted directory ->
+                                Path.Combine(directory, "Library", "Application Support")
+                            | _ -> cachedMacApplicationSupportDirectory.Value
+                        if appSupportBase.Length > 0 then
+                            Some(Path.Combine(appSupportBase, "fsion"))
+                        else
+                            None
                     else
-                        xdgCandidate
+                        let xdgBase =
+                            match lookup "HOME" with
+                            | Some directory when Path.IsPathRooted directory -> Path.Combine(directory, ".config")
+                            | _ -> cachedPosixPasswdConfigDirectory.Value
+                        if xdgBase.Length > 0 then Some(Path.Combine(xdgBase, "fsion")) else None
 
     match configDirectoryOpt with
     | None -> None

@@ -759,6 +759,9 @@ type private ProcessStateGate() =
         daemonBaseline |> Seq.map (fun (KeyValue(key, value)) -> key, value) |> Seq.toArray
 
     member _.IsQuiet(quietMs: int64) =
+        lock sync (fun () -> activeRuns = 0 && activeFilePreludes = 0 && Environment.TickCount64 - lastExit >= quietMs)
+
+    member _.IsRunsQuiet(quietMs: int64) =
         lock sync (fun () -> activeRuns = 0 && Environment.TickCount64 - lastExit >= quietMs)
 
 type private PreludePool(spec: Prelude.Spec, tag: Prelude.Tag) =
@@ -767,6 +770,7 @@ type private PreludePool(spec: Prelude.Spec, tag: Prelude.Tag) =
     member val Warm = Queue<WarmSession>()
     member val Failure: string option = None with get, set
     member val Claimers = 0 with get, set
+    member val WarmupWaiters = 0 with get, set
 exception private PreludeEvaluationFailure of attemptedTag: Prelude.Tag * inner: exn
 
 type SessionHost(options: SessionHostOptions) =
@@ -1054,9 +1058,8 @@ type SessionHost(options: SessionHostOptions) =
                                             match coldOutcome with
                                             | ValueNone -> ()
                                             | ValueSome(Choice1Of3 warm) ->
-                                                let currentTag = tagOfSpec slot.Spec
                                                 lock poolGate (fun () ->
-                                                    if refreshTagWith currentTag slot = warm.Prelude then
+                                                    if refreshTagWith warm.Prelude slot = warm.Prelude then
                                                         slot.Failure <- None)
                                                 claimedOpt <- Some warm
                                             | ValueSome(Choice2Of3(exactTag, inner)) ->
@@ -1191,20 +1194,27 @@ type SessionHost(options: SessionHostOptions) =
 
     let drainCleanups () =
         let mutable forceSweep = false
-        if not pendingCleanups.IsEmpty && creationGate.Wait 0 then
-            try
-                let count = pendingCleanups.Count
-                if count >= 16 then
-                    forceSweep <- true
-                    let drained = disposePendingCleanups ()
-                    if drained > 0 then
-                        Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
-                elif Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L then
-                    let drained = disposePendingCleanups ()
-                    if drained > 0 then
-                        Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
-            finally
-                creationGate.Release() |> ignore
+        if not pendingCleanups.IsEmpty then
+            let acquired =
+                if pendingCleanups.Count >= 16 then
+                    creationGate.Wait()
+                    true
+                else
+                    creationGate.Wait 0
+
+            if acquired then
+                try
+                    if pendingCleanups.Count >= 16 then
+                        forceSweep <- true
+                        let drained = disposePendingCleanups ()
+                        if drained > 0 then
+                            Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
+                    elif Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L then
+                        let drained = disposePendingCleanups ()
+                        if drained > 0 then
+                            Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
+                finally
+                    creationGate.Release() |> ignore
 
         if Volatile.Read(&pendingUnloadPhase1) > 0 || Volatile.Read(&pendingUnloadPhase2) > 0 then
             completeUnloadSweep forceSweep
@@ -1534,56 +1544,58 @@ type SessionHost(options: SessionHostOptions) =
             while filling
                   && Volatile.Read(&claimWaiters) = 0
                   && (Volatile.Read(&ensureWarmActive) > 0 || processState.IsQuiet 250L) do
+                let quietIdle = processState.IsQuiet 250L
                 let next =
-                    let snapshot = lock poolGate (fun () -> pools.ToArray())
-                    let tags =
-                        [| for candidate in snapshot do
-                               let needsCheck =
-                                   lock poolGate (fun () ->
-                                       pools.Contains candidate
-                                       && (candidate.Warm.Count < targetPoolSize || candidate.Failure.IsSome))
-                               if needsCheck then
-                                   yield candidate, tagOfSpec candidate.Spec |]
+                    let snapshot =
+                        lock poolGate (fun () ->
+                            [| for candidate in pools do
+                                   if (quietIdle || candidate.WarmupWaiters > 0)
+                                      && (candidate.Warm.Count < targetPoolSize || candidate.Failure.IsSome) then
+                                       yield candidate |])
+                    let tags = [| for candidate in snapshot -> candidate, tagOfSpec candidate.Spec |]
                     lock poolGate (fun () ->
                         for candidate, tag in tags do
                             if pools.Contains candidate then
                                 refreshTagWith tag candidate |> ignore
+                        let quietNow = processState.IsQuiet 250L
                         pools
                         |> Seq.rev
                         |> Seq.filter (fun slot ->
                             slot.Failure.IsNone
                             && slot.Warm.Count < targetPoolSize
+                            && (quietNow || slot.WarmupWaiters > 0)
                             && (match slot.Spec with
                                 | Prelude.Spec.File _ -> processState.CanEnterFilePreludeNow()
                                 | _ -> true))
-                        |> Seq.sortBy (fun slot -> slot.Warm.Count)
+                        |> Seq.sortBy (fun slot -> (if slot.WarmupWaiters > 0 then 0 else 1), slot.Warm.Count)
                         |> Seq.tryHead
                         |> Option.map (fun slot -> slot, slot.Tag))
                 match next with
                 | None -> filling <- false
                 | Some (slot, _) ->
+                    let slotEligible () =
+                        processState.IsQuiet 250L || lock poolGate (fun () -> slot.WarmupWaiters > 0)
                     if Volatile.Read(&claimWaiters) > 0
-                       || (Volatile.Read(&ensureWarmActive) = 0 && not (processState.IsQuiet 250L))
+                       || not (slotEligible ())
                        || not (creationGate.Wait 0) then
                         filling <- false
                     else
                         let failedWarm = ref None
                         let mutable gateHeld = true
-                        let mutable postCompileOutcome: Choice<WarmSession, Prelude.Tag * string, string> voption = ValueNone
+                        let mutable postCompileFailure: (Prelude.Tag voption * string) voption = ValueNone
                         let stillActive =
                             lock poolGate (fun () ->
                                 if pools.Contains slot
                                    && slot.Failure.IsNone
-                                   && slot.Warm.Count < targetPoolSize then
+                                   && slot.Warm.Count < targetPoolSize
+                                   && (processState.IsQuiet 250L || slot.WarmupWaiters > 0) then
                                     slot.Claimers <- slot.Claimers + 1
                                     true
                                 else
                                     false)
                         try
                             try
-                                if not stillActive
-                                   || Volatile.Read(&claimWaiters) > 0
-                                   || (Volatile.Read(&ensureWarmActive) = 0 && not (processState.IsQuiet 250L)) then
+                                if not stillActive || Volatile.Read(&claimWaiters) > 0 then
                                     filling <- false
                                 else
                                     let entered =
@@ -1597,20 +1609,21 @@ type SessionHost(options: SessionHostOptions) =
                                         try
                                             try
                                                 let warm = createWarmSession failedWarm slot.Spec
-                                                if processState.IsQuiet 250L then
+                                                if processState.IsRunsQuiet 250L then
                                                     GC.Collect(1, GCCollectionMode.Optimized, false)
                                                 lock poolGate (fun () ->
-                                                    if pools.Contains slot && slot.Tag = warm.Prelude then
+                                                    if pools.Contains slot then
+                                                        refreshTagWith warm.Prelude slot |> ignore
                                                         slot.Warm.Enqueue warm
                                                     else
-                                                        postCompileOutcome <- ValueSome(Choice1Of3 warm))
+                                                        discard.Enqueue warm)
                                             with
                                             | PreludeEvaluationFailure (exactTag, inner) ->
                                                 Log.error options.LogPath ("replenisher could not create a warm session: " + inner.Message)
-                                                postCompileOutcome <- ValueSome(Choice2Of3(exactTag, inner.Message))
+                                                postCompileFailure <- ValueSome(ValueSome exactTag, inner.Message)
                                             | ex ->
                                                 Log.error options.LogPath ("replenisher could not create a warm session: " + ex.Message)
-                                                postCompileOutcome <- ValueSome(Choice3Of3 ex.Message)
+                                                postCompileFailure <- ValueSome(ValueNone, ex.Message)
                                         finally
                                             if isFile then
                                                 processState.ExitFilePrelude()
@@ -1619,23 +1632,16 @@ type SessionHost(options: SessionHostOptions) =
                                     gateHeld <- false
                                     creationGate.Release() |> ignore
 
-                            match postCompileOutcome with
+                            match postCompileFailure with
                             | ValueNone -> ()
-                            | ValueSome(Choice1Of3 warm) ->
-                                let currentTag = tagOfSpec slot.Spec
-                                lock poolGate (fun () ->
-                                    if pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
-                                        slot.Warm.Enqueue warm
-                                    else
-                                        discard.Enqueue warm)
-                            | ValueSome(Choice2Of3(exactTag, message)) ->
+                            | ValueSome(ValueSome exactTag, message) ->
                                 let currentTag = tagOfSpec slot.Spec
                                 lock poolGate (fun () ->
                                     if pools.Contains slot && refreshTagWith currentTag slot = exactTag then
                                         slot.Failure <- Some message
                                     else
                                         replenishSignal.Release() |> ignore)
-                            | ValueSome(Choice3Of3 message) ->
+                            | ValueSome(ValueNone, message) ->
                                 let fallbackTag = tagOfSpec slot.Spec
                                 lock poolGate (fun () ->
                                     if pools.Contains slot && refreshTagWith fallbackTag slot = fallbackTag then
@@ -1700,7 +1706,10 @@ type SessionHost(options: SessionHostOptions) =
     member _.EnsureWarm(spec: Prelude.Spec) =
         if not options.Oneshot then
             let slot, _ = activateSpec spec
-            lock poolGate (fun () -> slot.Failure <- None)
+            lock poolGate (fun () ->
+                slot.Failure <- None
+                if targetPoolSize > 0 then
+                    slot.WarmupWaiters <- slot.WarmupWaiters + 1)
             if targetPoolSize > 0 then
                 Interlocked.Increment(&ensureWarmActive) |> ignore
                 try
@@ -1709,6 +1718,7 @@ type SessionHost(options: SessionHostOptions) =
                     | Some message -> failwith message
                     | None -> ()
                 finally
+                    lock poolGate (fun () -> slot.WarmupWaiters <- slot.WarmupWaiters - 1)
                     Interlocked.Decrement(&ensureWarmActive) |> ignore
             else
                 match spec with
@@ -1874,9 +1884,15 @@ type SessionHost(options: SessionHostOptions) =
                 finally
                     if options.LogPath.IsSome then
                         let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs
-                        logDetail ($"run-phases evalMs={evaluateMs:F3} gateReleaseMs={gateReleaseMs:F3}")
+                        logDetail (
+                            "run-phases evalMs="
+                            + evaluateMs.ToString("F3", CultureInfo.InvariantCulture)
+                            + " gateReleaseMs="
+                            + gateReleaseMs.ToString("F3", CultureInfo.InvariantCulture)
+                        )
+                    if pendingCleanups.Count >= 16 then
+                        drainCleanups ()
                     if not options.Oneshot then replenishSignal.Release() |> ignore
-
         let canceledOutcome () =
             Interlocked.Increment(&executed.contents) |> ignore
 

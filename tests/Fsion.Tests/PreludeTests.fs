@@ -194,29 +194,46 @@ type PreludeTests(output: ITestOutputHelper) =
                 Assert.Equal("platform-config", result.Stdout)
 
                 let homeFallback = Path.Combine(directory, "posix-home")
-                writeFile homeFallback ".config/fsion/prelude.fsx" "let homePreludeValue = \"posix-home-config\"\n"
-                let homeResult =
-                    context.Run(
-                        [ "-e"; "System.Console.Write(homePreludeValue)" ],
-                        timeoutMs = 120000,
-                        extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", null; "HOME", homeFallback ]
-                    )
-
-                Assert.True(homeResult.ExitCode = 0, homeResult.Stderr)
-                Assert.Equal("posix-home-config", homeResult.Stdout)
-
                 if OperatingSystem.IsMacOS() then
-                    let macHome = Path.Combine(directory, "mac-home")
-                    writeFile macHome "Library/Application Support/fsion/prelude.fsx" "let macPreludeValue = \"mac-app-support\"\n"
+                    writeFile homeFallback ".config/fsion/prelude.fsx" "let homePreludeValue = \"unexpected-xdg\"\n"
+                    writeFile homeFallback "Library/Application Support/fsion/prelude.fsx" "let homePreludeValue = \"mac-app-support\"\n"
                     let macResult =
                         context.Run(
-                            [ "-e"; "System.Console.Write(macPreludeValue)" ],
+                            [ "-e"; "System.Console.Write(homePreludeValue)" ],
                             timeoutMs = 120000,
-                            extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", null; "HOME", macHome ]
+                            extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", null; "HOME", homeFallback ]
                         )
                     Assert.True(macResult.ExitCode = 0, macResult.Stderr)
-                    Assert.Equal("mac-app-support", macResult.Stdout))
+                    Assert.Equal("mac-app-support", macResult.Stdout)
 
+                    let relXdgResult =
+                        context.Run(
+                            [ "-e"; "System.Console.Write(homePreludeValue)" ],
+                            timeoutMs = 120000,
+                            extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", "relative-xdg"; "HOME", homeFallback ]
+                        )
+                    Assert.True(relXdgResult.ExitCode = 0, relXdgResult.Stderr)
+                    Assert.Equal("mac-app-support", relXdgResult.Stdout)
+                else
+                    writeFile homeFallback ".config/fsion/prelude.fsx" "let homePreludeValue = \"posix-home-config\"\n"
+                    let homeResult =
+                        context.Run(
+                            [ "-e"; "System.Console.Write(homePreludeValue)" ],
+                            timeoutMs = 120000,
+                            extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", null; "HOME", homeFallback ]
+                        )
+
+                    Assert.True(homeResult.ExitCode = 0, homeResult.Stderr)
+                    Assert.Equal("posix-home-config", homeResult.Stdout)
+
+                    let relXdgResult =
+                        context.Run(
+                            [ "-e"; "System.Console.Write(homePreludeValue)" ],
+                            timeoutMs = 120000,
+                            extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", "relative-xdg"; "HOME", homeFallback ]
+                        )
+                    Assert.True(relXdgResult.ExitCode = 0, relXdgResult.Stderr)
+                    Assert.Equal("posix-home-config", relXdgResult.Stdout))
     [<Fact>]
     member _.``prelude resolution prefers the flag, then the environment, then the config directory`` () =
         withContext "prelude-precedence" (fun context directory ->
@@ -1053,4 +1070,39 @@ type PreludeTests(output: ITestOutputHelper) =
                 System.Threading.Thread.Sleep 800
                 Assert.False(File.Exists unselectedMarker, "auto-started daemon evaluated an unselected prelude.fsx next to fsiond")
             finally
-                runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] emptyCallerDir unselectedEnv None 20000 |> ignore)
+                runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] emptyCallerDir unselectedEnv None 20000 |> ignore
+
+            let prioPipe = "fsion-prio-" + Guid.NewGuid().ToString("N").Substring(0, 10)
+            let prioEnv =
+                [ "FSION_PIPE", prioPipe
+                  "FSIOND_PATH", Fsion.Tests.TestInfra.fsiondBinary
+                  "FSION_CONFIG_DIR", Path.Combine(directory, ".fsion-prio-config")
+                  "FSION_PRELUDE", null ]
+            let slowFilePrelude = Path.Combine(directory, "slow-prio.fsx")
+            let slowEntered = Path.Combine(directory, "slow-prio-entered.txt")
+            let slowRelease = Path.Combine(directory, "slow-prio-release.txt")
+            writeFile directory "slow-prio.fsx" "let prioVal = 1\n"
+            try
+                let startBare =
+                    runProcess Fsion.Tests.TestInfra.fsionBinary [ "--pool-size"; "2"; "--no-prelude"; "warmup" ] directory prioEnv None 120000
+                Assert.True(startBare.ExitCode = 0, startBare.Stderr)
+                let warmFileInit =
+                    runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; slowFilePrelude; "warmup" ] directory prioEnv None 120000
+                Assert.True(warmFileInit.ExitCode = 0, warmFileInit.Stderr)
+                writeFile
+                    directory
+                    "slow-prio.fsx"
+                    (sprintf
+                        "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\nlet prioVal = 2\n"
+                        slowEntered
+                        slowRelease)
+                let consumeBareOne =
+                    runProcess Fsion.Tests.TestInfra.fsionBinary [ "--no-prelude"; "-e"; "()" ] directory prioEnv None 60000
+                Assert.True(consumeBareOne.ExitCode = 0, consumeBareOne.Stderr)
+                let bareWarmup =
+                    runProcess Fsion.Tests.TestInfra.fsionBinary [ "--no-prelude"; "warmup" ] directory prioEnv None 15000
+                Assert.True(bareWarmup.ExitCode = 0, bareWarmup.Stderr)
+                Assert.False(File.Exists slowEntered, "non-file warmup started an unrelated slow file-prelude refill before warming the requested bare pool")
+            finally
+                writeFile directory "slow-prio-release.txt" "go"
+                runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] directory prioEnv None 20000 |> ignore)

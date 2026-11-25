@@ -224,7 +224,21 @@ type PreludeTests(output: ITestOutputHelper) =
                             extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", "relative-xdg"; "HOME", homeFallback ]
                         )
                     Assert.True(relXdgResult.ExitCode = 0, relXdgResult.Stderr)
-                    Assert.Equal("posix-home-config", relXdgResult.Stdout))
+                    Assert.Equal("posix-home-config", relXdgResult.Stdout)
+
+                    let missingXdg = Path.Combine(directory, "nonexistent-xdg")
+                    let workWithLocalFsion = Path.Combine(directory, "cwd-with-local-fsion")
+                    writeFile workWithLocalFsion "fsion/prelude.fsx" "let localLeak = \"unexpected-cwd-fallback\"\n"
+                    let missingXdgResult =
+                        runProcess
+                            Fsion.Tests.TestInfra.fsionBinary
+                            [ "-e"; "System.Console.Write(\"no-cwd-fallback\")" ]
+                            workWithLocalFsion
+                            (context.Environment @ [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", missingXdg; "HOME", Path.Combine(directory, "nonexistent-home") ])
+                            None
+                            120000
+                    Assert.True(missingXdgResult.ExitCode = 0, missingXdgResult.Stderr)
+                    Assert.Equal("no-cwd-fallback", missingXdgResult.Stdout))
     [<Fact>]
     member _.``prelude resolution prefers the flag, then the environment, then the config directory`` () =
         withContext "prelude-precedence" (fun context directory ->
@@ -1131,7 +1145,11 @@ type PreludeTests(output: ITestOutputHelper) =
                 writeFile directory "v1-release.txt" "go"
 
                 let warmV2Res = warmV2Task.GetAwaiter().GetResult()
-                let _ = warmV1Task.GetAwaiter().GetResult()
+                let warmV1Start = System.Diagnostics.Stopwatch.GetTimestamp()
+                let warmV1Res = warmV1Task.GetAwaiter().GetResult()
+                let warmV1WaitMs = System.Diagnostics.Stopwatch.GetElapsedTime(warmV1Start).TotalMilliseconds
+                Assert.Equal(1, warmV1Res.ExitCode)
+                Assert.True(warmV1WaitMs < 15000.0, sprintf "superseded warmup hung for %.1f ms" warmV1WaitMs)
                 Assert.Equal(1, warmV2Res.ExitCode)
                 Assert.Contains("broken-v2", warmV2Res.Stderr)
             finally

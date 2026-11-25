@@ -627,3 +627,47 @@ type IsolationTests(output: ITestOutputHelper) =
             assertRun runRes
             Assert.Equal("0", runRes.Stdout)
             Assert.False(File.Exists markerPath, "clearScriptStatics invoked custom struct parameterless constructor"))
+
+    [<Fact>]
+    member _.``LOH-referenced streams unlock before a stateless response and slow Dispose does not block siblings`` () =
+        withContext "loh-and-slow-dispose" (fun context directory ->
+            let warmup = context.Run([ "--pool-size"; "2"; "warmup" ], timeoutMs = 120000)
+            assertRun warmup
+
+            let targetPath = Path.Combine(directory, "loh-target.bin")
+            File.WriteAllBytes(targetPath, [| 112uy; 113uy |])
+            let lohScript = Path.Combine(directory, "loh-leak.fsx")
+            File.WriteAllText(
+                lohScript,
+                sprintf
+                    "let leakLoh () =\n    let arr = Array.zeroCreate<System.IO.FileStream> 32768\n    arr.[0] <- System.IO.File.OpenRead(@\"%s\")\n    arr.[0].ReadByte()\nSystem.Console.Write(leakLoh ())\n"
+                    targetPath)
+            let lohRes = context.Run([ lohScript ], timeoutMs = 60000)
+            assertRun lohRes
+            Assert.Equal("112", lohRes.Stdout)
+            use exclusive = new FileStream(targetPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None)
+            exclusive.Close()
+            File.Delete targetPath
+
+            let disposeEntered = Path.Combine(directory, "dispose-entered.txt")
+            let disposeRelease = Path.Combine(directory, "dispose-release.txt")
+            let slowDisposeScript = Path.Combine(directory, "slow-dispose.fsx")
+            File.WriteAllText(
+                slowDisposeScript,
+                sprintf
+                    "type Blocker() =\n    interface System.IDisposable with\n        member _.Dispose() =\n            System.IO.File.WriteAllText(@\"%s\", \"1\")\n            while not (System.IO.File.Exists(@\"%s\")) do\n                System.Threading.Thread.Sleep 20\nlet b = new Blocker()\nSystem.Console.Write(\"a-done\")\n"
+                    disposeEntered
+                    disposeRelease)
+            try
+                let taskA = System.Threading.Tasks.Task.Run(fun () -> context.Run([ slowDisposeScript ], timeoutMs = 60000))
+                awaitCondition "script A never entered Dispose()" (fun () -> File.Exists disposeEntered)
+                let resB = context.Run([ "-e"; "System.Console.Write(\"b-unblocked\")" ], timeoutMs = 15000)
+                assertRun resB
+                Assert.Equal("b-unblocked", resB.Stdout)
+                Assert.False(taskA.IsCompleted, "script A completed before Dispose() was released")
+                writeFile directory "dispose-release.txt" "go"
+                let resA = taskA.GetAwaiter().GetResult()
+                assertRun resA
+                Assert.Equal("a-done", resA.Stdout)
+            finally
+                writeFile directory "dispose-release.txt" "go")

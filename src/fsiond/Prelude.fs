@@ -32,9 +32,19 @@ let hashText (text: string) = digest (Encoding.UTF8.GetBytes text)
 
 let escapeVerbatim (value: string) = value.Replace("\"", "\"\"")
 
+let private readAllBytesShared (path: string) : byte[] =
+    use stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite ||| FileShare.Delete)
+    let length = stream.Length
+    if length = 0L then
+        [||]
+    else
+        use ms = new MemoryStream(if length <= int64 Int32.MaxValue then int length else 4096)
+        stream.CopyTo ms
+        ms.ToArray()
+
 let hashFile (path: string) : string option =
     try
-        Some(digest (File.ReadAllBytes path))
+        Some(digest (readAllBytesShared path))
     with _ ->
         None
 
@@ -42,7 +52,7 @@ let hashFile (path: string) : string option =
 // decoded text would tag a BOM'd prelude differently from what tagOfSpec computes on claims.
 let readAndHashFile (path: string) : (string * string) option =
     try
-        let bytes = File.ReadAllBytes path
+        let bytes = readAllBytesShared path
         use reader = new StreamReader(new MemoryStream(bytes), Encoding.UTF8, true)
         Some(reader.ReadToEnd(), digest bytes)
     with _ ->

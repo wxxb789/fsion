@@ -15,20 +15,20 @@ bindings alive across agent turns.
 ## Measured performance
 
 Goal 0006 measured the Windows `win-x64` (`net10.0`) package on `CPC-lhan-XF3D0M`: 30 interleaved rounds
-per workload after three warmups (`--phase-samples 12 --require-goal0006`, salt `a25ef738`, exit `0`).
+per workload after three warmups (`--phase-samples 12 --require-goal0006`, salt `4b9ee5d8`, exit `0`).
 Every round generated fresh F# / TS / JS / Python source and verified byte-identical stdout across all
 five runners (`fsion`, `dotnet-fsi`, `bun`, `node`, `python`), followed by a 12-script zero-gap burst.
 
 | Workload | `fsion` median | `bun` median | `node` median | `python` median | `dotnet fsi` median | `fsion` vs `dotnet fsi` |
 |---|---:|---:|---:|---:|---:|---:|
-| `hello` (fresh script) | **60.4 ms** | 66.7 ms | 94.4 ms | 61.6 ms | 3533.1 ms | **58.5x faster** (faster than `bun` & `python`) |
-| `typical` (JSON filter/sort + env) | **83.1 ms** | 68.0 ms | 93.8 ms | 89.8 ms | 3739.6 ms | **45.0x faster** (faster than `node` & `python`) |
-| `diverse` (DU / pipeline / StringBuilder / try) | **61.3 ms** | 65.8 ms | 93.8 ms | 62.1 ms | 3643.9 ms | **59.4x faster** (faster than `bun` & `python`) |
-| `burst` (12 back-to-back unseen `typical` scripts) | **70.1 ms** (max 78.8 ms) | 59.7 ms (max 254.1 ms) | — | — | — | 0 cold claims, 0 leaked sessions |
+| `hello` (fresh script) | **59.5 ms** | 61.7 ms | 87.1 ms | 60.2 ms | 3509.8 ms | **59.0x faster** (faster than `bun` & `python`) |
+| `typical` (JSON filter/sort + env) | **80.0 ms** | 63.2 ms | 86.5 ms | 81.9 ms | 3632.6 ms | **45.4x faster** (faster than `node` & `python`) |
+| `diverse` (DU / pipeline / StringBuilder / try) | **59.7 ms** | 61.7 ms | 86.3 ms | 57.0 ms | 3574.7 ms | **59.9x faster** (faster than `bun` & `node`) |
+| `burst` (12 back-to-back unseen `typical` scripts) | **68.8 ms** (max 251.7 ms) | 55.9 ms (max 245.4 ms) | — | — | — | 0 cold claims, 0 leaked sessions |
 
 All nine Goal 0006 thresholds passed (`9/9 PASS`). On the separate historical AC-07 check, `fsion`
-passes `>= 20x` over `dotnet fsi` (`45.00x`) while `typical <= 1.00x bun` remains `FAIL` (`1.222x`:
-the 12-sample phase probe attributes ~36.3 ms to Windows process spawn + named-pipe IPC and ~45.2 ms
+passes `>= 20x` over `dotnet fsi` (`45.41x`) while `typical <= 1.00x bun` remains `FAIL` (`1.266x`:
+the 12-sample phase probe attributes ~36.5 ms to Windows process spawn + named-pipe IPC and ~48.7 ms
 to full F# Hindley-Milner typechecking + in-memory IL emit + execution). See the
 [Goal 0006 benchmark report](docs/evidence/0006-benchmark-report.md) and
 [Goal 0006 evidence](docs/evidence/0006-evidence.md) for full distributions and package SHA-256s.

@@ -8,6 +8,7 @@ open System.Globalization
 open System.IO
 open System.Reflection
 open System.Runtime.CompilerServices
+open System.Runtime.InteropServices
 open System.Runtime.Loader
 open System.Text
 open System.Threading
@@ -343,27 +344,164 @@ let private clearCompilerAsyncLocals () =
         let valueType = local.GetType().GetGenericArguments().[0]
         valueProperty.SetValue(local, Activator.CreateInstance valueType)
 
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type private WinProcessHandleSnapshotHeader =
+    val mutable NumberOfHandles: unativeint
+    val mutable Reserved: unativeint
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type private WinProcessHandleTableEntryInfo =
+    val mutable HandleValue: nativeint
+    val mutable HandleCount: unativeint
+    val mutable PointerCount: unativeint
+    val mutable GrantedAccess: uint32
+    val mutable ObjectTypeIndex: uint32
+    val mutable HandleAttributes: uint32
+    val mutable Reserved: uint32
+
+module private WinHandleTable =
+    [<DllImport("ntdll.dll")>]
+    extern int NtQueryInformationProcess(
+        nativeint ProcessHandle,
+        int ProcessInformationClass,
+        nativeint ProcessInformation,
+        uint32 ProcessInformationLength,
+        uint32& ReturnLength)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern uint32 GetFileType(nativeint hFile)
+
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern uint32 GetFileAttributesW(string lpFileName)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern uint32 GetFinalPathNameByHandleW(nativeint hFile, nativeint lpszFilePath, uint32 cchFilePath, uint32 dwFlags)
+
+    let private headerSize = Marshal.SizeOf<WinProcessHandleSnapshotHeader>()
+    let private entrySize = Marshal.SizeOf<WinProcessHandleTableEntryInfo>()
+
+    let private isRegularDiskFile (hFile: nativeint) : bool =
+        if GetFileType hFile <> 1u then
+            false
+        else
+            // Directory handles (such as CurrentDirectory handles opened with FILE_TRAVERSE = 0x100020)
+            // report FILE_TYPE_DISK (1) yet cannot hold regular-file stream locks; filter FILE_ATTRIBUTE_DIRECTORY (0x10).
+            let buf = Marshal.AllocHGlobal 2048
+            try
+                let len = GetFinalPathNameByHandleW(hFile, buf, 1024u, 0u)
+                if len > 0u && len < 1024u then
+                    let path = Marshal.PtrToStringUni(buf, int len)
+                    let attrs = GetFileAttributesW path
+                    if attrs <> 0xFFFFFFFFu then
+                        (attrs &&& 0x10u) = 0u
+                    else
+                        true
+                else
+                    true
+            finally
+                Marshal.FreeHGlobal buf
+    let snapshot () : HashSet<nativeint> voption =
+        if not (OperatingSystem.IsWindows()) then
+            ValueNone
+        else
+            let mutable size = 32768u
+            let mutable retLen = 0u
+            let mutable buf = Marshal.AllocHGlobal(int size)
+            try
+                let mutable status = NtQueryInformationProcess(-1n, 51, buf, size, &retLen)
+                while status = 0xC0000004 do
+                    Marshal.FreeHGlobal buf
+                    size <- max (size * 2u) (retLen + 4096u)
+                    buf <- Marshal.AllocHGlobal(int size)
+                    status <- NtQueryInformationProcess(-1n, 51, buf, size, &retLen)
+                if status <> 0 then
+                    ValueNone
+                else
+                    let count = int (Marshal.ReadIntPtr(buf, 0))
+                    let hs = HashSet<nativeint>(count)
+                    for i = 0 to count - 1 do
+                        hs.Add(Marshal.ReadIntPtr(buf, headerSize + i * entrySize)) |> ignore
+                    ValueSome hs
+            finally
+                Marshal.FreeHGlobal buf
+
+    let posixFdSnapshot () : HashSet<string> voption =
+        if OperatingSystem.IsWindows() then
+            ValueNone
+        else
+            try
+                let dir =
+                    if Directory.Exists "/proc/self/fd" then Some "/proc/self/fd"
+                    elif Directory.Exists "/dev/fd" then Some "/dev/fd"
+                    else None
+                match dir with
+                | None -> ValueNone
+                | Some d ->
+                    let hs = HashSet<string>(StringComparer.Ordinal)
+                    for entry in Directory.GetFileSystemEntries d do
+                        hs.Add(Path.GetFileName entry) |> ignore
+                    ValueSome hs
+            with _ ->
+                ValueNone
+
+    let hasNewHandle (winBeforeOpt: HashSet<nativeint> voption) (posixBeforeOpt: HashSet<string> voption) : bool =
+        if OperatingSystem.IsWindows() then
+            match winBeforeOpt with
+            | ValueNone -> true
+            | ValueSome before ->
+                match snapshot () with
+                | ValueNone -> true
+                | ValueSome after ->
+                    let mutable found = false
+                    for h in after do
+                        if not found && not (before.Contains h) && isRegularDiskFile h then
+                            found <- true
+                    found
+        else
+            match posixBeforeOpt with
+            | ValueNone -> true
+            | ValueSome before ->
+                match posixFdSnapshot () with
+                | ValueNone -> true
+                | ValueSome after ->
+                    let mutable found = false
+                    for fd in after do
+                        if not found && not (before.Contains fd) then
+                            found <- true
+                    found
 let private sweepFinalizers () =
     GC.Collect(2, GCCollectionMode.Forced, true, false)
     GC.WaitForPendingFinalizers()
     GC.Collect(2, GCCollectionMode.Forced, true, false)
 
-let private sweepTransientFinalizers collectionsBefore =
-    // Any intervening collection, even Gen-0, can promote a stream opened by the script.
+let private sweepTransientFinalizers
+    (winHandlesBefore: HashSet<nativeint> voption)
+    (posixFdsBefore: HashSet<string> voption)
+    collectionsBefore
+    =
     let collect generation = GC.Collect(generation, GCCollectionMode.Forced, true, false)
+    let mutable collectedGen2 = false
     match collectionsBefore with
     | ValueSome(struct (gen0, gen1)) when GC.CollectionCount 1 = gen1 ->
         let collectGen1 () =
             collect 1
-            if GC.CollectionCount 1 <> gen1 + 1 then collect 2
+            if GC.CollectionCount 1 <> gen1 + 1 then
+                collect 2
+                collectedGen2 <- true
 
         if GC.CollectionCount 0 = gen0 then
             collect 0
             if GC.CollectionCount 0 <> gen0 + 1 then collectGen1 ()
         else
             collectGen1 ()
-    | _ -> collect 2
+    | _ ->
+        collect 2
+        collectedGen2 <- true
     GC.WaitForPendingFinalizers()
+    if not collectedGen2 && WinHandleTable.hasNewHandle winHandlesBefore posixFdsBefore then
+        collect 2
+        GC.WaitForPendingFinalizers()
 
 let private severityText (severity: FSharpDiagnosticSeverity) =
     match severity with
@@ -815,7 +953,7 @@ type SessionHost(options: SessionHostOptions) =
                 exactTag, trackedDirectory
             with ex ->
                 raise (PreludeEvaluationFailure(exactTag, ex))
-    let enqueueCleanup (claimed: WarmSession) =
+    let prepareCleanupWork (claimed: WarmSession) : CleanupWork =
         match claimed.Session with
         | Some session -> clearScriptStatics claimed.PreludeTypes session.DynamicAssemblies
         | None -> ()
@@ -823,7 +961,7 @@ type SessionHost(options: SessionHostOptions) =
         clearCompilerAsyncLocals ()
         claimed.PreludeTypes.Clear()
 
-        pendingCleanups.Enqueue
+        let work =
             { Session = claimed.Session
               ProcessExitHandlers = claimed.ProcessExitHandlers
               UnmanagedDllHandlers = claimed.UnmanagedDllHandlers
@@ -839,6 +977,7 @@ type SessionHost(options: SessionHostOptions) =
         claimed.ProcessExitHandlers <- [||]
         claimed.UnmanagedDllHandlers <- [||]
         claimed.AssemblyResolveHandlers <- [||]
+        work
     let removeHandlers (work: CleanupWork) =
         removeProcessExit work.ProcessExitHandlers
         removeUnmanagedDll work.UnmanagedDllHandlers
@@ -947,21 +1086,32 @@ type SessionHost(options: SessionHostOptions) =
 
         completeUnloadSweep true
 
-    let cleanupBackpressureGate = obj ()
+    let cleanupBackpressureGate = new SemaphoreSlim(1, 1)
 
     let enqueueCleanupAndDrainIfCapped (claimed: WarmSession) =
-        let shouldDrain =
-            lock cleanupBackpressureGate (fun () ->
-                enqueueCleanup claimed
-                pendingCleanups.Count >= 16)
-        if shouldDrain then
-            drainCleanups ()
+        let work = prepareCleanupWork claimed
+        cleanupBackpressureGate.Wait()
+        try
+            if pendingCleanups.Count >= 15 then
+                creationGate.Wait()
+                try
+                    pendingCleanups.Enqueue work
+                    let drained = disposePendingCleanups ()
+                    if drained > 0 then
+                        Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
+                finally
+                    creationGate.Release() |> ignore
+                completeUnloadSweep true
+            else
+                pendingCleanups.Enqueue work
+        finally
+            cleanupBackpressureGate.Release() |> ignore
 
-    let releaseSessionWith collectionsBefore (claimed: WarmSession) =
+    let releaseSessionWith winHandlesBefore posixFdsBefore collectionsBefore (claimed: WarmSession) =
         enqueueCleanupAndDrainIfCapped claimed
-        sweepTransientFinalizers collectionsBefore
+        sweepTransientFinalizers winHandlesBefore posixFdsBefore collectionsBefore
 
-    let releaseSession = releaseSessionWith ValueNone
+    let releaseSession = releaseSessionWith ValueNone ValueNone ValueNone
     let createWarmSession (failedWarmOut: WarmSession option ref) (spec: Prelude.Spec) : WarmSession =
         processState.EnsureBaselineWhenIdle(match spec with Prelude.Spec.File _ -> true | _ -> false)
         let processExitBefore = processExitSnapshot ()
@@ -1693,23 +1843,40 @@ type SessionHost(options: SessionHostOptions) =
             | ValueSome expected -> tag = expected
             | ValueNone -> true
         let mutable count, failure, retained, currentTag = state ()
+        let mutable superseded = false
+        let mutable lastDiskCheckMs = Environment.TickCount64
         while (count < targetPoolSize || not (matchesExpected currentTag))
               && failure.IsNone
+              && not superseded
               && retained
               && Environment.TickCount64 < deadline do
-            if count > 0 && not (matchesExpected currentTag) then
-                replenishSignal.Release() |> ignore
-            Thread.Sleep 5
-            let nextCount, nextFailure, nextRetained, nextTag = state ()
-            count <- nextCount
-            failure <- nextFailure
-            retained <- nextRetained
-            currentTag <- nextTag
+            let now = Environment.TickCount64
+            let shouldCheckDisk =
+                match expectedTagOpt with
+                | ValueSome expected -> currentTag <> expected || now - lastDiskCheckMs >= 100L
+                | ValueNone -> false
+            if shouldCheckDisk then
+                lastDiskCheckMs <- now
+                match expectedTagOpt with
+                | ValueSome expected when tagOfSpec slot.Spec <> expected ->
+                    superseded <- true
+                | _ -> ()
+            if not superseded then
+                if count > 0 && not (matchesExpected currentTag) then
+                    replenishSignal.Release() |> ignore
+                Thread.Sleep 5
+                let nextCount, nextFailure, nextRetained, nextTag = state ()
+                count <- nextCount
+                failure <- nextFailure
+                retained <- nextRetained
+                currentTag <- nextTag
         if not retained then
             if failOnEvict then
                 Some "requested prelude pool was evicted during warmup"
             else
                 None
+        elif superseded then
+            Some "configured prelude changed during warmup; retry warmup"
         else
             match failure with
             | Some message -> Some message
@@ -1832,12 +1999,12 @@ type SessionHost(options: SessionHostOptions) =
             let started = Stopwatch.GetTimestamp()
             let mutable evaluateMs = 0.0
             let mutable collectionsBefore = ValueNone
+            let mutable winHandlesBefore = ValueNone
+            let mutable posixFdsBefore = ValueNone
             let mutable entered = false
-
             try
                 processState.Enter(request.WorkingDirectory, request.Environment)
                 entered <- true
-
                 try
                     Ambient.set { Out = outWriter; Error = errWriter; In = TextReader.Null }
 
@@ -1870,8 +2037,9 @@ type SessionHost(options: SessionHostOptions) =
                                         Unchecked.defaultof<Timer>
 
                                 if stateless then
+                                    winHandlesBefore <- WinHandleTable.snapshot ()
+                                    posixFdsBefore <- WinHandleTable.posixFdSnapshot ()
                                     collectionsBefore <- ValueSome(struct (GC.CollectionCount 0, GC.CollectionCount 1))
-
                                 let evaluateStarted = Stopwatch.GetTimestamp()
                                 let exitCode, diagnostics =
                                     evaluate claimed request prepared outWriter errWriter runCts.Token
@@ -1898,7 +2066,10 @@ type SessionHost(options: SessionHostOptions) =
             finally
                 try
                     if stateless then
-                        if entered then releaseSessionWith collectionsBefore claimed else releaseSession claimed
+                        if entered then
+                            releaseSessionWith winHandlesBefore posixFdsBefore collectionsBefore claimed
+                        else
+                            releaseSession claimed
                 finally
                     if options.LogPath.IsSome then
                         let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs

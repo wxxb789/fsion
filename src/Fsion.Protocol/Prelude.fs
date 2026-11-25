@@ -82,25 +82,33 @@ let userPreludePathFrom
                 else
                     None
             else
+                let existingDir (path: string) =
+                    if path.Length = 0 then
+                        None
+                    else
+                        let resolved =
+                            match workingDirectory with
+                            | Some baseDir when baseDir.Length > 0 && Path.IsPathFullyQualified baseDir ->
+                                Path.GetFullPath(path, baseDir)
+                            | _ -> Path.GetFullPath path
+                        if Directory.Exists resolved then Some resolved else None
                 if OperatingSystem.IsMacOS() then
                     let appSupportBase =
                         match lookup "HOME" with
                         | Some directory -> Path.Combine(directory, "Library", "Application Support")
                         | None -> cachedMacApplicationSupportDirectory.Value
-                    if appSupportBase.Length > 0 then
-                        Some(Path.Combine(appSupportBase, "fsion"))
-                    else
-                        None
+                    existingDir appSupportBase |> Option.map (fun d -> Path.Combine(d, "fsion"))
                 else
-                    match lookup "XDG_CONFIG_HOME" with
-                    | Some directory when Path.IsPathRooted directory -> Some(Path.Combine(directory, "fsion"))
-                    | _ ->
-                        let xdgBase =
-                            match lookup "HOME" with
-                            | Some directory -> Path.Combine(directory, ".config")
-                            | None -> cachedPosixPasswdConfigDirectory.Value
-                        if xdgBase.Length > 0 then Some(Path.Combine(xdgBase, "fsion")) else None
-
+                    let xdgDirOpt =
+                        match lookup "XDG_CONFIG_HOME" with
+                        | Some directory when Path.IsPathRooted directory -> existingDir directory
+                        | _ ->
+                            let xdgBase =
+                                match lookup "HOME" with
+                                | Some directory -> Path.Combine(directory, ".config")
+                                | None -> cachedPosixPasswdConfigDirectory.Value
+                            existingDir xdgBase
+                    xdgDirOpt |> Option.map (fun d -> Path.Combine(d, "fsion"))
     match configDirectoryOpt with
     | None -> None
     | Some configDirectory ->

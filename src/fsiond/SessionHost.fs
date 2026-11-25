@@ -737,9 +737,9 @@ type private ProcessStateGate() =
     member _.CanEnterFilePreludeNow() =
         lock sync (fun () -> activeRuns = 0 && activeFilePreludes = 0)
 
-    member _.EnsureBaselineWhenIdle() =
+    member _.EnsureBaselineWhenIdle(isFilePrelude: bool) =
         lock sync (fun () ->
-            if activeRuns = 0 && activeFilePreludes = 0 then
+            if activeRuns = 0 && (isFilePrelude || activeFilePreludes = 0) then
                 if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
                     Directory.SetCurrentDirectory daemonDirectory
                 currentDirectory <- daemonDirectory
@@ -832,8 +832,8 @@ type SessionHost(options: SessionHostOptions) =
 
     let releaseSession = releaseSessionWith ValueNone
 
-    let createWarmSession (deferFailureSweep: bool) (spec: Prelude.Spec) : WarmSession =
-        processState.EnsureBaselineWhenIdle()
+    let createWarmSession (failedWarmOut: WarmSession option ref) (spec: Prelude.Spec) : WarmSession =
+        processState.EnsureBaselineWhenIdle(match spec with Prelude.Spec.File _ -> true | _ -> false)
         let processExitBefore = processExitSnapshot ()
         let unmanagedDllBefore = unmanagedDllSnapshot ()
         let assemblyResolveBefore = assemblyResolveSnapshot ()
@@ -929,8 +929,7 @@ type SessionHost(options: SessionHostOptions) =
             warm
         finally
             if not succeeded then
-                if deferFailureSweep then enqueueCleanup warm else releaseSession warm
-                replenishSignal.Release() |> ignore
+                failedWarmOut.Value <- Some warm
     let tagOfSpec spec = Prelude.tagOfSpec spec
 
     let discard = ConcurrentQueue<WarmSession>()
@@ -948,7 +947,14 @@ type SessionHost(options: SessionHostOptions) =
 
     let trimExcessPools () =
         while pools.Count > 2 && pools.Exists(fun candidate -> candidate.Claimers = 0) do
-            let evictIdx = pools.FindIndex(fun candidate -> candidate.Claimers = 0)
+            let mutable evictIdx = -1
+            let mutable idx = 0
+            while idx < pools.Count && evictIdx < 0 do
+                if pools.[idx].Claimers = 0 && pools.[idx].Spec <> desiredSpec then
+                    evictIdx <- idx
+                idx <- idx + 1
+            if evictIdx < 0 then
+                evictIdx <- pools.FindIndex(fun candidate -> candidate.Claimers = 0)
             let evicted = pools.[evictIdx]
             clearPool evicted
             pools.RemoveAt evictIdx
@@ -970,12 +976,23 @@ type SessionHost(options: SessionHostOptions) =
             slot, refreshTagWith tag slot)
     let poolCount () = lock poolGate (fun () -> pools |> Seq.sumBy (fun slot -> slot.Warm.Count))
 
-    let claimSession (slot: PreludePool) (cancelToken: CancellationToken) : WarmSession =
-        lock poolGate (fun () ->
-            slot.Claimers <- slot.Claimers + 1
-            if not (pools.Contains slot) then
-                pools.Add slot
-            trimExcessPools ())
+    let claimSession (spec: Prelude.Spec) (cancelToken: CancellationToken) : WarmSession =
+        let initialTag = tagOfSpec spec
+        let slot =
+            lock poolGate (fun () ->
+                desiredSpec <- spec
+                let index = pools.FindIndex(fun candidate -> candidate.Spec = spec)
+                let resolved =
+                    if index >= 0 then
+                        let existing = pools.[index]
+                        pools.RemoveAt index
+                        existing
+                    else
+                        PreludePool(spec, initialTag)
+                pools.Add resolved
+                resolved.Claimers <- resolved.Claimers + 1
+                trimExcessPools ()
+                resolved)
 
         try
             let tryClaim () =
@@ -992,29 +1009,56 @@ type SessionHost(options: SessionHostOptions) =
                     logDetail "session-claim waiting"
                     let mutable claimedOpt = None
                     while claimedOpt.IsNone do
-                        creationGate.Wait(cancelToken)
-                        let mutable releaseCreationGate = true
+                        let failedWarm = ref None
                         try
-                            match tryClaim () with
-                            | Some warm -> claimedOpt <- Some warm
-                            | None ->
-                                let canCreateNow =
-                                    match slot.Spec with
-                                    | Prelude.Spec.File _ -> processState.TryEnterFilePrelude()
-                                    | _ -> true
-                                if not canCreateNow then
-                                    creationGate.Release() |> ignore
-                                    releaseCreationGate <- false
-                                    processState.EnterFilePreludeBlocking()
-                                    try
-                                        creationGate.Wait(cancelToken)
-                                        releaseCreationGate <- true
-                                        match tryClaim () with
-                                        | Some warm -> claimedOpt <- Some warm
-                                        | None ->
+                            creationGate.Wait(cancelToken)
+                            let mutable releaseCreationGate = true
+                            try
+                                match tryClaim () with
+                                | Some warm -> claimedOpt <- Some warm
+                                | None ->
+                                    let canCreateNow =
+                                        match slot.Spec with
+                                        | Prelude.Spec.File _ -> processState.TryEnterFilePrelude()
+                                        | _ -> true
+                                    if not canCreateNow then
+                                        creationGate.Release() |> ignore
+                                        releaseCreationGate <- false
+                                        processState.EnterFilePreludeBlocking()
+                                        try
+                                            creationGate.Wait(cancelToken)
+                                            releaseCreationGate <- true
+                                            match tryClaim () with
+                                            | Some warm -> claimedOpt <- Some warm
+                                            | None ->
+                                                Interlocked.Increment(&coldClaims.contents) |> ignore
+                                                try
+                                                    let warm = createWarmSession failedWarm slot.Spec
+                                                    let currentTag = tagOfSpec slot.Spec
+                                                    lock poolGate (fun () ->
+                                                        if refreshTagWith currentTag slot = warm.Prelude then
+                                                            slot.Failure <- None)
+                                                    claimedOpt <- Some warm
+                                                with
+                                                | PreludeEvaluationFailure (exactTag, inner) ->
+                                                    let currentTag = tagOfSpec slot.Spec
+                                                    lock poolGate (fun () ->
+                                                        if refreshTagWith currentTag slot = exactTag then
+                                                            slot.Failure <- Some inner.Message)
+                                                    raise inner
+                                                | ex ->
+                                                    let fallbackTag = tagOfSpec slot.Spec
+                                                    lock poolGate (fun () ->
+                                                        if refreshTagWith fallbackTag slot = fallbackTag then
+                                                            slot.Failure <- Some ex.Message)
+                                                    reraise ()
+                                        finally
+                                            processState.ExitFilePrelude()
+                                    else
+                                        try
                                             Interlocked.Increment(&coldClaims.contents) |> ignore
                                             try
-                                                let warm = createWarmSession false slot.Spec
+                                                let warm = createWarmSession failedWarm slot.Spec
                                                 let currentTag = tagOfSpec slot.Spec
                                                 lock poolGate (fun () ->
                                                     if refreshTagWith currentTag slot = warm.Prelude then
@@ -1033,38 +1077,21 @@ type SessionHost(options: SessionHostOptions) =
                                                     if refreshTagWith fallbackTag slot = fallbackTag then
                                                         slot.Failure <- Some ex.Message)
                                                 reraise ()
-                                    finally
-                                        processState.ExitFilePrelude()
-                                else
-                                    try
-                                        Interlocked.Increment(&coldClaims.contents) |> ignore
-                                        try
-                                            let warm = createWarmSession false slot.Spec
-                                            let currentTag = tagOfSpec slot.Spec
-                                            lock poolGate (fun () ->
-                                                if refreshTagWith currentTag slot = warm.Prelude then
-                                                    slot.Failure <- None)
-                                            claimedOpt <- Some warm
-                                        with
-                                        | PreludeEvaluationFailure (exactTag, inner) ->
-                                            let currentTag = tagOfSpec slot.Spec
-                                            lock poolGate (fun () ->
-                                                if refreshTagWith currentTag slot = exactTag then
-                                                    slot.Failure <- Some inner.Message)
-                                            raise inner
-                                        | ex ->
-                                            let fallbackTag = tagOfSpec slot.Spec
-                                            lock poolGate (fun () ->
-                                                if refreshTagWith fallbackTag slot = fallbackTag then
-                                                    slot.Failure <- Some ex.Message)
-                                            reraise ()
-                                    finally
-                                        match slot.Spec with
-                                        | Prelude.Spec.File _ -> processState.ExitFilePrelude()
-                                        | _ -> ()
+                                        finally
+                                            match slot.Spec with
+                                            | Prelude.Spec.File _ -> processState.ExitFilePrelude()
+                                            | _ -> ()
+                            finally
+                                if releaseCreationGate then
+                                    creationGate.Release() |> ignore
                         finally
-                            if releaseCreationGate then
-                                creationGate.Release() |> ignore
+                            match failedWarm.Value with
+                            | Some failed ->
+                                try
+                                    releaseSession failed
+                                finally
+                                    if not options.Oneshot then replenishSignal.Release() |> ignore
+                            | None -> ()
                     claimedOpt.Value
                 finally
                     Interlocked.Decrement(&claimWaiters) |> ignore
@@ -1502,9 +1529,10 @@ type SessionHost(options: SessionHostOptions) =
                                 match entered with
                                 | ValueNone -> filling <- false
                                 | ValueSome isFile ->
+                                    let failedWarm = ref None
                                     try
                                         try
-                                            let warm = createWarmSession true slot.Spec
+                                            let warm = createWarmSession failedWarm slot.Spec
                                             if processState.IsQuiet 250L then
                                                 GC.Collect(1, GCCollectionMode.Optimized, false)
                                             let currentTag = tagOfSpec slot.Spec
@@ -1529,6 +1557,11 @@ type SessionHost(options: SessionHostOptions) =
                                     finally
                                         if isFile then
                                             processState.ExitFilePrelude()
+                                        match failedWarm.Value with
+                                        | Some failed ->
+                                            enqueueCleanup failed
+                                            replenishSignal.Release() |> ignore
+                                        | None -> ()
                         finally
                             lock poolGate (fun () ->
                                 slot.Claimers <- slot.Claimers - 1
@@ -1595,20 +1628,30 @@ type SessionHost(options: SessionHostOptions) =
             else
                 match spec with
                 | Prelude.Spec.File _ ->
-                    let probe =
-                        processState.EnterFilePreludeBlocking()
-                        try
-                            creationGate.Wait()
-                            try
-                                createWarmSession false spec
-                            finally
-                                creationGate.Release() |> ignore
-                        finally
-                            processState.ExitFilePrelude()
+                    let failedWarm = ref None
                     try
-                        releaseSession probe
+                        let probe =
+                            processState.EnterFilePreludeBlocking()
+                            try
+                                creationGate.Wait()
+                                try
+                                    createWarmSession failedWarm spec
+                                finally
+                                    creationGate.Release() |> ignore
+                            finally
+                                processState.ExitFilePrelude()
+                        try
+                            releaseSession probe
+                        finally
+                            replenishSignal.Release() |> ignore
                     finally
-                        replenishSignal.Release() |> ignore
+                        match failedWarm.Value with
+                        | Some failed ->
+                            try
+                                releaseSession failed
+                            finally
+                                replenishSignal.Release() |> ignore
+                        | None -> ()
                 | _ -> ()
 
     member _.IsWarm =
@@ -1760,13 +1803,12 @@ type SessionHost(options: SessionHostOptions) =
 
         let work () =
             let targetSpec = Prelude.specOfRequest request
-            let slot, expectedTag = activateSpec targetSpec
 
             let outcome =
                 try
                     match request.SessionId with
                     | None ->
-                        let claimed = claimSession slot disconnectToken
+                        let claimed = claimSession targetSpec disconnectToken
 
                         try
                             runInSession claimed true
@@ -1790,6 +1832,7 @@ type SessionHost(options: SessionHostOptions) =
                               TimedOut = true }
                         | Some entry ->
                             try
+                                let _, expectedTag = activateSpec targetSpec
                                 match entry.Session with
                                 | Some warm when warm.Prelude <> expectedTag ->
                                     releaseSession warm
@@ -1797,7 +1840,7 @@ type SessionHost(options: SessionHostOptions) =
                                 | _ -> ()
 
                                 if entry.Session.IsNone then
-                                    entry.Session <- Some(claimSession slot disconnectToken)
+                                    entry.Session <- Some(claimSession targetSpec disconnectToken)
 
                                 let outcome =
                                     try

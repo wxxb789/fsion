@@ -745,6 +745,8 @@ def main(argv: list[str]) -> int:
             if required_runner not in present_ids:
                 missing.append(f"runner '{required_runner}' is missing")
         if flag == "--require-goal0006":
+            if warmup_rounds < 1:
+                missing.append(f"--warmup must be >= 1 when --require-goal0006 is set (got {warmup_rounds})")
             if args.phase_samples < 1:
                 missing.append("--phase-samples must be >= 1 when --require-goal0006 is set")
             if int(data.get("burstRuns", 0)) < 12:
@@ -797,6 +799,10 @@ def main(argv: list[str]) -> int:
         config_dir = work_dir / ".fsion-config"
         config_dir.mkdir(parents=True, exist_ok=True)
         base_env["XDG_CONFIG_HOME"] = str(config_dir)
+        if sys.platform == "darwin":
+            mac_home = work_dir / ".fsion-mac-home"
+            mac_home.mkdir(parents=True, exist_ok=True)
+            base_env["HOME"] = str(mac_home)
     present = [runner.id for runner in runners]
     print(f"benchmark salt {salt}; runners: {', '.join(present)}")
     if skipped:

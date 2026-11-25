@@ -830,6 +830,93 @@ type PreludeTests(output: ITestOutputHelper) =
                     Assert.Equal("p0-ok", p0Unblock.Stdout)
                     let p0WarmRes = p0Warm.GetAwaiter().GetResult()
                     Assert.True(p0WarmRes.ExitCode = 0, p0WarmRes.Stderr)
+
+                    let p0FailEntered = Path.Combine(directory, "p0-fail-entered.txt")
+                    let p0FailRelease = Path.Combine(directory, "p0-fail-release.txt")
+                    let p0FailPath = Path.Combine(directory, "p0-fail.fsx")
+                    writeFile
+                        directory
+                        "p0-fail.fsx"
+                        (sprintf
+                            "type P0FailFin() =\n    override _.Finalize() =\n        System.IO.File.WriteAllText(@\"%s\", \"1\")\n        while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\nlet mutable p0Holder : obj = box (P0FailFin())\np0Holder <- null\nSystem.GC.Collect()\nfailwith \"p0-fail-boom\"\n"
+                            p0FailEntered
+                            p0FailRelease)
+                    let p0FailWarm =
+                        System.Threading.Tasks.Task.Run(fun () ->
+                            runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; p0FailPath; "warmup" ] daemonDir poolZeroEnv None 120000)
+                    waitFor "failed prelude finalizer entered" (fun () -> File.Exists p0FailEntered)
+                    let p0FailUnblock =
+                        runProcess
+                            Fsion.Tests.TestInfra.fsionBinary
+                            [ "--session"; "p0-sess"; "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"go\"); System.Console.Write(\"p0-fail-unblocked\")" p0FailRelease ]
+                            daemonDir
+                            poolZeroEnv
+                            None
+                            60000
+                    Assert.True(p0FailUnblock.ExitCode = 0, p0FailUnblock.Stderr)
+                    Assert.Equal("p0-fail-unblocked", p0FailUnblock.Stdout)
+                    let p0FailWarmRes = p0FailWarm.GetAwaiter().GetResult()
+                    Assert.True(p0FailWarmRes.ExitCode <> 0)
+
+                    let nrPipe = "fsion-test-nr-" + Guid.NewGuid().ToString("N")
+                    let nrEnv =
+                        [ "FSION_PIPE", nrPipe
+                          "FSIOND_PATH", Fsion.Tests.TestInfra.fsiondBinary
+                          "FSION_CONFIG_DIR", Path.Combine(directory, ".fsion-nr-config")
+                          "FSION_PRELUDE", null ]
+                    try
+                        let nrPathA = Path.Combine(directory, "nr-a.fsx")
+                        writeFile directory "nr-a.fsx" "let nrVal = \"A1\"\n"
+                        let nrStart = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--pool-size"; "1"; "--prelude"; nrPathA; "-e"; "()" ] daemonDir nrEnv None 120000
+                        Assert.True(nrStart.ExitCode = 0, nrStart.Stderr)
+                        let nrSessA = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--session"; "nr"; "--prelude"; nrPathA; "-e"; "System.Console.Write(nrVal)" ] daemonDir nrEnv None 60000
+                        Assert.True(nrSessA.ExitCode = 0, nrSessA.Stderr)
+                        Assert.Equal("A1", nrSessA.Stdout)
+                        let nrPathB = Path.Combine(directory, "nr-b.fsx")
+                        writeFile directory "nr-b.fsx" "let nrOther = \"B\"\n"
+                        let nrWarmB = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; nrPathB; "warmup" ] daemonDir nrEnv None 120000
+                        Assert.True(nrWarmB.ExitCode = 0, nrWarmB.Stderr)
+                        let nrRewarmA = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; nrPathA; "warmup" ] daemonDir nrEnv None 120000
+                        Assert.True(nrRewarmA.ExitCode = 0, nrRewarmA.Stderr)
+                        let nrHold = Path.Combine(directory, "nr-hold.txt")
+                        let nrHoldRelease = Path.Combine(directory, "nr-hold-release.txt")
+                        let nrTurnHold =
+                            System.Threading.Tasks.Task.Run(fun () ->
+                                runProcess
+                                    Fsion.Tests.TestInfra.fsionBinary
+                                    [ "--session"; "nr"; "--prelude"; nrPathA; "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20" nrHold nrHoldRelease ]
+                                    daemonDir
+                                    nrEnv
+                                    None
+                                    120000)
+                        waitFor "nr session holding gate" (fun () -> File.Exists nrHold)
+                        let nrResetQueued =
+                            System.Threading.Tasks.Task.Run(fun () ->
+                                runProcess
+                                    Fsion.Tests.TestInfra.fsionBinary
+                                    [ "--session"; "nr"; "--reset"; "--prelude"; nrPathA; "-e"; "System.Console.Write(nrVal)" ]
+                                    daemonDir
+                                    nrEnv
+                                    None
+                                    120000)
+                        System.Threading.Thread.Sleep 150
+                        let nrEvict1 = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--no-prelude"; "-e"; "()" ] daemonDir nrEnv None 60000
+                        Assert.True(nrEvict1.ExitCode = 0, nrEvict1.Stderr)
+                        let nrEvict2 =
+                            System.Threading.Tasks.Task.Run(fun () ->
+                                runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; nrPathB; "-e"; "()" ] daemonDir nrEnv None 120000)
+                        System.Threading.Thread.Sleep 150
+                        writeFile directory "nr-a.fsx" "let nrVal = \"A2\"\n"
+                        writeFile directory "nr-hold-release.txt" "go"
+                        let nrHoldRes = nrTurnHold.GetAwaiter().GetResult()
+                        Assert.True(nrHoldRes.ExitCode = 0, nrHoldRes.Stderr)
+                        let nrEvict2Res = nrEvict2.GetAwaiter().GetResult()
+                        Assert.True(nrEvict2Res.ExitCode = 0, nrEvict2Res.Stderr)
+                        let nrResetRes = nrResetQueued.GetAwaiter().GetResult()
+                        Assert.True(nrResetRes.ExitCode = 0, nrResetRes.Stderr)
+                        Assert.Equal("A2", nrResetRes.Stdout)
+                    finally
+                        runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] daemonDir nrEnv None 20000 |> ignore
                 finally
                     runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] daemonDir thrEnv None 20000 |> ignore
             finally

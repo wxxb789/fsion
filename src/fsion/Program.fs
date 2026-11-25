@@ -281,7 +281,7 @@ let private daemonArguments
         else
             match options.PreludePath with
             | Some path -> [ "--prelude"; path ]
-            | None -> []
+            | None -> [ "--builtin-prelude" ]
     let logArguments =
         match Environment.GetEnvironmentVariable "FSIOND_LOG" with
         | null | "" -> []
@@ -295,7 +295,12 @@ let private spawnDaemon
     (endpoint: Endpoint)
     =
     let spawnOptions =
-        if not options.NoPrelude && options.PreludePath.IsNone then
+        if
+            not options.NoPrelude
+            && options.PreludePath.IsNone
+            && (PreludeConfig.configuredPreludePath ()).IsNone
+            && String.IsNullOrEmpty(Environment.GetEnvironmentVariable PreludeConfig.ConfigDirectoryEnvironmentVariable)
+        then
             { options with PreludePath = PreludeConfig.userPreludePath () }
         else
             options

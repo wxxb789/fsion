@@ -284,72 +284,12 @@ let private scriptAssemblies () =
         not (isNull name) && name.StartsWith("FSI-", StringComparison.Ordinal))
 
 // FSI emits one collectible FSI-ASSEMBLY dynamic assembly per session. Static fields on its
-// FSI_000n types hold top-level bindings and leaked@ closures; a top-level
-// `let reader = new StreamReader(...)` keeps its Windows file handle locked until the binding is
-// disposed or the field is nulled (initonly fields cannot be nulled, so they must be disposed).
-// Nulling the rest lets GC unload the assembly and finalize any remaining streams.
-let rec private disposeValueGraph (visited: HashSet<obj>) (depth: int) (value: obj) =
-    if not (isNull value) && depth < 16 then
-        let valueType = value.GetType()
-
-        if
-            not valueType.IsPrimitive
-            && not valueType.IsEnum
-            && not valueType.IsPointer
-            && valueType <> typeof<string>
-        then
-            let canProceed =
-                if valueType.IsValueType then
-                    true
-                else
-                    visited.Add value
-
-            if canProceed then
-                match value with
-                | :? IDisposable as disposable ->
-                    try
-                        disposable.Dispose()
-                    with _ ->
-                        ()
-                | _ -> ()
-
-                match value with
-                | :? Array as arrayValue ->
-                    let elementType = valueType.GetElementType()
-
-                    if
-                        not (isNull elementType)
-                        && not elementType.IsPrimitive
-                        && not elementType.IsEnum
-                        && elementType <> typeof<string>
-                    then
-                        let enumerator = arrayValue.GetEnumerator()
-
-                        while enumerator.MoveNext() do
-                            disposeValueGraph visited (depth + 1) enumerator.Current
-                | _ ->
-                    let mutable currentType = valueType
-
-                    while not (isNull currentType) && currentType <> typeof<obj> && currentType <> typeof<ValueType> do
-                        for field in currentType.GetFields(BindingFlags.Instance ||| BindingFlags.Public ||| BindingFlags.NonPublic) do
-                            let fieldType = field.FieldType
-
-                            if
-                                not fieldType.IsPrimitive
-                                && not fieldType.IsEnum
-                                && not fieldType.IsPointer
-                                && fieldType <> typeof<string>
-                            then
-                                try
-                                    disposeValueGraph visited (depth + 1) (field.GetValue value)
-                                with _ ->
-                                    ()
-
-                        currentType <- currentType.BaseType
-
+// FSI_000n types hold top-level bindings and leaked@ closures. Top-level IDisposable bindings
+// (`let reader = new StreamReader(...)`) are disposed directly; all non-initonly static fields
+// (including `[<Struct>]` records, nested modules, tuples, and arrays) are reset to default/null
+// so sweepTransientFinalizers deterministically finalizes any nested streams without traversing
+// into shared process-wide BCL objects like Async.DefaultCancellationToken's backing CTS.
 let private clearScriptStatics (preludeTypes: HashSet<Type>) (assemblies: Assembly[]) =
-    let visited = HashSet<obj>(ReferenceEqualityComparer.Instance)
-
     for assembly in assemblies do
         try
             for scriptType in assembly.GetTypes() |> Array.filter (preludeTypes.Contains >> not) do
@@ -361,10 +301,17 @@ let private clearScriptStatics (preludeTypes: HashSet<Type>) (assemblies: Assemb
                         && not field.FieldType.IsPointer
                         && field.FieldType <> typeof<string>
                     then
-                        try
-                            disposeValueGraph visited 0 (field.GetValue null)
-                        with _ ->
-                            ()
+                        if not field.FieldType.IsValueType then
+                            try
+                                match field.GetValue null with
+                                | :? IDisposable as disposable ->
+                                    try
+                                        disposable.Dispose()
+                                    with _ ->
+                                        ()
+                                | _ -> ()
+                            with _ ->
+                                ()
 
                         if not field.IsInitOnly then
                             try
@@ -1058,17 +1005,20 @@ type SessionHost(options: SessionHostOptions) =
                 resolved)
 
         try
-            let tryClaim () =
+            let tryClaimOutsideGate (knownTag: Prelude.Tag voption) =
                 let hasCandidates = lock poolGate (fun () -> slot.Warm.Count > 0)
                 if not hasCandidates then
                     None
                 else
-                    let tag = tagOfSpec slot.Spec
+                    let tag =
+                        match knownTag with
+                        | ValueSome existing -> existing
+                        | ValueNone -> tagOfSpec slot.Spec
                     lock poolGate (fun () ->
                         refreshTagWith tag slot |> ignore
                         if slot.Warm.Count = 0 then None else Some(slot.Warm.Dequeue()))
 
-            match tryClaim () with
+            match tryClaimOutsideGate (ValueSome initialTag) with
             | Some warm -> warm
             | None ->
                 Interlocked.Increment(&claimWaiters) |> ignore
@@ -1076,69 +1026,92 @@ type SessionHost(options: SessionHostOptions) =
                     logDetail "session-claim waiting"
                     let mutable claimedOpt = None
                     while claimedOpt.IsNone do
-                        let failedWarm = ref None
-                        try
-                            creationGate.Wait(cancelToken)
-                            let mutable releaseCreationGate = true
+                        match tryClaimOutsideGate ValueNone with
+                        | Some warm -> claimedOpt <- Some warm
+                        | None ->
+                            let failedWarm = ref None
                             try
-                                match tryClaim () with
-                                | Some warm -> claimedOpt <- Some warm
-                                | None ->
-                                    let createCold () =
-                                        Interlocked.Increment(&coldClaims.contents) |> ignore
-                                        try
-                                            let warm = createWarmSession failedWarm slot.Spec
-                                            lock poolGate (fun () ->
-                                                if slot.Tag = warm.Prelude then
-                                                    slot.Failure <- None)
-                                            claimedOpt <- Some warm
-                                        with
-                                        | PreludeEvaluationFailure (exactTag, inner) ->
-                                            lock poolGate (fun () ->
-                                                if slot.Tag = exactTag then
-                                                    slot.Failure <- Some inner.Message)
-                                            raise inner
-                                        | ex ->
-                                            let fallbackTag = tagOfSpec slot.Spec
-                                            lock poolGate (fun () ->
-                                                if refreshTagWith fallbackTag slot = fallbackTag then
-                                                    slot.Failure <- Some ex.Message)
-                                            reraise ()
-
-                                    let canCreateNow =
-                                        match slot.Spec with
-                                        | Prelude.Spec.File _ -> processState.TryEnterFilePrelude()
-                                        | _ -> true
-                                    if not canCreateNow then
-                                        creationGate.Release() |> ignore
-                                        releaseCreationGate <- false
-                                        processState.EnterFilePreludeBlocking()
-                                        try
-                                            creationGate.Wait(cancelToken)
-                                            releaseCreationGate <- true
-                                            match tryClaim () with
-                                            | Some warm -> claimedOpt <- Some warm
-                                            | None -> createCold ()
-                                        finally
-                                            processState.ExitFilePrelude()
-                                    else
-                                        try
-                                            createCold ()
-                                        finally
-                                            match slot.Spec with
-                                            | Prelude.Spec.File _ -> processState.ExitFilePrelude()
-                                            | _ -> ()
-                            finally
-                                if releaseCreationGate then
-                                    creationGate.Release() |> ignore
-                        finally
-                            match failedWarm.Value with
-                            | Some failed ->
+                                creationGate.Wait(cancelToken)
+                                let mutable releaseCreationGate = true
                                 try
-                                    releaseSession failed
+                                    let hasWarmUnderGate = lock poolGate (fun () -> slot.Warm.Count > 0)
+                                    if not hasWarmUnderGate then
+                                        let createCold (releaseFilePrelude: unit -> unit) =
+                                            Interlocked.Increment(&coldClaims.contents) |> ignore
+                                            let mutable coldOutcome: Choice<WarmSession, Prelude.Tag * exn, exn> voption = ValueNone
+                                            try
+                                                let warm = createWarmSession failedWarm slot.Spec
+                                                coldOutcome <- ValueSome(Choice1Of3 warm)
+                                            with
+                                            | PreludeEvaluationFailure (exactTag, inner) ->
+                                                coldOutcome <- ValueSome(Choice2Of3(exactTag, inner))
+                                            | ex ->
+                                                coldOutcome <- ValueSome(Choice3Of3 ex)
+
+                                            releaseFilePrelude ()
+                                            creationGate.Release() |> ignore
+                                            releaseCreationGate <- false
+                                            match coldOutcome with
+                                            | ValueNone -> ()
+                                            | ValueSome(Choice1Of3 warm) ->
+                                                let currentTag = tagOfSpec slot.Spec
+                                                lock poolGate (fun () ->
+                                                    if refreshTagWith currentTag slot = warm.Prelude then
+                                                        slot.Failure <- None)
+                                                claimedOpt <- Some warm
+                                            | ValueSome(Choice2Of3(exactTag, inner)) ->
+                                                let currentTag = tagOfSpec slot.Spec
+                                                lock poolGate (fun () ->
+                                                    if refreshTagWith currentTag slot = exactTag then
+                                                        slot.Failure <- Some inner.Message)
+                                                raise inner
+                                            | ValueSome(Choice3Of3 ex) ->
+                                                let fallbackTag = tagOfSpec slot.Spec
+                                                lock poolGate (fun () ->
+                                                    if refreshTagWith fallbackTag slot = fallbackTag then
+                                                        slot.Failure <- Some ex.Message)
+                                                raise ex
+                                        let canCreateNow =
+                                            match slot.Spec with
+                                            | Prelude.Spec.File _ -> processState.TryEnterFilePrelude()
+                                            | _ -> true
+                                        let mutable filePreludeEntered = false
+                                        let exitFilePreludeIfHeld () =
+                                            if filePreludeEntered then
+                                                filePreludeEntered <- false
+                                                processState.ExitFilePrelude()
+                                        if not canCreateNow then
+                                            creationGate.Release() |> ignore
+                                            releaseCreationGate <- false
+                                            processState.EnterFilePreludeBlocking()
+                                            filePreludeEntered <- true
+                                            try
+                                                creationGate.Wait(cancelToken)
+                                                releaseCreationGate <- true
+                                                if not (lock poolGate (fun () -> slot.Warm.Count > 0)) then
+                                                    createCold exitFilePreludeIfHeld
+                                            finally
+                                                exitFilePreludeIfHeld ()
+                                        else
+                                            filePreludeEntered <-
+                                                match slot.Spec with
+                                                | Prelude.Spec.File _ -> true
+                                                | _ -> false
+                                            try
+                                                createCold exitFilePreludeIfHeld
+                                            finally
+                                                exitFilePreludeIfHeld ()
                                 finally
-                                    if not options.Oneshot then replenishSignal.Release() |> ignore
-                            | None -> ()
+                                    if releaseCreationGate then
+                                        creationGate.Release() |> ignore
+                            finally
+                                match failedWarm.Value with
+                                | Some failed ->
+                                    try
+                                        releaseSession failed
+                                    finally
+                                        if not options.Oneshot then replenishSignal.Release() |> ignore
+                                | None -> ()
                     claimedOpt.Value
                 finally
                     Interlocked.Decrement(&claimWaiters) |> ignore
@@ -1595,6 +1568,8 @@ type SessionHost(options: SessionHostOptions) =
                         filling <- false
                     else
                         let failedWarm = ref None
+                        let mutable gateHeld = true
+                        let mutable postCompileOutcome: Choice<WarmSession, Prelude.Tag * string, string> voption = ValueNone
                         let stillActive =
                             lock poolGate (fun () ->
                                 if pools.Contains slot
@@ -1605,52 +1580,73 @@ type SessionHost(options: SessionHostOptions) =
                                 else
                                     false)
                         try
-                            if not stillActive
-                               || Volatile.Read(&claimWaiters) > 0
-                               || (Volatile.Read(&ensureWarmActive) = 0 && not (processState.IsQuiet 250L)) then
-                                filling <- false
-                            else
-                                let entered =
-                                    match slot.Spec with
-                                    | Prelude.Spec.File _ ->
-                                        if processState.TryEnterFilePrelude() then ValueSome true else ValueNone
-                                    | _ -> ValueSome false
-                                match entered with
-                                | ValueNone -> filling <- false
-                                | ValueSome isFile ->
-                                    try
+                            try
+                                if not stillActive
+                                   || Volatile.Read(&claimWaiters) > 0
+                                   || (Volatile.Read(&ensureWarmActive) = 0 && not (processState.IsQuiet 250L)) then
+                                    filling <- false
+                                else
+                                    let entered =
+                                        match slot.Spec with
+                                        | Prelude.Spec.File _ ->
+                                            if processState.TryEnterFilePrelude() then ValueSome true else ValueNone
+                                        | _ -> ValueSome false
+                                    match entered with
+                                    | ValueNone -> filling <- false
+                                    | ValueSome isFile ->
                                         try
-                                            let warm = createWarmSession failedWarm slot.Spec
-                                            if processState.IsQuiet 250L then
-                                                GC.Collect(1, GCCollectionMode.Optimized, false)
-                                            let currentTag = tagOfSpec slot.Spec
-                                            lock poolGate (fun () ->
-                                                if pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
-                                                    slot.Warm.Enqueue warm
-                                                else
-                                                    discard.Enqueue warm)
-                                        with
-                                        | PreludeEvaluationFailure (exactTag, inner) ->
-                                            Log.error options.LogPath ("replenisher could not create a warm session: " + inner.Message)
-                                            let currentTag = tagOfSpec slot.Spec
-                                            lock poolGate (fun () ->
-                                                if pools.Contains slot && refreshTagWith currentTag slot = exactTag then
-                                                    slot.Failure <- Some inner.Message)
-                                        | ex ->
-                                            Log.error options.LogPath ("replenisher could not create a warm session: " + ex.Message)
-                                            let fallbackTag = tagOfSpec slot.Spec
-                                            lock poolGate (fun () ->
-                                                if pools.Contains slot && refreshTagWith fallbackTag slot = fallbackTag then
-                                                    slot.Failure <- Some ex.Message)
-                                    finally
-                                        if isFile then
-                                            processState.ExitFilePrelude()
+                                            try
+                                                let warm = createWarmSession failedWarm slot.Spec
+                                                if processState.IsQuiet 250L then
+                                                    GC.Collect(1, GCCollectionMode.Optimized, false)
+                                                lock poolGate (fun () ->
+                                                    if pools.Contains slot && slot.Tag = warm.Prelude then
+                                                        slot.Warm.Enqueue warm
+                                                    else
+                                                        postCompileOutcome <- ValueSome(Choice1Of3 warm))
+                                            with
+                                            | PreludeEvaluationFailure (exactTag, inner) ->
+                                                Log.error options.LogPath ("replenisher could not create a warm session: " + inner.Message)
+                                                postCompileOutcome <- ValueSome(Choice2Of3(exactTag, inner.Message))
+                                            | ex ->
+                                                Log.error options.LogPath ("replenisher could not create a warm session: " + ex.Message)
+                                                postCompileOutcome <- ValueSome(Choice3Of3 ex.Message)
+                                        finally
+                                            if isFile then
+                                                processState.ExitFilePrelude()
+                            finally
+                                if gateHeld then
+                                    gateHeld <- false
+                                    creationGate.Release() |> ignore
+
+                            match postCompileOutcome with
+                            | ValueNone -> ()
+                            | ValueSome(Choice1Of3 warm) ->
+                                let currentTag = tagOfSpec slot.Spec
+                                lock poolGate (fun () ->
+                                    if pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
+                                        slot.Warm.Enqueue warm
+                                    else
+                                        discard.Enqueue warm)
+                            | ValueSome(Choice2Of3(exactTag, message)) ->
+                                let currentTag = tagOfSpec slot.Spec
+                                lock poolGate (fun () ->
+                                    if pools.Contains slot && refreshTagWith currentTag slot = exactTag then
+                                        slot.Failure <- Some message
+                                    else
+                                        replenishSignal.Release() |> ignore)
+                            | ValueSome(Choice3Of3 message) ->
+                                let fallbackTag = tagOfSpec slot.Spec
+                                lock poolGate (fun () ->
+                                    if pools.Contains slot && refreshTagWith fallbackTag slot = fallbackTag then
+                                        slot.Failure <- Some message
+                                    else
+                                        replenishSignal.Release() |> ignore)
                         finally
                             if stillActive then
                                 lock poolGate (fun () ->
                                     slot.Claimers <- slot.Claimers - 1
                                     trimExcessPools ())
-                            creationGate.Release() |> ignore
                             match failedWarm.Value with
                             | Some failed ->
                                 enqueueCleanup failed

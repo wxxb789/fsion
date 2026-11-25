@@ -59,12 +59,6 @@ let tagOfSpec (spec: Spec) : Tag =
         | Some contentHash -> Tag.File(path, contentHash)
         | None -> Tag.File(path, "unreadable")
 
-let specOfTag (tag: Tag) : Spec =
-    match tag with
-    | Tag.Bare -> Spec.Bare
-    | Tag.Builtin -> Spec.Builtin
-    | Tag.File (path, _) -> Spec.File(normalizePath path)
-
 let specOfRequest (request: ExecuteRequest) : Spec =
     if request.NoPrelude then
         Spec.Bare

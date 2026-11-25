@@ -8,6 +8,17 @@ open Xunit
 open Xunit.Abstractions
 open Fsion.Tests.TestInfra
 
+let private readSharedLog (path: string) =
+    try
+        if File.Exists path then
+            use stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite ||| FileShare.Delete)
+            use reader = new StreamReader(stream)
+            reader.ReadToEnd()
+        else
+            ""
+    with _ ->
+        ""
+
 type PreludeTests(output: ITestOutputHelper) =
     [<Fact>]
     member _.``alternating six builtin and bare turns retain both warmed pools`` () =
@@ -759,7 +770,7 @@ type PreludeTests(output: ITestOutputHelper) =
                                 None
                                 120000)
                     waitFor "claimant for thr-a waiting" (fun () ->
-                        File.Exists thrLog && File.ReadAllText(thrLog).Contains("session-claim waiting"))
+                        (readSharedLog thrLog).Contains("session-claim waiting"))
                     writeFile directory "thr-a-release.txt" "go"
                     let claimADone = thrClaimA.GetAwaiter().GetResult()
                     Assert.True(claimADone.ExitCode = 0, claimADone.Stderr)
@@ -1002,4 +1013,44 @@ type PreludeTests(output: ITestOutputHelper) =
                             None
                             60000
                     Assert.True(driveRelRun.ExitCode = 0, driveRelRun.Stderr)
-                    Assert.Equal("rel-ok", driveRelRun.Stdout))
+                    Assert.Equal("rel-ok", driveRelRun.Stdout)
+
+            let isolatedDaemonBin = Path.Combine(directory, "isolated-daemon-bin")
+            Directory.CreateDirectory isolatedDaemonBin |> ignore
+            let sourceDaemonDir = Path.GetDirectoryName Fsion.Tests.TestInfra.fsiondBinary
+            for filePath in Directory.GetFiles(sourceDaemonDir, "*", SearchOption.AllDirectories) do
+                let relativePath = Path.GetRelativePath(sourceDaemonDir, filePath)
+                let destinationPath = Path.Combine(isolatedDaemonBin, relativePath)
+                let destinationParent = Path.GetDirectoryName destinationPath
+                if not (String.IsNullOrEmpty destinationParent) then
+                    Directory.CreateDirectory destinationParent |> ignore
+                File.Copy(filePath, destinationPath, true)
+            let unselectedMarker = Path.Combine(directory, "unselected-daemon-prelude.txt")
+            writeFile
+                (Path.Combine(isolatedDaemonBin, ".fsion-unselected"))
+                "prelude.fsx"
+                (sprintf "System.IO.File.WriteAllText(@\"%s\", \"unexpected\")\n" unselectedMarker)
+            let emptyCallerDir = Path.Combine(directory, "empty-caller")
+            Directory.CreateDirectory emptyCallerDir |> ignore
+            let isolatedDaemonPath = Path.Combine(isolatedDaemonBin, Path.GetFileName Fsion.Tests.TestInfra.fsiondBinary)
+            let unselectedPipe = "fsion-unselected-" + Guid.NewGuid().ToString("N").Substring(0, 10)
+            let unselectedEnv =
+                [ "FSION_PIPE", unselectedPipe
+                  "FSIOND_PATH", isolatedDaemonPath
+                  "FSION_CONFIG_DIR", ".fsion-unselected"
+                  "FSION_PRELUDE", null ]
+            try
+                let unselectedRun =
+                    runProcess
+                        Fsion.Tests.TestInfra.fsionBinary
+                        [ "--pool-size"; "2"; "-e"; "System.Console.Write(\"builtin-ok\")" ]
+                        emptyCallerDir
+                        unselectedEnv
+                        None
+                        120000
+                Assert.True(unselectedRun.ExitCode = 0, unselectedRun.Stderr)
+                Assert.Equal("builtin-ok", unselectedRun.Stdout)
+                System.Threading.Thread.Sleep 800
+                Assert.False(File.Exists unselectedMarker, "auto-started daemon evaluated an unselected prelude.fsx next to fsiond")
+            finally
+                runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] emptyCallerDir unselectedEnv None 20000 |> ignore)

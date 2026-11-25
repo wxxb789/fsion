@@ -492,7 +492,18 @@ type IsolationTests(output: ITestOutputHelper) =
                 File.Delete structPath
             finally
                 writeFile directory "struct-hold-release.txt" "go"
-                holdNamed.GetAwaiter().GetResult() |> assertRun)
+                holdNamed.GetAwaiter().GetResult() |> assertRun
+
+            let tokenScript1 = Path.Combine(directory, "token-1.fsx")
+            let tokenScript2 = Path.Combine(directory, "token-2.fsx")
+            writeFile directory "token-1.fsx" "let token = Async.DefaultCancellationToken\nSystem.Console.Write(token.CanBeCanceled)\n"
+            writeFile directory "token-2.fsx" "System.Console.Write(Async.DefaultCancellationToken.WaitHandle.WaitOne(0))\n"
+            let tokenRun1 = run [ tokenScript1 ]
+            assertRun tokenRun1
+            Assert.Equal("True", tokenRun1.Stdout)
+            let tokenRun2 = run [ tokenScript2 ]
+            assertRun tokenRun2
+            Assert.Equal("False", tokenRun2.Stdout))
 
     [<Fact>]
     member _.``an empty pool claimant takes the session made by its in-flight producer`` () =

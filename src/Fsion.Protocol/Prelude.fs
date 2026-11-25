@@ -35,36 +35,19 @@ let private cachedWindowsApplicationData =
     lazy (Environment.GetFolderPath Environment.SpecialFolder.ApplicationData)
 
 let private posixAccountHomeDirectory () =
-    let currentUser = Environment.UserName
-    let tryPasswd () =
+    let savedHome = Environment.GetEnvironmentVariable "HOME"
+    try
+        Environment.SetEnvironmentVariable("HOME", null)
         try
-            if File.Exists "/etc/passwd" then
-                File.ReadAllLines "/etc/passwd"
-                |> Array.tryPick (fun line ->
-                    if line.Length = 0 || line.[0] = '#' then
-                        None
-                    else
-                        let parts = line.Split(':')
-                        if parts.Length >= 6 && String.Equals(parts.[0], currentUser, StringComparison.Ordinal) && parts.[5].Length > 0 then
-                            Some parts.[5]
-                        else
-                            None)
+            let resolved = Environment.GetFolderPath Environment.SpecialFolder.UserProfile
+            if not (isNull resolved) && resolved.Length > 0 then
+                resolved
             else
-                None
+                ""
         with _ ->
-            None
-    match tryPasswd () with
-    | Some home -> home
-    | None ->
-        if OperatingSystem.IsMacOS() && currentUser.Length > 0 then
-            let candidate = Path.Combine("/Users", currentUser)
-            if Directory.Exists candidate then candidate else ""
-        elif currentUser.Length > 0 then
-            let candidate = Path.Combine("/home", currentUser)
-            if Directory.Exists candidate then candidate else ""
-        else
             ""
-
+    finally
+        Environment.SetEnvironmentVariable("HOME", savedHome)
 let private cachedPosixPasswdConfigDirectory =
     lazy (
         let accountHome = posixAccountHomeDirectory ()

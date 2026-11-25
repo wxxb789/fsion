@@ -583,6 +583,48 @@ type PreludeTests(output: ITestOutputHelper) =
                 let resB = reqB.GetAwaiter().GetResult()
                 Assert.True(resB.ExitCode = 0, resB.Stderr)
                 Assert.Equal("file-cold-ok", resB.Stdout)
+
+                let mutDir = Path.Combine(directory, "prelude-mut-cwd")
+                Directory.CreateDirectory mutDir |> ignore
+                writeFile mutDir "settings.txt" "wrong-mutated-cwd"
+                let mutPrelude = Path.Combine(directory, "mut-cwd-prelude.fsx")
+                writeFile directory "mut-cwd-prelude.fsx" (sprintf "System.IO.Directory.SetCurrentDirectory(@\"%s\")\n" mutDir)
+                let daemonDir = Path.GetDirectoryName Fsion.Tests.TestInfra.fsiondBinary
+                let mutRun =
+                    runProcess
+                        Fsion.Tests.TestInfra.fsionBinary
+                        [ "--prelude"; mutPrelude; "-e"; "System.Console.Write(System.IO.Directory.GetCurrentDirectory())" ]
+                        daemonDir
+                        poolZeroEnv
+                        None
+                        60000
+                Assert.True(mutRun.ExitCode = 0, mutRun.Stderr)
+                Assert.Equal(daemonDir, mutRun.Stdout)
+
+                let dispEntered = Path.Combine(directory, "disp-entered.txt")
+                let dispRelease = Path.Combine(directory, "disp-release.txt")
+                let dispCode =
+                    sprintf
+                        "let h = { new System.IDisposable with member _.Dispose() = System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20 }\nSystem.Console.Write(\"disp-A\")"
+                        dispEntered
+                        dispRelease
+                let dispA =
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        runProcess Fsion.Tests.TestInfra.fsionBinary [ "-e"; dispCode ] callerSubdir poolZeroEnv None 120000)
+                waitFor "stateless IDisposable.Dispose started" (fun () -> File.Exists dispEntered)
+                let dispB =
+                    runProcess
+                        Fsion.Tests.TestInfra.fsionBinary
+                        [ "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"go\"); System.Console.Write(\"disp-B\")" dispRelease ]
+                        daemonDir
+                        poolZeroEnv
+                        None
+                        60000
+                Assert.True(dispB.ExitCode = 0, dispB.Stderr)
+                Assert.Equal("disp-B", dispB.Stdout)
+                let dispADone = dispA.GetAwaiter().GetResult()
+                Assert.True(dispADone.ExitCode = 0, dispADone.Stderr)
+                Assert.Equal("disp-A", dispADone.Stdout)
             finally
                 runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] callerSubdir poolZeroEnv None 20000 |> ignore
             let subProject = Path.Combine(directory, "sub-project")

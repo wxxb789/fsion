@@ -698,10 +698,9 @@ type private ProcessStateGate() =
                 Monitor.Wait sync |> ignore
 
             if activeRuns = 0 && activeFilePreludes = 0 then
-                if currentDirectory <> directory then
+                if not (String.Equals(Directory.GetCurrentDirectory(), directory, StringComparison.Ordinal)) then
                     Directory.SetCurrentDirectory directory
-                    currentDirectory <- directory
-
+                currentDirectory <- directory
                 if not (matchesEnvironment environment) then
                     currentEnvironment <- environmentMap environment
 
@@ -755,6 +754,9 @@ type private ProcessStateGate() =
         lock sync (fun () ->
             activeFilePreludes <- activeFilePreludes - 1
             if activeFilePreludes = 0 then
+                if activeRuns = 0 then
+                    Directory.SetCurrentDirectory daemonDirectory
+                    currentDirectory <- daemonDirectory
                 Monitor.PulseAll sync)
 
     member _.CanEnterFilePreludeNow() =
@@ -784,6 +786,8 @@ type private PreludePool(spec: Prelude.Spec, tag: Prelude.Tag) =
     member val Warm = Queue<WarmSession>()
     member val Failure: string option = None with get, set
 
+exception private PreludeEvaluationFailure of attemptedTag: Prelude.Tag * inner: exn
+
 type SessionHost(options: SessionHostOptions) =
     let targetPoolSize = if options.Oneshot then 1 else max 0 options.PoolSize
     let poolGate = obj ()
@@ -802,24 +806,30 @@ type SessionHost(options: SessionHostOptions) =
     let logDetail message = options.LogPath |> Option.iter (fun _ -> Log.info options.LogPath message)
     let evaluateUserPrelude (session: FsiEvaluationSession) (path: string) : Prelude.Tag * string =
         match Prelude.readAndHashFile path with
-        | None -> failwith ("configured prelude file could not be read: " + path)
+        | None ->
+            let missingTag = Prelude.Tag.File(Path.GetFullPath path, "unreadable")
+            raise (PreludeEvaluationFailure(missingTag, InvalidOperationException("configured prelude file could not be read: " + path)))
         | Some (text, contentHash) ->
-            let directory =
-                match Path.GetDirectoryName path with
-                | null | "" -> AppContext.BaseDirectory
-                | directory -> directory
+            let exactTag = Prelude.Tag.File(Path.GetFullPath path, contentHash)
+            try
+                let directory =
+                    match Path.GetDirectoryName path with
+                    | null | "" -> AppContext.BaseDirectory
+                    | directory -> directory
 
-            session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
-            match NugetCache.prepare text directory path with
-            | Some plan ->
-                session.EvalInteraction(NugetCache.referenceBlock plan, "fsion-prelude-refs.fsx")
-                session.EvalInteraction(plan.RewrittenSource + "\n()", path)
-            | None -> session.EvalInteraction(text + "\n()", path)
+                session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
+                match NugetCache.prepare text directory path with
+                | Some plan ->
+                    session.EvalInteraction(NugetCache.referenceBlock plan, "fsion-prelude-refs.fsx")
+                    session.EvalInteraction(plan.RewrittenSource + "\n()", path)
+                | None -> session.EvalInteraction(text + "\n()", path)
 
-            let trackedDirectory =
-                if mayMutateCompilerDirectory text then "" else directory
+                let trackedDirectory =
+                    if mayMutateCompilerDirectory text then "" else directory
 
-            Prelude.Tag.File(path, contentHash), trackedDirectory
+                exactTag, trackedDirectory
+            with ex ->
+                raise (PreludeEvaluationFailure(exactTag, ex))
     let enqueueCleanup (claimed: WarmSession) =
         match claimed.Session with
         | Some session -> clearScriptStatics claimed.PreludeTypes session.DynamicAssemblies
@@ -851,7 +861,7 @@ type SessionHost(options: SessionHostOptions) =
 
     let releaseSession = releaseSessionWith ValueNone
 
-    let createWarmSession (spec: Prelude.Spec) : WarmSession =
+    let createWarmSession (deferFailureSweep: bool) (spec: Prelude.Spec) : WarmSession =
         processState.EnsureBaselineWhenIdle()
         let processExitBefore = processExitSnapshot ()
         let unmanagedDllBefore = unmanagedDllSnapshot ()
@@ -899,7 +909,16 @@ type SessionHost(options: SessionHostOptions) =
                         | Prelude.Spec.File path ->
                             session.EvalInteraction(prelude exitMarker + builtinPrelude)
                             evaluateUserPrelude session path
-                    with :? FsiCompilationException ->
+                    with
+                    | PreludeEvaluationFailure (exactTag, (:? FsiCompilationException as compEx)) ->
+                        let diagnostics = creationErr.ToString()
+                        let wrapped =
+                            if diagnostics.Trim().Length = 0 then
+                                compEx :> exn
+                            else
+                                Exception("configured prelude did not compile:" + Environment.NewLine + diagnostics)
+                        raise (PreludeEvaluationFailure(exactTag, wrapped))
+                    | :? FsiCompilationException ->
                         let diagnostics = creationErr.ToString()
 
                         if diagnostics.Trim().Length = 0 then
@@ -939,7 +958,7 @@ type SessionHost(options: SessionHostOptions) =
             warm
         finally
             if not succeeded then
-                releaseSession warm
+                if deferFailureSweep then enqueueCleanup warm else releaseSession warm
                 replenishSignal.Release() |> ignore
     let tagOfSpec spec = Prelude.tagOfSpec spec
 
@@ -1012,18 +1031,24 @@ type SessionHost(options: SessionHostOptions) =
                                     | Some warm -> claimedOpt <- Some warm
                                     | None ->
                                         Interlocked.Increment(&coldClaims.contents) |> ignore
-                                        let attemptedTag = tagOfSpec slot.Spec
                                         try
-                                            let warm = createWarmSession slot.Spec
+                                            let warm = createWarmSession false slot.Spec
                                             let currentTag = tagOfSpec slot.Spec
                                             lock poolGate (fun () ->
                                                 if refreshTagWith currentTag slot = warm.Prelude then
                                                     slot.Failure <- None)
                                             claimedOpt <- Some warm
-                                        with ex ->
+                                        with
+                                        | PreludeEvaluationFailure (exactTag, inner) ->
                                             let currentTag = tagOfSpec slot.Spec
                                             lock poolGate (fun () ->
-                                                if refreshTagWith currentTag slot = attemptedTag then
+                                                if refreshTagWith currentTag slot = exactTag then
+                                                    slot.Failure <- Some inner.Message)
+                                            raise inner
+                                        | ex ->
+                                            let fallbackTag = tagOfSpec slot.Spec
+                                            lock poolGate (fun () ->
+                                                if refreshTagWith fallbackTag slot = fallbackTag then
                                                     slot.Failure <- Some ex.Message)
                                             reraise ()
                                 finally
@@ -1031,18 +1056,24 @@ type SessionHost(options: SessionHostOptions) =
                             else
                                 try
                                     Interlocked.Increment(&coldClaims.contents) |> ignore
-                                    let attemptedTag = tagOfSpec slot.Spec
                                     try
-                                        let warm = createWarmSession slot.Spec
+                                        let warm = createWarmSession false slot.Spec
                                         let currentTag = tagOfSpec slot.Spec
                                         lock poolGate (fun () ->
                                             if refreshTagWith currentTag slot = warm.Prelude then
                                                 slot.Failure <- None)
                                         claimedOpt <- Some warm
-                                    with ex ->
+                                    with
+                                    | PreludeEvaluationFailure (exactTag, inner) ->
                                         let currentTag = tagOfSpec slot.Spec
                                         lock poolGate (fun () ->
-                                            if refreshTagWith currentTag slot = attemptedTag then
+                                            if refreshTagWith currentTag slot = exactTag then
+                                                slot.Failure <- Some inner.Message)
+                                        raise inner
+                                    | ex ->
+                                        let fallbackTag = tagOfSpec slot.Spec
+                                        lock poolGate (fun () ->
+                                            if refreshTagWith fallbackTag slot = fallbackTag then
                                                 slot.Failure <- Some ex.Message)
                                         reraise ()
                                 finally
@@ -1465,39 +1496,52 @@ type SessionHost(options: SessionHostOptions) =
                         |> Option.map (fun slot -> slot, slot.Tag))
                 match next with
                 | None -> filling <- false
-                | Some (slot, attemptedTag) ->
-                    if not (creationGate.Wait 0) then
+                | Some (slot, _) ->
+                    if Volatile.Read(&claimWaiters) > 0
+                       || (Volatile.Read(&ensureWarmActive) = 0 && not (processState.IsQuiet 250L))
+                       || not (creationGate.Wait 0) then
                         filling <- false
                     else
                         try
-                            let entered =
-                                match slot.Spec with
-                                | Prelude.Spec.File _ ->
-                                    if processState.TryEnterFilePrelude() then ValueSome true else ValueNone
-                                | _ -> ValueSome false
-                            match entered with
-                            | ValueNone -> ()
-                            | ValueSome isFile ->
-                                try
+                            if Volatile.Read(&claimWaiters) > 0
+                               || (Volatile.Read(&ensureWarmActive) = 0 && not (processState.IsQuiet 250L)) then
+                                filling <- false
+                            else
+                                let entered =
+                                    match slot.Spec with
+                                    | Prelude.Spec.File _ ->
+                                        if processState.TryEnterFilePrelude() then ValueSome true else ValueNone
+                                    | _ -> ValueSome false
+                                match entered with
+                                | ValueNone -> ()
+                                | ValueSome isFile ->
                                     try
-                                        let warm = createWarmSession slot.Spec
-                                        if processState.IsQuiet 250L then
-                                            GC.Collect(1, GCCollectionMode.Optimized, false)
-                                        let currentTag = tagOfSpec slot.Spec
-                                        lock poolGate (fun () ->
-                                            if pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
-                                                slot.Warm.Enqueue warm
-                                            else
-                                                discard.Enqueue warm)
-                                    with ex ->
-                                        Log.error options.LogPath ("replenisher could not create a warm session: " + ex.Message)
-                                        let currentTag = tagOfSpec slot.Spec
-                                        lock poolGate (fun () ->
-                                            if pools.Contains slot && refreshTagWith currentTag slot = attemptedTag then
-                                                slot.Failure <- Some ex.Message)
-                                finally
-                                    if isFile then
-                                        processState.ExitFilePrelude()
+                                        try
+                                            let warm = createWarmSession true slot.Spec
+                                            if processState.IsQuiet 250L then
+                                                GC.Collect(1, GCCollectionMode.Optimized, false)
+                                            let currentTag = tagOfSpec slot.Spec
+                                            lock poolGate (fun () ->
+                                                if pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
+                                                    slot.Warm.Enqueue warm
+                                                else
+                                                    discard.Enqueue warm)
+                                        with
+                                        | PreludeEvaluationFailure (exactTag, inner) ->
+                                            Log.error options.LogPath ("replenisher could not create a warm session: " + inner.Message)
+                                            let currentTag = tagOfSpec slot.Spec
+                                            lock poolGate (fun () ->
+                                                if pools.Contains slot && refreshTagWith currentTag slot = exactTag then
+                                                    slot.Failure <- Some inner.Message)
+                                        | ex ->
+                                            Log.error options.LogPath ("replenisher could not create a warm session: " + ex.Message)
+                                            let fallbackTag = tagOfSpec slot.Spec
+                                            lock poolGate (fun () ->
+                                                if pools.Contains slot && refreshTagWith fallbackTag slot = fallbackTag then
+                                                    slot.Failure <- Some ex.Message)
+                                    finally
+                                        if isFile then
+                                            processState.ExitFilePrelude()
                         finally
                             creationGate.Release() |> ignore
                 drainDiscarded ()
@@ -1565,7 +1609,7 @@ type SessionHost(options: SessionHostOptions) =
                     try
                         creationGate.Wait()
                         try
-                            createWarmSession spec |> releaseSession
+                            createWarmSession false spec |> releaseSession
                         finally
                             creationGate.Release() |> ignore
                     finally
@@ -1699,13 +1743,12 @@ type SessionHost(options: SessionHostOptions) =
                     finally
                         Ambient.clear ()
                 finally
-                    if entered then
-                        try
-                            if stateless then releaseSessionWith collectionsBefore claimed
-                        finally
-                            processState.Exit ()
+                    let wasEntered = entered
+                    if wasEntered then
+                        processState.Exit ()
+                    if stateless then
+                        if wasEntered then releaseSessionWith collectionsBefore claimed else releaseSession claimed
             finally
-                if not entered && stateless then releaseSession claimed
                 if options.LogPath.IsSome then
                     let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs
                     logDetail ($"run-phases evalMs={evaluateMs:F3} gateReleaseMs={gateReleaseMs:F3}")

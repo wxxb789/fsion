@@ -649,6 +649,34 @@ type IsolationTests(output: ITestOutputHelper) =
             exclusive.Close()
             File.Delete targetPath
 
+            let reusePath = Path.Combine(directory, "loh-reuse-target.bin")
+            File.WriteAllBytes(reusePath, [| 97uy; 98uy |])
+            let p0Log = Path.Combine(directory, "daemon-reuse.log")
+            let runP0 args =
+                context.Run([ "--pool-size"; "0" ] @ args, timeoutMs = 120000, extraEnv = [ "FSIOND_LOG", p0Log ])
+            runP0
+                [ "--session"; "reuse-seed"; "-e"
+                  "System.AppDomain.CurrentDomain.SetData(\"reuse-events\", Array.init 384 (fun _ -> new System.Threading.ManualResetEvent(false)))" ]
+            |> assertRun
+            let reuseCode =
+                String.concat "\n"
+                    [ "open System"
+                      "open System.IO"
+                      "open System.Threading"
+                      "let leakReuse () ="
+                      "    let events = AppDomain.CurrentDomain.GetData(\"reuse-events\") :?> ManualResetEvent array"
+                      "    for ev in events do ev.Dispose()"
+                      "    AppDomain.CurrentDomain.SetData(\"reuse-events\", null)"
+                      "    let arr = Array.zeroCreate<FileStream> 32768"
+                      "    arr.[0] <- File.OpenRead(fsi.CommandLineArgs.[1])"
+                      "    Console.Write(arr.[0].ReadByte())"
+                      "leakReuse ()" ]
+            let reuseRes = runP0 [ "-e"; reuseCode; reusePath ]
+            assertRun reuseRes
+            Assert.Equal("97", reuseRes.Stdout)
+            assertFileUnlocked reusePath
+            File.Delete reusePath
+
             let disposeEntered = Path.Combine(directory, "dispose-entered.txt")
             let disposeRelease = Path.Combine(directory, "dispose-release.txt")
             let slowDisposeScript = Path.Combine(directory, "slow-dispose.fsx")

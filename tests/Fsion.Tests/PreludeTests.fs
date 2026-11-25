@@ -1154,4 +1154,37 @@ type PreludeTests(output: ITestOutputHelper) =
                 Assert.Contains("broken-v2", warmV2Res.Stderr)
             finally
                 writeFile directory "v1-release.txt" "go"
-                runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] directory editEnv None 20000 |> ignore)
+                runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] directory editEnv None 20000 |> ignore
+
+            let finalCheckPipe = "fsion-test-final-check-" + Guid.NewGuid().ToString("N")
+            let finalCheckEnv =
+                [ "FSION_PIPE", finalCheckPipe
+                  "FSIOND_PATH", Fsion.Tests.TestInfra.fsiondBinary
+                  "FSION_CONFIG_DIR", Path.Combine(directory, ".fsion-final-check-config")
+                  "FSION_PRELUDE", null ]
+            let finalPrelude = Path.Combine(directory, "final-check.fsx")
+            let fcEntered = Path.Combine(directory, "fc-entered.txt")
+            let fcRelease = Path.Combine(directory, "fc-release.txt")
+            writeFile
+                directory
+                "final-check.fsx"
+                (sprintf
+                    "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 5\nlet fcVal = 1\n"
+                    fcEntered
+                    fcRelease)
+            try
+                let fcWarmTask =
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        runProcess Fsion.Tests.TestInfra.fsionBinary [ "--pool-size"; "1"; "--prelude"; finalPrelude; "warmup" ] directory finalCheckEnv None 120000)
+                let fcDeadline = DateTime.UtcNow.AddSeconds 30.0
+                while not (File.Exists fcEntered) && DateTime.UtcNow < fcDeadline do
+                    System.Threading.Thread.Sleep 10
+                Assert.True(File.Exists fcEntered, "fc v1 never entered evaluation")
+                writeFile directory "final-check.fsx" "let fcVal = 2\n"
+                writeFile directory "fc-release.txt" "go"
+                let fcRes = fcWarmTask.GetAwaiter().GetResult()
+                Assert.Equal(1, fcRes.ExitCode)
+                Assert.Contains("configured prelude changed during warmup", fcRes.Stderr)
+            finally
+                writeFile directory "fc-release.txt" "go"
+                runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] directory finalCheckEnv None 20000 |> ignore)

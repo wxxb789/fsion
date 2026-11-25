@@ -360,6 +360,22 @@ type private WinProcessHandleTableEntryInfo =
     val mutable HandleAttributes: uint32
     val mutable Reserved: uint32
 
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type private WinByHandleFileInformation =
+    val mutable dwFileAttributes: uint32
+    val mutable ftCreationTimeLow: uint32
+    val mutable ftCreationTimeHigh: uint32
+    val mutable ftLastAccessTimeLow: uint32
+    val mutable ftLastAccessTimeHigh: uint32
+    val mutable ftLastWriteTimeLow: uint32
+    val mutable ftLastWriteTimeHigh: uint32
+    val mutable dwVolumeSerialNumber: uint32
+    val mutable nFileSizeHigh: uint32
+    val mutable nFileSizeLow: uint32
+    val mutable nNumberOfLinks: uint32
+    val mutable nFileIndexHigh: uint32
+    val mutable nFileIndexLow: uint32
+
 module private WinHandleTable =
     [<DllImport("ntdll.dll")>]
     extern int NtQueryInformationProcess(
@@ -372,6 +388,9 @@ module private WinHandleTable =
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern uint32 GetFileType(nativeint hFile)
 
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool GetFileInformationByHandle(nativeint hFile, WinByHandleFileInformation& lpFileInformation)
+
     [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
     extern uint32 GetFileAttributesW(string lpFileName)
 
@@ -381,27 +400,36 @@ module private WinHandleTable =
     let private headerSize = Marshal.SizeOf<WinProcessHandleSnapshotHeader>()
     let private entrySize = Marshal.SizeOf<WinProcessHandleTableEntryInfo>()
 
-    let private isRegularDiskFile (hFile: nativeint) : bool =
+    let private tryRegularDiskIdentity (hFile: nativeint) : struct (nativeint * uint32 * uint64) voption =
         if GetFileType hFile <> 1u then
-            false
+            ValueNone
         else
-            // Directory handles (such as CurrentDirectory handles opened with FILE_TRAVERSE = 0x100020)
-            // report FILE_TYPE_DISK (1) yet cannot hold regular-file stream locks; filter FILE_ATTRIBUTE_DIRECTORY (0x10).
-            let buf = Marshal.AllocHGlobal 2048
-            try
-                let len = GetFinalPathNameByHandleW(hFile, buf, 1024u, 0u)
-                if len > 0u && len < 1024u then
-                    let path = Marshal.PtrToStringUni(buf, int len)
-                    let attrs = GetFileAttributesW path
-                    if attrs <> 0xFFFFFFFFu then
-                        (attrs &&& 0x10u) = 0u
-                    else
-                        true
+            let mutable info = Unchecked.defaultof<WinByHandleFileInformation>
+            if GetFileInformationByHandle(hFile, &info) then
+                if (info.dwFileAttributes &&& 0x10u) <> 0u then
+                    ValueNone
                 else
-                    true
-            finally
-                Marshal.FreeHGlobal buf
-    let snapshot () : HashSet<nativeint> voption =
+                    let fileIndex = (uint64 info.nFileIndexHigh <<< 32) ||| uint64 info.nFileIndexLow
+                    ValueSome(struct (hFile, info.dwVolumeSerialNumber, fileIndex))
+            else
+                // Directory handles opened with FILE_TRAVERSE (0x100020, e.g. CurrentDirectory) fail
+                // GetFileInformationByHandle; check path attributes so directories do not force Gen-2.
+                let buf = Marshal.AllocHGlobal 2048
+                try
+                    let len = GetFinalPathNameByHandleW(hFile, buf, 1024u, 0u)
+                    if len > 0u && len < 1024u then
+                        let path = Marshal.PtrToStringUni(buf, int len)
+                        let attrs = GetFileAttributesW path
+                        if attrs <> 0xFFFFFFFFu && (attrs &&& 0x10u) <> 0u then
+                            ValueNone
+                        else
+                            ValueSome(struct (hFile, 0xFFFFFFFFu, uint64 (path.GetHashCode())))
+                    else
+                        ValueSome(struct (hFile, 0xFFFFFFFFu, 0UL))
+                finally
+                    Marshal.FreeHGlobal buf
+
+    let snapshot () : HashSet<struct (nativeint * uint32 * uint64)> voption =
         if not (OperatingSystem.IsWindows()) then
             ValueNone
         else
@@ -419,9 +447,12 @@ module private WinHandleTable =
                     ValueNone
                 else
                     let count = int (Marshal.ReadIntPtr(buf, 0))
-                    let hs = HashSet<nativeint>(count)
+                    let hs = HashSet<struct (nativeint * uint32 * uint64)>()
                     for i = 0 to count - 1 do
-                        hs.Add(Marshal.ReadIntPtr(buf, headerSize + i * entrySize)) |> ignore
+                        let h = Marshal.ReadIntPtr(buf, headerSize + i * entrySize)
+                        match tryRegularDiskIdentity h with
+                        | ValueSome id -> hs.Add id |> ignore
+                        | ValueNone -> ()
                     ValueSome hs
             finally
                 Marshal.FreeHGlobal buf
@@ -440,12 +471,23 @@ module private WinHandleTable =
                 | Some d ->
                     let hs = HashSet<string>(StringComparer.Ordinal)
                     for entry in Directory.GetFileSystemEntries d do
-                        hs.Add(Path.GetFileName entry) |> ignore
+                        let name = Path.GetFileName entry
+                        let target =
+                            try
+                                match File.ResolveLinkTarget(entry, false) with
+                                | null -> ""
+                                | info -> info.FullName
+                            with _ ->
+                                ""
+                        hs.Add(name + "\t" + target) |> ignore
                     ValueSome hs
             with _ ->
                 ValueNone
 
-    let hasNewHandle (winBeforeOpt: HashSet<nativeint> voption) (posixBeforeOpt: HashSet<string> voption) : bool =
+    let hasNewHandle
+        (winBeforeOpt: HashSet<struct (nativeint * uint32 * uint64)> voption)
+        (posixBeforeOpt: HashSet<string> voption)
+        : bool =
         if OperatingSystem.IsWindows() then
             match winBeforeOpt with
             | ValueNone -> true
@@ -454,8 +496,8 @@ module private WinHandleTable =
                 | ValueNone -> true
                 | ValueSome after ->
                     let mutable found = false
-                    for h in after do
-                        if not found && not (before.Contains h) && isRegularDiskFile h then
+                    for id in after do
+                        if not found && not (before.Contains id) then
                             found <- true
                     found
         else
@@ -470,13 +512,14 @@ module private WinHandleTable =
                         if not found && not (before.Contains fd) then
                             found <- true
                     found
+
 let private sweepFinalizers () =
     GC.Collect(2, GCCollectionMode.Forced, true, false)
     GC.WaitForPendingFinalizers()
     GC.Collect(2, GCCollectionMode.Forced, true, false)
 
 let private sweepTransientFinalizers
-    (winHandlesBefore: HashSet<nativeint> voption)
+    (winHandlesBefore: HashSet<struct (nativeint * uint32 * uint64)> voption)
     (posixFdsBefore: HashSet<string> voption)
     collectionsBefore
     =
@@ -1882,8 +1925,12 @@ type SessionHost(options: SessionHostOptions) =
             | Some message -> Some message
             | None when count < targetPoolSize || not (matchesExpected currentTag) ->
                 Some("timed out waiting for warm session pool to fill within " + string timeoutMs + " ms")
-            | None -> None
-
+            | None ->
+                match expectedTagOpt with
+                | ValueSome expected when tagOfSpec slot.Spec <> expected ->
+                    replenishSignal.Release() |> ignore
+                    Some "configured prelude changed during warmup; retry warmup"
+                | _ -> None
     member _.DesiredSpec = lock poolGate (fun () -> desiredSpec)
 
     member _.RespawnEnvironment() = processState.RespawnEnvironment()

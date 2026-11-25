@@ -3,6 +3,7 @@
     <OutputType>Exe</OutputType>
     <AssemblyName>fsiond</AssemblyName>
     <RootNamespace>Fsiond</RootNamespace>
+    <NoWarn>$(NoWarn);FS3391</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Log.fs" />

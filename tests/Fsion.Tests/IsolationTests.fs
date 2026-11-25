@@ -597,3 +597,33 @@ type IsolationTests(output: ITestOutputHelper) =
             Assert.InRange(after.ManagedHeapBytes, 1L, 400L * 1024L * 1024L)
             Assert.True(after.ManagedHeapBytes - before.ManagedHeapBytes < 64L * 1024L * 1024L)
             output.WriteLine($"heap {before.ManagedHeapBytes} -> {after.ManagedHeapBytes}; assemblies {after.ScriptAssemblies}; cold claims {after.ColdClaims - before.ColdClaims}"))
+
+    [<Fact>]
+    member _.``clearing script statics does not invoke custom struct parameterless constructors`` () =
+        withContext "struct-ctor-safety" (fun context directory ->
+            let markerPath = Path.Combine(directory, "struct-ctor-called.txt")
+            let csDir = Path.Combine(directory, "structlib")
+            Directory.CreateDirectory csDir |> ignore
+            writeFile
+                csDir
+                "StructLib.csproj"
+                "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net10.0</TargetFramework>\n  </PropertyGroup>\n</Project>\n"
+            writeFile
+                csDir
+                "Probe.cs"
+                (sprintf
+                    "namespace StructLib;\npublic struct SideEffectStruct {\n    public int Value;\n    public SideEffectStruct() {\n        System.IO.File.WriteAllText(@\"%s\", \"called\");\n        Value = 99;\n    }\n}\n"
+                    markerPath)
+            let buildLib = runProcess "dotnet" [ "build"; csDir; "-c"; "Release"; "--nologo" ] directory [] None 120000
+            Assert.True(buildLib.ExitCode = 0, buildLib.Stdout + "\n" + buildLib.Stderr)
+            let dllPath = Path.Combine(csDir, "bin", "Release", "net10.0", "StructLib.dll")
+            let scriptPath = Path.Combine(directory, "use-struct.fsx")
+            File.WriteAllText(
+                scriptPath,
+                sprintf
+                    "#r @\"%s\"\nlet mutable s : StructLib.SideEffectStruct = Unchecked.defaultof<StructLib.SideEffectStruct>\nSystem.Console.Write(s.Value)\n"
+                    dllPath)
+            let runRes = context.Run([ scriptPath ], timeoutMs = 120000)
+            assertRun runRes
+            Assert.Equal("0", runRes.Stdout)
+            Assert.False(File.Exists markerPath, "clearScriptStatics invoked custom struct parameterless constructor"))

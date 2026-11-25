@@ -7,6 +7,7 @@ open System.Diagnostics
 open System.Globalization
 open System.IO
 open System.Reflection
+open System.Runtime.CompilerServices
 open System.Runtime.Loader
 open System.Text
 open System.Threading
@@ -317,10 +318,9 @@ let private clearScriptStatics (preludeTypes: HashSet<Type>) (assemblies: Assemb
                             try
                                 let resetValue =
                                     if field.FieldType.IsValueType then
-                                        Activator.CreateInstance field.FieldType
+                                        RuntimeHelpers.GetUninitializedObject field.FieldType
                                     else
                                         null
-
                                 field.SetValue(null, resetValue)
                             with _ ->
                                 ()
@@ -839,13 +839,129 @@ type SessionHost(options: SessionHostOptions) =
         claimed.ProcessExitHandlers <- [||]
         claimed.UnmanagedDllHandlers <- [||]
         claimed.AssemblyResolveHandlers <- [||]
+    let removeHandlers (work: CleanupWork) =
+        removeProcessExit work.ProcessExitHandlers
+        removeUnmanagedDll work.UnmanagedDllHandlers
+        removeAssemblyResolve work.AssemblyResolveHandlers
+
+    let releasedGate = obj ()
+
+    let drainReleasedSessions () =
+        lock releasedGate (fun () ->
+            let survivors = ResizeArray<WeakReference>()
+            let mutable weak = Unchecked.defaultof<WeakReference>
+
+            while releasedSessions.TryDequeue(&weak) do
+                if weak.IsAlive then
+                    survivors.Add weak
+
+            for survivor in survivors do
+                releasedSessions.Enqueue survivor
+
+            survivors.Count)
+
+    let mutable totalReleased = 0
+    let mutable pendingUnloadPhase1 = 0
+    let mutable pendingUnloadPhase2 = 0
+
+    let disposePendingCleanups () =
+        let mutable work = Unchecked.defaultof<CleanupWork>
+        let mutable drained = 0
+
+        while pendingCleanups.TryDequeue(&work) do
+            drained <- drained + 1
+
+            match work.Session with
+            | Some session ->
+                detachSessionCallback session
+                clearCheckerCaches session
+                lock releasedGate (fun () -> releasedSessions.Enqueue(WeakReference(session)))
+
+                try
+                    (session :> IDisposable).Dispose()
+                with _ ->
+                    ()
+            | None -> ()
+
+            removeHandlers work
+
+        drained
+
+    let completeUnloadSweep (forceSweep: bool) =
+        let isQuietNow () = forceSweep || (Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L)
+        let phase1 = Interlocked.Exchange(&pendingUnloadPhase1, 0)
+        if phase1 > 0 then
+            if isQuietNow () then
+                GC.Collect(2, GCCollectionMode.Forced, true, false)
+                GC.WaitForPendingFinalizers()
+                Interlocked.Add(&pendingUnloadPhase2, phase1) |> ignore
+            else
+                Interlocked.Add(&pendingUnloadPhase1, phase1) |> ignore
+
+        let phase2 = Interlocked.Exchange(&pendingUnloadPhase2, 0)
+        if phase2 > 0 then
+            if isQuietNow () then
+                GC.Collect(2, GCCollectionMode.Forced, true, false)
+                let alive = drainReleasedSessions ()
+                let cumulative = Interlocked.Add(&totalReleased, phase2)
+                logDetail ($"unload released={cumulative} alive={alive}")
+            else
+                Interlocked.Add(&pendingUnloadPhase2, phase2) |> ignore
+
+    let drainCleanups () =
+        let mutable forceSweep = false
+        if not pendingCleanups.IsEmpty then
+            let acquired =
+                if pendingCleanups.Count >= 16 then
+                    creationGate.Wait()
+                    true
+                else
+                    creationGate.Wait 0
+
+            if acquired then
+                try
+                    if pendingCleanups.Count >= 16 then
+                        forceSweep <- true
+                        let drained = disposePendingCleanups ()
+                        if drained > 0 then
+                            Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
+                    elif Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L then
+                        let drained = disposePendingCleanups ()
+                        if drained > 0 then
+                            Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
+                finally
+                    creationGate.Release() |> ignore
+
+        if Volatile.Read(&pendingUnloadPhase1) > 0 || Volatile.Read(&pendingUnloadPhase2) > 0 then
+            completeUnloadSweep forceSweep
+
+    let drainCleanupsBlocking () =
+        creationGate.Wait()
+
+        try
+            let drained = disposePendingCleanups ()
+            if drained > 0 then
+                Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
+        finally
+            creationGate.Release() |> ignore
+
+        completeUnloadSweep true
+
+    let cleanupBackpressureGate = obj ()
+
+    let enqueueCleanupAndDrainIfCapped (claimed: WarmSession) =
+        let shouldDrain =
+            lock cleanupBackpressureGate (fun () ->
+                enqueueCleanup claimed
+                pendingCleanups.Count >= 16)
+        if shouldDrain then
+            drainCleanups ()
 
     let releaseSessionWith collectionsBefore (claimed: WarmSession) =
-        enqueueCleanup claimed
+        enqueueCleanupAndDrainIfCapped claimed
         sweepTransientFinalizers collectionsBefore
 
     let releaseSession = releaseSessionWith ValueNone
-
     let createWarmSession (failedWarmOut: WarmSession option ref) (spec: Prelude.Spec) : WarmSession =
         processState.EnsureBaselineWhenIdle(match spec with Prelude.Spec.File _ -> true | _ -> false)
         let processExitBefore = processExitSnapshot ()
@@ -1122,114 +1238,6 @@ type SessionHost(options: SessionHostOptions) =
             lock poolGate (fun () ->
                 slot.Claimers <- slot.Claimers - 1
                 trimExcessPools ())
-
-    let removeHandlers (work: CleanupWork) =
-        removeProcessExit work.ProcessExitHandlers
-        removeUnmanagedDll work.UnmanagedDllHandlers
-        removeAssemblyResolve work.AssemblyResolveHandlers
-
-    let releasedGate = obj ()
-
-    let drainReleasedSessions () =
-        lock releasedGate (fun () ->
-            let survivors = ResizeArray<WeakReference>()
-            let mutable weak = Unchecked.defaultof<WeakReference>
-
-            while releasedSessions.TryDequeue(&weak) do
-                if weak.IsAlive then
-                    survivors.Add weak
-
-            for survivor in survivors do
-                releasedSessions.Enqueue survivor
-
-            survivors.Count)
-
-    let mutable totalReleased = 0
-    let mutable pendingUnloadPhase1 = 0
-    let mutable pendingUnloadPhase2 = 0
-
-    let disposePendingCleanups () =
-        let mutable work = Unchecked.defaultof<CleanupWork>
-        let mutable drained = 0
-
-        while pendingCleanups.TryDequeue(&work) do
-            drained <- drained + 1
-
-            match work.Session with
-            | Some session ->
-                detachSessionCallback session
-                clearCheckerCaches session
-                lock releasedGate (fun () -> releasedSessions.Enqueue(WeakReference(session)))
-
-                try
-                    (session :> IDisposable).Dispose()
-                with _ ->
-                    ()
-            | None -> ()
-
-            removeHandlers work
-
-        drained
-
-    let completeUnloadSweep (forceSweep: bool) =
-        let isQuietNow () = forceSweep || (Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L)
-        let phase1 = Interlocked.Exchange(&pendingUnloadPhase1, 0)
-        if phase1 > 0 then
-            if isQuietNow () then
-                GC.Collect(2, GCCollectionMode.Forced, true, false)
-                GC.WaitForPendingFinalizers()
-                Interlocked.Add(&pendingUnloadPhase2, phase1) |> ignore
-            else
-                Interlocked.Add(&pendingUnloadPhase1, phase1) |> ignore
-
-        let phase2 = Interlocked.Exchange(&pendingUnloadPhase2, 0)
-        if phase2 > 0 then
-            if isQuietNow () then
-                GC.Collect(2, GCCollectionMode.Forced, true, false)
-                let alive = drainReleasedSessions ()
-                let cumulative = Interlocked.Add(&totalReleased, phase2)
-                logDetail ($"unload released={cumulative} alive={alive}")
-            else
-                Interlocked.Add(&pendingUnloadPhase2, phase2) |> ignore
-
-    let drainCleanups () =
-        let mutable forceSweep = false
-        if not pendingCleanups.IsEmpty then
-            let acquired =
-                if pendingCleanups.Count >= 16 then
-                    creationGate.Wait()
-                    true
-                else
-                    creationGate.Wait 0
-
-            if acquired then
-                try
-                    if pendingCleanups.Count >= 16 then
-                        forceSweep <- true
-                        let drained = disposePendingCleanups ()
-                        if drained > 0 then
-                            Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
-                    elif Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L then
-                        let drained = disposePendingCleanups ()
-                        if drained > 0 then
-                            Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
-                finally
-                    creationGate.Release() |> ignore
-
-        if Volatile.Read(&pendingUnloadPhase1) > 0 || Volatile.Read(&pendingUnloadPhase2) > 0 then
-            completeUnloadSweep forceSweep
-
-    let drainCleanupsBlocking () =
-        creationGate.Wait()
-
-        try
-            let drained = disposePendingCleanups ()
-            if drained > 0 then
-                Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
-        finally
-            creationGate.Release() |> ignore
-
-        completeUnloadSweep true
 
     let stripLeadingBom (text: string) =
         if text.Length > 0 && text.[0] = '\uFEFF' then text.Substring 1 else text
@@ -1521,7 +1529,7 @@ type SessionHost(options: SessionHostOptions) =
                                 | _ -> ())
 
                             match entry.Session with
-                            | Some warm -> enqueueCleanup warm
+                            | Some warm -> enqueueCleanupAndDrainIfCapped warm
                             | None -> ()
 
                             entry.Session <- None
@@ -1532,7 +1540,7 @@ type SessionHost(options: SessionHostOptions) =
     let drainDiscarded () =
         let mutable stale = Unchecked.defaultof<WarmSession>
         while discard.TryDequeue(&stale) do
-            enqueueCleanup stale
+            enqueueCleanupAndDrainIfCapped stale
 
     let replenish () =
         while true do
@@ -1550,7 +1558,7 @@ type SessionHost(options: SessionHostOptions) =
                         lock poolGate (fun () ->
                             [| for candidate in pools do
                                    if (quietIdle || candidate.WarmupWaiters > 0)
-                                      && (candidate.Warm.Count < targetPoolSize || candidate.Failure.IsSome) then
+                                      && (candidate.Warm.Count < targetPoolSize || candidate.Failure.IsSome || candidate.WarmupWaiters > 0) then
                                        yield candidate |])
                     let tags = [| for candidate in snapshot -> candidate, tagOfSpec candidate.Spec |]
                     lock poolGate (fun () ->
@@ -1655,7 +1663,7 @@ type SessionHost(options: SessionHostOptions) =
                                     trimExcessPools ())
                             match failedWarm.Value with
                             | Some failed ->
-                                enqueueCleanup failed
+                                enqueueCleanupAndDrainIfCapped failed
                                 replenishSignal.Release() |> ignore
                             | None -> ()
                 drainDiscarded ()
@@ -1677,16 +1685,26 @@ type SessionHost(options: SessionHostOptions) =
                 )
                 |> ignore
 
-    let waitForWarm timeoutMs failOnEvict (slot: PreludePool) =
+    let waitForWarm timeoutMs failOnEvict (expectedTagOpt: Prelude.Tag voption) (slot: PreludePool) =
         let deadline = Environment.TickCount64 + timeoutMs
-        let state () = lock poolGate (fun () -> slot.Warm.Count, slot.Failure, pools.Contains slot)
-        let mutable count, failure, retained = state ()
-        while count < targetPoolSize && failure.IsNone && retained && Environment.TickCount64 < deadline do
+        let state () = lock poolGate (fun () -> slot.Warm.Count, slot.Failure, pools.Contains slot, slot.Tag)
+        let matchesExpected tag =
+            match expectedTagOpt with
+            | ValueSome expected -> tag = expected
+            | ValueNone -> true
+        let mutable count, failure, retained, currentTag = state ()
+        while (count < targetPoolSize || not (matchesExpected currentTag))
+              && failure.IsNone
+              && retained
+              && Environment.TickCount64 < deadline do
+            if count > 0 && not (matchesExpected currentTag) then
+                replenishSignal.Release() |> ignore
             Thread.Sleep 5
-            let nextCount, nextFailure, nextRetained = state ()
+            let nextCount, nextFailure, nextRetained, nextTag = state ()
             count <- nextCount
             failure <- nextFailure
             retained <- nextRetained
+            currentTag <- nextTag
         if not retained then
             if failOnEvict then
                 Some "requested prelude pool was evicted during warmup"
@@ -1695,7 +1713,7 @@ type SessionHost(options: SessionHostOptions) =
         else
             match failure with
             | Some message -> Some message
-            | None when count < targetPoolSize ->
+            | None when count < targetPoolSize || not (matchesExpected currentTag) ->
                 Some("timed out waiting for warm session pool to fill within " + string timeoutMs + " ms")
             | None -> None
 
@@ -1705,7 +1723,7 @@ type SessionHost(options: SessionHostOptions) =
 
     member _.EnsureWarm(spec: Prelude.Spec) =
         if not options.Oneshot then
-            let slot, _ = activateSpec spec
+            let slot, expectedTag = activateSpec spec
             lock poolGate (fun () ->
                 slot.Failure <- None
                 if targetPoolSize > 0 then
@@ -1714,7 +1732,7 @@ type SessionHost(options: SessionHostOptions) =
                 Interlocked.Increment(&ensureWarmActive) |> ignore
                 try
                     replenishSignal.Release() |> ignore
-                    match waitForWarm 60000L true slot with
+                    match waitForWarm 60000L true (ValueSome expectedTag) slot with
                     | Some message -> failwith message
                     | None -> ()
                 finally
@@ -1890,8 +1908,6 @@ type SessionHost(options: SessionHostOptions) =
                             + " gateReleaseMs="
                             + gateReleaseMs.ToString("F3", CultureInfo.InvariantCulture)
                         )
-                    if pendingCleanups.Count >= 16 then
-                        drainCleanups ()
                     if not options.Oneshot then replenishSignal.Release() |> ignore
         let canceledOutcome () =
             Interlocked.Increment(&executed.contents) |> ignore
@@ -2014,7 +2030,7 @@ type SessionHost(options: SessionHostOptions) =
             let slots = lock poolGate (fun () -> pools.ToArray())
             replenishSignal.Release() |> ignore
             for slot in slots do
-                waitForWarm 30000L false slot |> ignore
+                waitForWarm 30000L false ValueNone slot |> ignore
 
         drainCleanupsBlocking ()
         sweepFinalizers ()

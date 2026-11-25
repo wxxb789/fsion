@@ -82,24 +82,23 @@ let userPreludePathFrom
                 else
                     None
             else
-                match lookup "XDG_CONFIG_HOME" with
-                | Some directory when Path.IsPathRooted directory -> Some(Path.Combine(directory, "fsion"))
-                | _ ->
-                    if OperatingSystem.IsMacOS() then
-                        let appSupportBase =
-                            match lookup "HOME" with
-                            | Some directory when Path.IsPathRooted directory ->
-                                Path.Combine(directory, "Library", "Application Support")
-                            | _ -> cachedMacApplicationSupportDirectory.Value
-                        if appSupportBase.Length > 0 then
-                            Some(Path.Combine(appSupportBase, "fsion"))
-                        else
-                            None
+                if OperatingSystem.IsMacOS() then
+                    let appSupportBase =
+                        match lookup "HOME" with
+                        | Some directory -> Path.Combine(directory, "Library", "Application Support")
+                        | None -> cachedMacApplicationSupportDirectory.Value
+                    if appSupportBase.Length > 0 then
+                        Some(Path.Combine(appSupportBase, "fsion"))
                     else
+                        None
+                else
+                    match lookup "XDG_CONFIG_HOME" with
+                    | Some directory when Path.IsPathRooted directory -> Some(Path.Combine(directory, "fsion"))
+                    | _ ->
                         let xdgBase =
                             match lookup "HOME" with
-                            | Some directory when Path.IsPathRooted directory -> Path.Combine(directory, ".config")
-                            | _ -> cachedPosixPasswdConfigDirectory.Value
+                            | Some directory -> Path.Combine(directory, ".config")
+                            | None -> cachedPosixPasswdConfigDirectory.Value
                         if xdgBase.Length > 0 then Some(Path.Combine(xdgBase, "fsion")) else None
 
     match configDirectoryOpt with

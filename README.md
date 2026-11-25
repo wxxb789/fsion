@@ -15,20 +15,20 @@ bindings alive across agent turns.
 ## Measured performance
 
 Goal 0006 measured the Windows `win-x64` (`net10.0`) package on `CPC-lhan-XF3D0M`: 30 interleaved rounds
-per workload after three warmups (`--phase-samples 12 --require-goal0006`, salt `b59f5b2d`, exit `0`).
+per workload after three warmups (`--phase-samples 12 --require-goal0006`, salt `a25ef738`, exit `0`).
 Every round generated fresh F# / TS / JS / Python source and verified byte-identical stdout across all
 five runners (`fsion`, `dotnet-fsi`, `bun`, `node`, `python`), followed by a 12-script zero-gap burst.
 
 | Workload | `fsion` median | `bun` median | `node` median | `python` median | `dotnet fsi` median | `fsion` vs `dotnet fsi` |
 |---|---:|---:|---:|---:|---:|---:|
-| `hello` (fresh script) | **50.2 ms** | 55.2 ms | 82.2 ms | 52.5 ms | 3064.5 ms | **61.0x faster** (faster than `bun` & `python`) |
-| `typical` (JSON filter/sort + env) | **70.0 ms** | 56.3 ms | 80.7 ms | 74.7 ms | 3247.8 ms | **46.4x faster** (faster than `node` & `python`) |
-| `diverse` (DU / pipeline / StringBuilder / try) | **51.5 ms** | 55.5 ms | 81.6 ms | 52.5 ms | 3193.0 ms | **62.0x faster** (faster than `bun` & `python`) |
-| `burst` (12 back-to-back unseen `typical` scripts) | **64.8 ms** (max 74.5 ms) | 51.4 ms (max 59.5 ms) | — | — | — | 0 cold claims, 0 leaked sessions |
+| `hello` (fresh script) | **60.4 ms** | 66.7 ms | 94.4 ms | 61.6 ms | 3533.1 ms | **58.5x faster** (faster than `bun` & `python`) |
+| `typical` (JSON filter/sort + env) | **83.1 ms** | 68.0 ms | 93.8 ms | 89.8 ms | 3739.6 ms | **45.0x faster** (faster than `node` & `python`) |
+| `diverse` (DU / pipeline / StringBuilder / try) | **61.3 ms** | 65.8 ms | 93.8 ms | 62.1 ms | 3643.9 ms | **59.4x faster** (faster than `bun` & `python`) |
+| `burst` (12 back-to-back unseen `typical` scripts) | **70.1 ms** (max 78.8 ms) | 59.7 ms (max 254.1 ms) | — | — | — | 0 cold claims, 0 leaked sessions |
 
 All nine Goal 0006 thresholds passed (`9/9 PASS`). On the separate historical AC-07 check, `fsion`
-passes `>= 20x` over `dotnet fsi` (`46.39x`) while `typical <= 1.00x bun` remains `FAIL` (`1.244x`:
-the 12-sample phase probe attributes ~31.9 ms to Windows process spawn + named-pipe IPC and ~48.6 ms
+passes `>= 20x` over `dotnet fsi` (`45.00x`) while `typical <= 1.00x bun` remains `FAIL` (`1.222x`:
+the 12-sample phase probe attributes ~36.3 ms to Windows process spawn + named-pipe IPC and ~45.2 ms
 to full F# Hindley-Milner typechecking + in-memory IL emit + execution). See the
 [Goal 0006 benchmark report](docs/evidence/0006-benchmark-report.md) and
 [Goal 0006 evidence](docs/evidence/0006-evidence.md) for full distributions and package SHA-256s.
@@ -170,11 +170,11 @@ build time so scripts using them do not pay the first-use import cost.
 A `prelude.fsx` evaluated once per warm session (not per run) can define helpers, `open`
 namespaces, or reference packages with `#r "nuget: ..."`. Resolution order: `--prelude`
 flag → `FSION_PRELUDE` → `<FSION_CONFIG_DIR>/prelude.fsx` → `%APPDATA%/fsion/prelude.fsx`
-on Windows (`$XDG_CONFIG_HOME/fsion/prelude.fsx` when rooted, `~/Library/Application Support/fsion/prelude.fsx`
-on macOS, or `~/.config/fsion/prelude.fsx` on Linux) → built-in prelude only. The daemon retains
-file-backed sessions with the SHA-256 of the prelude they evaluated. Content SHA-256
-changes trigger a refresh without a restart; a broken prelude fails session creation
-instead of silently running without it.
+on Windows (`~/Library/Application Support/fsion/prelude.fsx` on macOS, or
+`$XDG_CONFIG_HOME/fsion/prelude.fsx` when rooted else `~/.config/fsion/prelude.fsx` on Linux)
+→ built-in prelude only. The daemon retains file-backed sessions with the SHA-256 of
+the prelude they evaluated. Content SHA-256 changes trigger a refresh without a
+restart; a broken prelude fails session creation instead of silently running without it.
 
 Repeated top-level `#r "nuget: ..."` directives resolve through the official
 `FSharp.Compiler.Service` dependency manager once and are then served from a persistent

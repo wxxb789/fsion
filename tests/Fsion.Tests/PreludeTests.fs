@@ -183,16 +183,6 @@ type PreludeTests(output: ITestOutputHelper) =
                 Assert.True(result.ExitCode = 0, result.Stderr)
                 Assert.Equal("windows-special-folder-ok", result.Stdout)
             else
-                let result =
-                    context.Run(
-                        [ "-e"; "System.Console.Write(platformPreludeValue)" ],
-                        timeoutMs = 120000,
-                        extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", configHome ]
-                    )
-
-                Assert.True(result.ExitCode = 0, result.Stderr)
-                Assert.Equal("platform-config", result.Stdout)
-
                 let homeFallback = Path.Combine(directory, "posix-home")
                 if OperatingSystem.IsMacOS() then
                     writeFile homeFallback ".config/fsion/prelude.fsx" "let homePreludeValue = \"unexpected-xdg\"\n"
@@ -201,20 +191,21 @@ type PreludeTests(output: ITestOutputHelper) =
                         context.Run(
                             [ "-e"; "System.Console.Write(homePreludeValue)" ],
                             timeoutMs = 120000,
-                            extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", null; "HOME", homeFallback ]
+                            extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", configHome; "HOME", homeFallback ]
                         )
                     Assert.True(macResult.ExitCode = 0, macResult.Stderr)
                     Assert.Equal("mac-app-support", macResult.Stdout)
-
-                    let relXdgResult =
-                        context.Run(
-                            [ "-e"; "System.Console.Write(homePreludeValue)" ],
-                            timeoutMs = 120000,
-                            extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", "relative-xdg"; "HOME", homeFallback ]
-                        )
-                    Assert.True(relXdgResult.ExitCode = 0, relXdgResult.Stderr)
-                    Assert.Equal("mac-app-support", relXdgResult.Stdout)
                 else
+                    let result =
+                        context.Run(
+                            [ "-e"; "System.Console.Write(platformPreludeValue)" ],
+                            timeoutMs = 120000,
+                            extraEnv = [ "FSION_CONFIG_DIR", null; "FSION_PRELUDE", null; "XDG_CONFIG_HOME", configHome ]
+                        )
+
+                    Assert.True(result.ExitCode = 0, result.Stderr)
+                    Assert.Equal("platform-config", result.Stdout)
+
                     writeFile homeFallback ".config/fsion/prelude.fsx" "let homePreludeValue = \"posix-home-config\"\n"
                     let homeResult =
                         context.Run(
@@ -510,7 +501,7 @@ type PreludeTests(output: ITestOutputHelper) =
                 System.Threading.Tasks.Task.Run(fun () ->
                     runProcess
                         Fsion.Tests.TestInfra.fsionBinary
-                        [ "--pool-size"; "1"; "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20; System.Console.Write(System.Environment.GetEnvironmentVariable(\"FSION_REPLENISH_PROBE\"))" callerEnteredPath callerReleasePath ]
+                        [ "--pool-size"; "1"; "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\nSystem.Console.Write(System.Environment.GetEnvironmentVariable(\"FSION_REPLENISH_PROBE\"))" callerEnteredPath callerReleasePath ]
                         callerSubdir
                         (context.Environment @ [ "FSION_REPLENISH_PROBE", "leaked" ])
                         None
@@ -1105,4 +1096,44 @@ type PreludeTests(output: ITestOutputHelper) =
                 Assert.False(File.Exists slowEntered, "non-file warmup started an unrelated slow file-prelude refill before warming the requested bare pool")
             finally
                 writeFile directory "slow-prio-release.txt" "go"
-                runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] directory prioEnv None 20000 |> ignore)
+                runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] directory prioEnv None 20000 |> ignore
+
+            let editPipe = "fsion-edit-" + Guid.NewGuid().ToString("N").Substring(0, 10)
+            let editEnv =
+                [ "FSION_PIPE", editPipe
+                  "FSIOND_PATH", Fsion.Tests.TestInfra.fsiondBinary
+                  "FSION_CONFIG_DIR", Path.Combine(directory, ".fsion-edit-config")
+                  "FSION_PRELUDE", null ]
+            let editPrelude = Path.Combine(directory, "mid-edit.fsx")
+            let v1Entered = Path.Combine(directory, "v1-entered.txt")
+            let v1Release = Path.Combine(directory, "v1-release.txt")
+            writeFile
+                directory
+                "mid-edit.fsx"
+                (sprintf
+                    "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\nlet midEditVal = 1\n"
+                    v1Entered
+                    v1Release)
+            try
+                let warmV1Task =
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        runProcess Fsion.Tests.TestInfra.fsionBinary [ "--pool-size"; "1"; "--prelude"; editPrelude; "warmup" ] directory editEnv None 120000)
+                let enteredDeadline = DateTime.UtcNow.AddSeconds 30.0
+                while not (File.Exists v1Entered) && DateTime.UtcNow < enteredDeadline do
+                    System.Threading.Thread.Sleep 25
+                Assert.True(File.Exists v1Entered, "V1 prelude never entered evaluation")
+
+                writeFile directory "mid-edit.fsx" "failwith \"broken-v2\"\n"
+                let warmV2Task =
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        runProcess Fsion.Tests.TestInfra.fsionBinary [ "--pool-size"; "1"; "--prelude"; editPrelude; "warmup" ] directory editEnv None 120000)
+                System.Threading.Thread.Sleep 300
+                writeFile directory "v1-release.txt" "go"
+
+                let warmV2Res = warmV2Task.GetAwaiter().GetResult()
+                let _ = warmV1Task.GetAwaiter().GetResult()
+                Assert.Equal(1, warmV2Res.ExitCode)
+                Assert.Contains("broken-v2", warmV2Res.Stderr)
+            finally
+                writeFile directory "v1-release.txt" "go"
+                runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] directory editEnv None 20000 |> ignore)

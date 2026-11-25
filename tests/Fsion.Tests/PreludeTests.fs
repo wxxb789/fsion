@@ -727,8 +727,8 @@ type PreludeTests(output: ITestOutputHelper) =
                 try
                     let thrStart = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--pool-size"; "1"; "warmup" ] daemonDir thrEnv None 120000
                     Assert.True(thrStart.ExitCode = 0, thrStart.Stderr)
-                    let thrWarmB = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; thrBPath; "warmup" ] daemonDir thrEnv None 120000
-                    Assert.True(thrWarmB.ExitCode = 0, thrWarmB.Stderr)
+                    let thrWarmAInitial = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; thrAPath; "warmup" ] daemonDir thrEnv None 120000
+                    Assert.True(thrWarmAInitial.ExitCode = 0, thrWarmAInitial.Stderr)
                     writeFile
                         directory
                         "thr-a.fsx"
@@ -742,29 +742,94 @@ type PreludeTests(output: ITestOutputHelper) =
                         System.Threading.Tasks.Task.Run(fun () ->
                             runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; thrAPath; "warmup" ] daemonDir thrEnv None 120000)
                     waitFor "thr-a replenisher entered" (fun () -> File.Exists thrAEntered)
+                    let thrRunBuiltin =
+                        runProcess Fsion.Tests.TestInfra.fsionBinary [ "warmup" ] daemonDir thrEnv None 120000
+                    Assert.True(thrRunBuiltin.ExitCode = 0, thrRunBuiltin.Stderr)
+                    let thrRunBare =
+                        System.Threading.Tasks.Task.Run(fun () ->
+                            runProcess Fsion.Tests.TestInfra.fsionBinary [ "--no-prelude"; "warmup" ] daemonDir thrEnv None 120000)
+                    System.Threading.Thread.Sleep 150
                     let thrClaimA =
                         System.Threading.Tasks.Task.Run(fun () ->
-                            runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; thrAPath; "-e"; "System.Console.Write(thrVal)" ] daemonDir thrEnv None 120000)
+                            runProcess
+                                Fsion.Tests.TestInfra.fsionBinary
+                                [ "--prelude"; thrAPath; "-e"; sprintf "let n = System.IO.File.ReadAllText(@\"%s.count\").Length in System.Console.Write(thrVal + \"|\" + string n)" thrAEntered ]
+                                daemonDir
+                                thrEnv
+                                None
+                                120000)
                     waitFor "claimant for thr-a waiting" (fun () ->
                         File.Exists thrLog && File.ReadAllText(thrLog).Contains("session-claim waiting"))
-                    let thrRunBuiltin =
-                        System.Threading.Tasks.Task.Run(fun () ->
-                            runProcess Fsion.Tests.TestInfra.fsionBinary [ "-e"; "()" ] daemonDir thrEnv None 60000)
-                    let thrRunB =
-                        System.Threading.Tasks.Task.Run(fun () ->
-                            System.Threading.Thread.Sleep 80
-                            runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; thrBPath; "-e"; "()" ] daemonDir thrEnv None 60000)
-                    System.Threading.Thread.Sleep 200
                     writeFile directory "thr-a-release.txt" "go"
-                    let _ = thrReplenishA.GetAwaiter().GetResult()
                     let claimADone = thrClaimA.GetAwaiter().GetResult()
-                    let builtinDone = thrRunBuiltin.GetAwaiter().GetResult()
-                    let bDone = thrRunB.GetAwaiter().GetResult()
-                    Assert.True(builtinDone.ExitCode = 0, builtinDone.Stderr)
-                    Assert.True(bDone.ExitCode = 0, bDone.Stderr)
                     Assert.True(claimADone.ExitCode = 0, claimADone.Stderr)
-                    Assert.Equal("A2", claimADone.Stdout)
-                    Assert.Equal(1, File.ReadAllText(thrAEntered + ".count").Length)
+                    Assert.Equal("A2|1", claimADone.Stdout)
+                    let _ = thrReplenishA.GetAwaiter().GetResult()
+                    let bareDone = thrRunBare.GetAwaiter().GetResult()
+                    Assert.True(bareDone.ExitCode = 0, bareDone.Stderr)
+
+                    let seqAEntered = Path.Combine(directory, "seq-a-entered.txt")
+                    let seqARelease = Path.Combine(directory, "seq-a-release.txt")
+                    let seqASub = Path.Combine(directory, "seq-a-sub")
+                    Directory.CreateDirectory seqASub |> ignore
+                    let seqAPath = Path.Combine(directory, "seq-a.fsx")
+                    let seqBPath = Path.Combine(directory, "seq-b.fsx")
+                    writeFile
+                        directory
+                        "seq-a.fsx"
+                        (sprintf
+                            "System.IO.Directory.SetCurrentDirectory(@\"%s\")\nSystem.Environment.SetEnvironmentVariable(\"FSION_SEQ_PRELUDE\", \"dirty\")\nSystem.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\n"
+                            seqASub
+                            seqAEntered
+                            seqARelease)
+                    writeFile
+                        directory
+                        "seq-b.fsx"
+                        "let seqClean = System.IO.Directory.GetCurrentDirectory() + \"|\" + (match System.Environment.GetEnvironmentVariable(\"FSION_SEQ_PRELUDE\") with null -> \"unset\" | v -> v)\n"
+                    let seqTaskA =
+                        System.Threading.Tasks.Task.Run(fun () ->
+                            runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; seqAPath; "-e"; "()" ] daemonDir poolZeroEnv None 120000)
+                    waitFor "seq-a entered" (fun () -> File.Exists seqAEntered)
+                    let seqTaskB =
+                        System.Threading.Tasks.Task.Run(fun () ->
+                            runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; seqBPath; "-e"; "System.Console.Write(seqClean)" ] daemonDir poolZeroEnv None 120000)
+                    System.Threading.Thread.Sleep 150
+                    writeFile directory "seq-a-release.txt" "go"
+                    let seqResA = seqTaskA.GetAwaiter().GetResult()
+                    let seqResB = seqTaskB.GetAwaiter().GetResult()
+                    Assert.True(seqResA.ExitCode = 0, seqResA.Stderr)
+                    Assert.True(seqResB.ExitCode = 0, seqResB.Stderr)
+                    Assert.Equal(daemonDir + "|unset", seqResB.Stdout)
+
+                    let p0DispEntered = Path.Combine(directory, "p0-disp-entered.txt")
+                    let p0DispRelease = Path.Combine(directory, "p0-disp-release.txt")
+                    let p0DispPath = Path.Combine(directory, "p0-disp.fsx")
+                    writeFile
+                        directory
+                        "p0-disp.fsx"
+                        (sprintf
+                            "let hold = { new System.IDisposable with member _.Dispose() = System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20 }\n"
+                            p0DispEntered
+                            p0DispRelease)
+                    let p0Named =
+                        runProcess Fsion.Tests.TestInfra.fsionBinary [ "--session"; "p0-sess"; "-e"; "()" ] daemonDir poolZeroEnv None 60000
+                    Assert.True(p0Named.ExitCode = 0, p0Named.Stderr)
+                    let p0Warm =
+                        System.Threading.Tasks.Task.Run(fun () ->
+                            runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; p0DispPath; "warmup" ] daemonDir poolZeroEnv None 120000)
+                    waitFor "pool=0 warmup Dispose entered" (fun () -> File.Exists p0DispEntered)
+                    let p0Unblock =
+                        runProcess
+                            Fsion.Tests.TestInfra.fsionBinary
+                            [ "--session"; "p0-sess"; "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"go\"); System.Console.Write(\"p0-ok\")" p0DispRelease ]
+                            daemonDir
+                            poolZeroEnv
+                            None
+                            60000
+                    Assert.True(p0Unblock.ExitCode = 0, p0Unblock.Stderr)
+                    Assert.Equal("p0-ok", p0Unblock.Stdout)
+                    let p0WarmRes = p0Warm.GetAwaiter().GetResult()
+                    Assert.True(p0WarmRes.ExitCode = 0, p0WarmRes.Stderr)
                 finally
                     runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] daemonDir thrEnv None 20000 |> ignore
             finally

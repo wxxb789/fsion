@@ -701,28 +701,25 @@ type private ProcessStateGate() =
 
     member _.EnterFilePreludeBlocking() =
         lock sync (fun () ->
-            while activeRuns > 0 do
+            while activeRuns > 0 || activeFilePreludes > 0 do
                 Monitor.Wait sync |> ignore
 
-            if activeFilePreludes = 0 then
+            if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
+                Directory.SetCurrentDirectory daemonDirectory
+            currentDirectory <- daemonDirectory
+            applyEnvironment (readProcessEnvironment ()) daemonBaseline
+            currentEnvironment <- daemonBaseline
+            activeFilePreludes <- 1)
+
+    member _.TryEnterFilePrelude() =
+        lock sync (fun () ->
+            if activeRuns = 0 && activeFilePreludes = 0 then
                 if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
                     Directory.SetCurrentDirectory daemonDirectory
                 currentDirectory <- daemonDirectory
                 applyEnvironment (readProcessEnvironment ()) daemonBaseline
                 currentEnvironment <- daemonBaseline
-
-            activeFilePreludes <- activeFilePreludes + 1)
-
-    member _.TryEnterFilePrelude() =
-        lock sync (fun () ->
-            if activeRuns = 0 then
-                if activeFilePreludes = 0 then
-                    if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
-                        Directory.SetCurrentDirectory daemonDirectory
-                    currentDirectory <- daemonDirectory
-                    applyEnvironment (readProcessEnvironment ()) daemonBaseline
-                    currentEnvironment <- daemonBaseline
-                activeFilePreludes <- activeFilePreludes + 1
+                activeFilePreludes <- 1
                 true
             else
                 false)
@@ -730,16 +727,15 @@ type private ProcessStateGate() =
     member _.ExitFilePrelude() =
         lock sync (fun () ->
             activeFilePreludes <- activeFilePreludes - 1
-            if activeFilePreludes = 0 then
-                try
-                    if activeRuns = 0 then
-                        Directory.SetCurrentDirectory daemonDirectory
-                        currentDirectory <- daemonDirectory
-                finally
-                    Monitor.PulseAll sync)
+            try
+                if activeRuns = 0 && activeFilePreludes = 0 then
+                    Directory.SetCurrentDirectory daemonDirectory
+                    currentDirectory <- daemonDirectory
+            finally
+                Monitor.PulseAll sync)
 
     member _.CanEnterFilePreludeNow() =
-        lock sync (fun () -> activeRuns = 0)
+        lock sync (fun () -> activeRuns = 0 && activeFilePreludes = 0)
 
     member _.EnsureBaselineWhenIdle() =
         lock sync (fun () ->
@@ -749,7 +745,6 @@ type private ProcessStateGate() =
                 currentDirectory <- daemonDirectory
                 applyEnvironment (readProcessEnvironment ()) daemonBaseline
                 currentEnvironment <- daemonBaseline)
-
     member _.RespawnEnvironment() =
         daemonBaseline |> Seq.map (fun (KeyValue(key, value)) -> key, value) |> Seq.toArray
 
@@ -951,6 +946,13 @@ type SessionHost(options: SessionHostOptions) =
             slot.Failure <- None
         tag
 
+    let trimExcessPools () =
+        while pools.Count > 2 && pools.Exists(fun candidate -> candidate.Claimers = 0) do
+            let evictIdx = pools.FindIndex(fun candidate -> candidate.Claimers = 0)
+            let evicted = pools.[evictIdx]
+            clearPool evicted
+            pools.RemoveAt evictIdx
+
     let activateSpec spec =
         let tag = tagOfSpec spec
         lock poolGate (fun () ->
@@ -962,14 +964,9 @@ type SessionHost(options: SessionHostOptions) =
                     pools.RemoveAt index
                     existing
                 else
-                    if pools.Count >= 2 then
-                        let evictIdx = pools.FindIndex(fun candidate -> candidate.Claimers = 0)
-                        if evictIdx >= 0 then
-                            let evicted = pools.[evictIdx]
-                            clearPool evicted
-                            pools.RemoveAt evictIdx
                     PreludePool(spec, tag)
             pools.Add slot
+            trimExcessPools ()
             slot, refreshTagWith tag slot)
     let poolCount () = lock poolGate (fun () -> pools |> Seq.sumBy (fun slot -> slot.Warm.Count))
 
@@ -977,13 +974,8 @@ type SessionHost(options: SessionHostOptions) =
         lock poolGate (fun () ->
             slot.Claimers <- slot.Claimers + 1
             if not (pools.Contains slot) then
-                if pools.Count >= 2 then
-                    let evictIdx = pools.FindIndex(fun candidate -> candidate.Claimers = 0)
-                    if evictIdx >= 0 then
-                        let evicted = pools.[evictIdx]
-                        clearPool evicted
-                        pools.RemoveAt evictIdx
-                pools.Add slot)
+                pools.Add slot
+            trimExcessPools ())
 
         try
             let tryClaim () =
@@ -1079,11 +1071,7 @@ type SessionHost(options: SessionHostOptions) =
         finally
             lock poolGate (fun () ->
                 slot.Claimers <- slot.Claimers - 1
-                while pools.Count > 2 && pools.Exists(fun candidate -> candidate.Claimers = 0) do
-                    let evictIdx = pools.FindIndex(fun candidate -> candidate.Claimers = 0)
-                    let evicted = pools.[evictIdx]
-                    clearPool evicted
-                    pools.RemoveAt evictIdx)
+                trimExcessPools ())
 
     let removeHandlers (work: CleanupWork) =
         removeProcessExit work.ProcessExitHandlers
@@ -1500,6 +1488,7 @@ type SessionHost(options: SessionHostOptions) =
                        || not (creationGate.Wait 0) then
                         filling <- false
                     else
+                        lock poolGate (fun () -> slot.Claimers <- slot.Claimers + 1)
                         try
                             if Volatile.Read(&claimWaiters) > 0
                                || (Volatile.Read(&ensureWarmActive) = 0 && not (processState.IsQuiet 250L)) then
@@ -1520,8 +1509,7 @@ type SessionHost(options: SessionHostOptions) =
                                                 GC.Collect(1, GCCollectionMode.Optimized, false)
                                             let currentTag = tagOfSpec slot.Spec
                                             lock poolGate (fun () ->
-                                                if (pools.Contains slot || slot.Claimers > 0)
-                                                   && refreshTagWith currentTag slot = warm.Prelude then
+                                                if pools.Contains slot && refreshTagWith currentTag slot = warm.Prelude then
                                                     slot.Warm.Enqueue warm
                                                 else
                                                     discard.Enqueue warm)
@@ -1542,6 +1530,9 @@ type SessionHost(options: SessionHostOptions) =
                                         if isFile then
                                             processState.ExitFilePrelude()
                         finally
+                            lock poolGate (fun () ->
+                                slot.Claimers <- slot.Claimers - 1
+                                trimExcessPools ())
                             creationGate.Release() |> ignore
                 drainDiscarded ()
                 drainCleanups ()
@@ -1604,16 +1595,20 @@ type SessionHost(options: SessionHostOptions) =
             else
                 match spec with
                 | Prelude.Spec.File _ ->
-                    processState.EnterFilePreludeBlocking()
-                    try
-                        creationGate.Wait()
+                    let probe =
+                        processState.EnterFilePreludeBlocking()
                         try
-                            createWarmSession false spec |> releaseSession
+                            creationGate.Wait()
+                            try
+                                createWarmSession false spec
+                            finally
+                                creationGate.Release() |> ignore
                         finally
-                            creationGate.Release() |> ignore
+                            processState.ExitFilePrelude()
+                    try
+                        releaseSession probe
                     finally
-                        processState.ExitFilePrelude()
-                    replenishSignal.Release() |> ignore
+                        replenishSignal.Release() |> ignore
                 | _ -> ()
 
     member _.IsWarm =
@@ -1742,17 +1737,17 @@ type SessionHost(options: SessionHostOptions) =
                     finally
                         Ambient.clear ()
                 finally
-                    try
-                        if entered then
-                            processState.Exit ()
-                    finally
-                        if stateless then
-                            if entered then releaseSessionWith collectionsBefore claimed else releaseSession claimed
+                    if entered then
+                        processState.Exit ()
             finally
-                if options.LogPath.IsSome then
-                    let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs
-                    logDetail ($"run-phases evalMs={evaluateMs:F3} gateReleaseMs={gateReleaseMs:F3}")
-                if not options.Oneshot then replenishSignal.Release() |> ignore
+                try
+                    if stateless then
+                        if entered then releaseSessionWith collectionsBefore claimed else releaseSession claimed
+                finally
+                    if options.LogPath.IsSome then
+                        let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs
+                        logDetail ($"run-phases evalMs={evaluateMs:F3} gateReleaseMs={gateReleaseMs:F3}")
+                    if not options.Oneshot then replenishSignal.Release() |> ignore
 
         let canceledOutcome () =
             Interlocked.Increment(&executed.contents) |> ignore

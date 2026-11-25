@@ -488,31 +488,34 @@ type IsolationTests(output: ITestOutputHelper) =
                        "let greeting = \"hello\"" ])
             let run args =
                 context.Run(
-                    [ "--pool-size"; "1"; "--prelude"; prelude ] @ args,
+                    [ "--pool-size"; "2"; "--prelude"; prelude ] @ args,
                     timeoutMs = 120000,
                     extraEnv = env
                 )
             run [ "warmup" ] |> assertRun
             let before = context.MetricsOrFail()
-            Assert.Equal(1, before.PoolWarm)
+            Assert.Equal(2, before.PoolWarm)
+            let first = run [ "-e"; "System.Console.Write(greeting)" ]
+            assertRun first
+            Assert.Equal("hello", first.Stdout)
             writeFile directory "block" ""
             try
-                let first = run [ "-e"; "System.Console.Write(greeting)" ]
-                assertRun first
-                Assert.Equal("hello", first.Stdout)
+                let second = run [ "-e"; "System.Console.Write(greeting + \"2\")" ]
+                assertRun second
+                Assert.Equal("hello2", second.Stdout)
                 awaitCondition "replenishment did not start" (fun () -> File.Exists creating)
-                let second = Task.Run(fun () -> run [ "-e"; "System.IO.File.WriteAllText(" + literal active + ", greeting + \"2\")" ])
+                let third = Task.Run(fun () -> run [ "-e"; "System.IO.File.WriteAllText(" + literal active + ", greeting)" ])
                 awaitCondition "empty-pool claimant did not wait for the in-flight producer" (fun () -> (readLog log).Contains("session-claim waiting"))
                 Assert.False(File.Exists active)
                 File.Delete block
-                assertRun second.Result
-                Assert.Equal("hello2", File.ReadAllText active)
+                assertRun third.Result
+                Assert.Equal("hello", File.ReadAllText active)
                 let after = context.MetricsOrFail()
-                Assert.Equal(before.Executed + 2, after.Executed)
+                Assert.Equal(before.Executed + 3, after.Executed)
                 Assert.Equal(before.ColdClaims, after.ColdClaims)
-                Assert.Equal(1, after.PoolWarm)
+                Assert.Equal(2, after.PoolWarm)
                 let creations = (readLog log).Split('\n') |> Array.filter (fun line -> line.Contains "session-created total=")
-                Assert.Equal(3, creations.Length)
+                Assert.Equal(5, creations.Length)
             finally
                 File.Delete block)
 

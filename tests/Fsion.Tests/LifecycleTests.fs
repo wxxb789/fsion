@@ -281,8 +281,14 @@ let ``defaultEndpointName ignores USERNAME and USER environment overrides`` () =
 
         Assert.Equal(0, first.ExitCode)
         Assert.Equal(0, second.ExitCode)
-        Assert.Equal(first.Stdout, second.Stdout)
-        Assert.DoesNotContain("spoofed-alpha", first.Stdout)
-        Assert.DoesNotContain("spoofed-beta", second.Stdout)
+        let extractEndpoint (text: string) =
+            let m = System.Text.RegularExpressions.Regex.Match(text, @"endpoint(?:\s+|=)([^\s,\)]+)")
+            Assert.True(m.Success, "Unexpected status output: " + text)
+            m.Groups.[1].Value
+        let ep1 = extractEndpoint first.Stdout
+        let ep2 = extractEndpoint second.Stdout
+        Assert.Equal(ep1, ep2)
+        Assert.DoesNotContain("spoofed-alpha", ep1)
+        Assert.DoesNotContain("spoofed-beta", ep2)
     finally
         tryDeleteDirectory workingDirectory

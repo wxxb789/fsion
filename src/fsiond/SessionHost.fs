@@ -1119,6 +1119,7 @@ type SessionHost(options: SessionHostOptions) =
         survivors.Count
 
     let mutable totalReleased = 0
+    let mutable pendingUnloadSweep = 0
 
     let disposePendingCleanups () =
         let mutable work = Unchecked.defaultof<CleanupWork>
@@ -1143,31 +1144,55 @@ type SessionHost(options: SessionHostOptions) =
 
         drained
 
-    let drainPendingCleanups () =
-        let drained = disposePendingCleanups ()
-        if drained > 0 then
-            totalReleased <- totalReleased + drained
-            sweepFinalizers ()
-            let alive = drainReleasedSessions ()
-            logDetail ($"unload released={totalReleased} alive={alive}")
+    let completeUnloadSweep (forceSweep: bool) =
+        let pending = Interlocked.Exchange(&pendingUnloadSweep, 0)
+        if pending > 0 then
+            if forceSweep || (Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L) then
+                sweepFinalizers ()
+                let alive =
+                    if creationGate.Wait 0 then
+                        try
+                            drainReleasedSessions ()
+                        finally
+                            creationGate.Release() |> ignore
+                    else
+                        0
+                let cumulative = Interlocked.Add(&totalReleased, pending)
+                logDetail ($"unload released={cumulative} alive={alive}")
+            else
+                Interlocked.Add(&pendingUnloadSweep, pending) |> ignore
 
     let drainCleanups () =
+        let mutable forceSweep = false
         if not pendingCleanups.IsEmpty && creationGate.Wait 0 then
             try
-                if pendingCleanups.Count >= 16 then
-                    drainPendingCleanups ()
+                let count = pendingCleanups.Count
+                if count >= 16 then
+                    forceSweep <- true
+                    let drained = disposePendingCleanups ()
+                    if drained > 0 then
+                        Interlocked.Add(&pendingUnloadSweep, drained) |> ignore
                 elif Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L then
-                    drainPendingCleanups ()
+                    let drained = disposePendingCleanups ()
+                    if drained > 0 then
+                        Interlocked.Add(&pendingUnloadSweep, drained) |> ignore
             finally
                 creationGate.Release() |> ignore
+
+        if Volatile.Read(&pendingUnloadSweep) > 0 then
+            completeUnloadSweep forceSweep
 
     let drainCleanupsBlocking () =
         creationGate.Wait()
 
         try
-            drainPendingCleanups ()
+            let drained = disposePendingCleanups ()
+            if drained > 0 then
+                Interlocked.Add(&pendingUnloadSweep, drained) |> ignore
         finally
             creationGate.Release() |> ignore
+
+        completeUnloadSweep true
 
     let stripLeadingBom (text: string) =
         if text.Length > 0 && text.[0] = '\uFEFF' then text.Substring 1 else text
@@ -1515,9 +1540,19 @@ type SessionHost(options: SessionHostOptions) =
                        || not (creationGate.Wait 0) then
                         filling <- false
                     else
-                        lock poolGate (fun () -> slot.Claimers <- slot.Claimers + 1)
+                        let failedWarm = ref None
+                        let stillActive =
+                            lock poolGate (fun () ->
+                                if pools.Contains slot
+                                   && slot.Failure.IsNone
+                                   && slot.Warm.Count < targetPoolSize then
+                                    slot.Claimers <- slot.Claimers + 1
+                                    true
+                                else
+                                    false)
                         try
-                            if Volatile.Read(&claimWaiters) > 0
+                            if not stillActive
+                               || Volatile.Read(&claimWaiters) > 0
                                || (Volatile.Read(&ensureWarmActive) = 0 && not (processState.IsQuiet 250L)) then
                                 filling <- false
                             else
@@ -1529,7 +1564,6 @@ type SessionHost(options: SessionHostOptions) =
                                 match entered with
                                 | ValueNone -> filling <- false
                                 | ValueSome isFile ->
-                                    let failedWarm = ref None
                                     try
                                         try
                                             let warm = createWarmSession failedWarm slot.Spec
@@ -1557,16 +1591,17 @@ type SessionHost(options: SessionHostOptions) =
                                     finally
                                         if isFile then
                                             processState.ExitFilePrelude()
-                                        match failedWarm.Value with
-                                        | Some failed ->
-                                            enqueueCleanup failed
-                                            replenishSignal.Release() |> ignore
-                                        | None -> ()
                         finally
-                            lock poolGate (fun () ->
-                                slot.Claimers <- slot.Claimers - 1
-                                trimExcessPools ())
+                            if stillActive then
+                                lock poolGate (fun () ->
+                                    slot.Claimers <- slot.Claimers - 1
+                                    trimExcessPools ())
                             creationGate.Release() |> ignore
+                            match failedWarm.Value with
+                            | Some failed ->
+                                enqueueCleanup failed
+                                replenishSignal.Release() |> ignore
+                            | None -> ()
                 drainDiscarded ()
                 drainCleanups ()
 
@@ -1919,7 +1954,12 @@ type SessionHost(options: SessionHostOptions) =
         sweepFinalizers ()
 
         let scriptAssemblyCount = scriptAssemblies () |> Array.length
-        let aliveDisposedSessions = drainReleasedSessions ()
+        let aliveDisposedSessions =
+            creationGate.Wait()
+            try
+                drainReleasedSessions ()
+            finally
+                creationGate.Release() |> ignore
 
         { PoolTarget = targetPoolSize
           PoolWarm = poolCount ()

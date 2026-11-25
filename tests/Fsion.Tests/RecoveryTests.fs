@@ -108,7 +108,41 @@ type RecoveryTests(output: ITestOutputHelper) =
                 )
             Assert.True(next.ExitCode = 0, next.Stderr)
             Assert.Equal(replacement, context.DaemonPid())
-            Assert.Equal("<null>", next.Stdout))
+            Assert.Equal("<null>", next.Stdout)
+
+            let bootMarker = Path.Combine(directory, "boot-prelude-runs.txt")
+            let bootPrelude = Path.Combine(directory, "boot-prelude.fsx")
+            writeFile
+                directory
+                "boot-prelude.fsx"
+                (sprintf "System.IO.File.AppendAllText(@\"%s\", \"run\\n\")\nlet bootVal = 1\n" bootMarker)
+            let bootPipe = "fsion-test-bootp-" + Guid.NewGuid().ToString("N")
+            let bootStartEnv =
+                [ "FSION_PIPE", bootPipe
+                  "FSIOND_PATH", fsiondBinary
+                  "FSION_CONFIG_DIR", Path.Combine(directory, ".fsion-bootp-config")
+                  "FSION_PRELUDE", bootPrelude ]
+            let bootClearEnv =
+                [ "FSION_PIPE", bootPipe
+                  "FSIOND_PATH", fsiondBinary
+                  "FSION_CONFIG_DIR", Path.Combine(directory, ".fsion-bootp-config")
+                  "FSION_PRELUDE", null ]
+            try
+                let bootWarm = runProcess fsionBinary [ "--pool-size"; "1"; "warmup" ] directory bootStartEnv None 120000
+                Assert.True(bootWarm.ExitCode = 0, bootWarm.Stderr)
+                let bootCountBefore = File.ReadAllLines(bootMarker).Length
+                Assert.True(bootCountBefore >= 1)
+                let wedgeBuiltin =
+                    runProcess fsionBinary [ "--timeout"; "500"; "-e"; "while true do ()" ] directory bootClearEnv None 60000
+                Assert.Equal(124, wedgeBuiltin.ExitCode)
+                let afterBuiltin =
+                    runProcess fsionBinary [ "-e"; "System.Console.Write(\"builtin-ok\")" ] directory bootClearEnv None 120000
+                Assert.True(afterBuiltin.ExitCode = 0, afterBuiltin.Stderr)
+                Assert.Equal("builtin-ok", afterBuiltin.Stdout)
+                Thread.Sleep 800
+                Assert.Equal(bootCountBefore, File.ReadAllLines(bootMarker).Length)
+            finally
+                runProcess fsionBinary [ "daemon"; "stop" ] directory bootClearEnv None 20000 |> ignore)
 
     [<Fact>]
     member _.``client disconnect cancels a cooperative wait without retiring the daemon`` () =

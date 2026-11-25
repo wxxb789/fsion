@@ -171,7 +171,7 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
                       "--pool-size"; string options.PoolSize ]
                     @ (match session.DesiredSpec with
                        | Prelude.Spec.Bare -> [ "--no-prelude" ]
-                       | Prelude.Spec.Builtin -> []
+                       | Prelude.Spec.Builtin -> [ "--builtin-prelude" ]
                        | Prelude.Spec.File path -> [ "--prelude"; path ])
                     @ (match options.LogPath with
                        | Some path -> [ "--log"; path ]

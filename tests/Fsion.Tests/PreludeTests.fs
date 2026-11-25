@@ -691,7 +691,7 @@ type PreludeTests(output: ITestOutputHelper) =
                       "FSION_CONFIG_DIR", Path.Combine(directory, ".fsion-fin-config") ]
                 try
                     let finWarm =
-                        runProcess Fsion.Tests.TestInfra.fsionBinary [ "--pool-size"; "2"; "--session-ttl"; "0.01"; "warmup" ] daemonDir finEnv None 120000
+                        runProcess Fsion.Tests.TestInfra.fsionBinary [ "--pool-size"; "0"; "--session-ttl"; "0.01"; "warmup" ] daemonDir finEnv None 120000
                     Assert.True(finWarm.ExitCode = 0, finWarm.Stderr)
                     let finArm =
                         runProcess Fsion.Tests.TestInfra.fsionBinary [ "--session"; "fin-sess"; "-e"; finCode ] daemonDir finEnv None 60000
@@ -917,6 +917,50 @@ type PreludeTests(output: ITestOutputHelper) =
                         Assert.Equal("A2", nrResetRes.Stdout)
                     finally
                         runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] daemonDir nrEnv None 20000 |> ignore
+
+                    let bgFailPipe = "fsion-test-bgf-" + Guid.NewGuid().ToString("N")
+                    let bgFailEnv =
+                        [ "FSION_PIPE", bgFailPipe
+                          "FSIOND_PATH", Fsion.Tests.TestInfra.fsiondBinary
+                          "FSION_CONFIG_DIR", Path.Combine(directory, ".fsion-bgf-config")
+                          "FSION_PRELUDE", null ]
+                    try
+                        let bgFailPath = Path.Combine(directory, "bg-fail.fsx")
+                        let bgArmMarker = Path.Combine(directory, "bg-arm.txt")
+                        let bgSecondRunning = Path.Combine(directory, "bg-second-running.txt")
+                        let bgEvalRelease = Path.Combine(directory, "bg-eval-release.txt")
+                        let bgDispEntered = Path.Combine(directory, "bg-disp-entered.txt")
+                        let bgDispRelease = Path.Combine(directory, "bg-disp-release.txt")
+                        writeFile
+                            directory
+                            "bg-fail.fsx"
+                            (sprintf
+                                "let armed = System.IO.File.Exists(@\"%s\")\nlet hold = { new System.IDisposable with member _.Dispose() = if armed then System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20 }\nif armed then\n    System.IO.File.WriteAllText(@\"%s\", \"1\")\n    while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\n    failwith \"bg-fail-boom\"\n"
+                                bgArmMarker
+                                bgDispEntered
+                                bgDispRelease
+                                bgSecondRunning
+                                bgEvalRelease)
+                        let bgWarm = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--pool-size"; "2"; "--prelude"; bgFailPath; "warmup" ] daemonDir bgFailEnv None 120000
+                        Assert.True(bgWarm.ExitCode = 0, bgWarm.Stderr)
+                        writeFile directory "bg-arm.txt" "arm"
+                        let bgConsumeOne = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; bgFailPath; "-e"; "()" ] daemonDir bgFailEnv None 60000
+                        Assert.True(bgConsumeOne.ExitCode = 0, bgConsumeOne.Stderr)
+                        waitFor "replenisher entered armed bg-fail evaluation" (fun () -> File.Exists bgSecondRunning)
+                        writeFile directory "bg-eval-release.txt" "boom"
+                        waitFor "replenisher failed prelude Dispose entered" (fun () -> File.Exists bgDispEntered)
+                        let bgColdUnblock =
+                            runProcess
+                                Fsion.Tests.TestInfra.fsionBinary
+                                [ "--no-prelude"; "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"go\"); System.Console.Write(\"bg-cold-ok\")" bgDispRelease ]
+                                daemonDir
+                                bgFailEnv
+                                None
+                                60000
+                        Assert.True(bgColdUnblock.ExitCode = 0, bgColdUnblock.Stderr)
+                        Assert.Equal("bg-cold-ok", bgColdUnblock.Stdout)
+                    finally
+                        runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] daemonDir bgFailEnv None 20000 |> ignore
                 finally
                     runProcess Fsion.Tests.TestInfra.fsionBinary [ "daemon"; "stop" ] daemonDir thrEnv None 20000 |> ignore
             finally

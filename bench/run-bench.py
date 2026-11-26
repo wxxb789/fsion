@@ -461,12 +461,16 @@ def _measure_phases(runner: Runner, data: dict, directory: Path, env: dict, time
             # never stalls client response delivery); wait briefly for this sequential sample's
             # `executed` line to land before starting the next sample so log entries stay 1:1 ordered.
             deadline = time.perf_counter() + 2.0
+            observed = False
             while time.perf_counter() < deadline:
                 if log.exists():
                     trace_so_far = log.read_text(encoding="utf-8", errors="replace")
                     if len(re.findall(r"executed exit=0 .* daemonMs=([\d.]+)", trace_so_far)) >= index:
+                        observed = True
                         break
                 time.sleep(0.01)
+            if not observed:
+                raise SystemExit(f"timed out waiting for phase sample {index} executed log entry")
     finally:
         _run_command(command + ["daemon", "stop"], directory, env, timeout)
     trace = log.read_text(encoding="utf-8")

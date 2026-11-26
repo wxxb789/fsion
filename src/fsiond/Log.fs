@@ -36,20 +36,22 @@ let private openAppendStream (fullPath: string) : FileStream option =
         let flags = oWrOnly ||| oAppend ||| oNonBlock ||| oCloExec
         let mutable fd = PosixLogOpen.openExisting(fullPath, flags)
         if fd < 0 && Marshal.GetLastPInvokeError() = 2 then // ENOENT on both Linux and macOS
-            let createTarget =
+            // If `fullPath` itself is a symlink (including a dangling symlink whose target may contain
+            // `symlink/..` segments), avoid creating a wrong path via lexical `..` folding: only create
+            // when `fullPath` is not an existing symlink (normal missing log file).
+            let isSymlink =
                 try
-                    match File.ResolveLinkTarget(fullPath, true) with
-                    | null -> fullPath
-                    | info -> info.FullName
+                    FileInfo(fullPath).LinkTarget <> null
                 with _ ->
-                    fullPath
-            try
-                use _created = new FileStream(createTarget, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite ||| FileShare.Delete)
-                ()
-            with :? IOException ->
-                // Another process created the file concurrently (EEXIST); retry openExisting below.
-                ()
-            fd <- PosixLogOpen.openExisting(fullPath, flags)
+                    false
+            if not isSymlink then
+                try
+                    use _created = new FileStream(fullPath, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite ||| FileShare.Delete)
+                    ()
+                with :? IOException ->
+                    // Another process created the file concurrently (EEXIST); retry openExisting below.
+                    ()
+                fd <- PosixLogOpen.openExisting(fullPath, flags)
         if fd < 0 then
             None
         else

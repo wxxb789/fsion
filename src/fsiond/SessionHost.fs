@@ -2093,7 +2093,9 @@ type SessionHost(options: SessionHostOptions) =
                             && slot.Warm.Count < targetPoolSize
                             && (quietNow || slot.WarmupWaiters > 0)
                             && (match slot.Spec with
-                                | Prelude.Spec.File _ -> processState.CanEnterFilePreludeNow()
+                                | Prelude.Spec.File _ ->
+                                    (slot.Spec = desiredSpec || slot.WarmupWaiters > 0)
+                                    && processState.CanEnterFilePreludeNow()
                                 | _ -> true))
                         |> Seq.sortBy (fun slot -> (if slot.WarmupWaiters > 0 then 0 else 1), slot.Warm.Count)
                         |> Seq.tryHead

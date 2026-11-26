@@ -471,9 +471,26 @@ module private WinHandleTable =
     let mutable private assemblyLoadHooked = false
     let mutable private baselineEpoch = 0L
     let private pendingDefaultAsmCandidates = Dictionary<struct (uint32 * uint64), int64 * HashSet<nativeint>>()
-    let private runtimeTrustedRoot =
-        let dir = Path.GetDirectoryName(typeof<obj>.Assembly.Location)
-        if String.IsNullOrEmpty dir then "" else Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + string Path.DirectorySeparatorChar
+    let private resolveCanonicalPath (path: string) =
+        let full = Path.GetFullPath path
+        try
+            match File.ResolveLinkTarget(full, true) with
+            | null -> full
+            | info -> info.FullName
+        with _ ->
+            full
+
+    let private runtimeTrustedRoots =
+        let roots = HashSet<string>(if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal)
+        let addDir (dir: string) =
+            if not (String.IsNullOrEmpty dir) then
+                let full = Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + string Path.DirectorySeparatorChar
+                roots.Add full |> ignore
+                let canonical = resolveCanonicalPath dir
+                let canonicalNorm = canonical.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + string Path.DirectorySeparatorChar
+                roots.Add canonicalNorm |> ignore
+        addDir (Path.GetDirectoryName(typeof<obj>.Assembly.Location))
+        [| for r in roots -> r |]
 
     let private bundledTrustedAssemblies =
         let appDir =
@@ -485,16 +502,19 @@ module private WinHandleTable =
               "FSharp.Compiler.Service.dll"
               "FSharp.Core.dll"
               "Fsion.Protocol.dll" ]
-        let set = HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        let set = HashSet<string>(if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal)
         if appDir.Length > 0 then
             for name in names do
-                set.Add(Path.Combine(appDir, name)) |> ignore
+                let p = Path.Combine(appDir, name)
+                set.Add p |> ignore
+                set.Add(resolveCanonicalPath p) |> ignore
         set
 
     let private isTrustedRuntimeAssemblyPath (fullPath: string) =
-        (runtimeTrustedRoot.Length > 0
-         && fullPath.StartsWith(runtimeTrustedRoot, StringComparison.OrdinalIgnoreCase))
+        let comparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+        (runtimeTrustedRoots |> Array.exists (fun root -> fullPath.StartsWith(root, comparison)))
         || bundledTrustedAssemblies.Contains fullPath
+
     let private recordHandleBaselineForAssembly (asm: Assembly) =
         if OperatingSystem.IsWindows()
            && not asm.IsDynamic

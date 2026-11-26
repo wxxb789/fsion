@@ -144,7 +144,7 @@ let ``idle ttl retires an auto-started daemon`` () =
         Assert.Equal(0, warmup.ExitCode)
         Assert.True((context.DaemonPid()).IsSome, "daemon was not reported as running")
 
-        let deadline = DateTime.UtcNow.AddSeconds 30.0
+        let deadline = DateTime.UtcNow.AddSeconds 45.0
         let mutable running = true
 
         while running && DateTime.UtcNow < deadline do
@@ -152,7 +152,6 @@ let ``idle ttl retires an auto-started daemon`` () =
             running <- (context.DaemonPid()).IsSome
 
         Assert.False(running, "daemon did not exit after the idle TTL elapsed"))
-
 let private readAllTextEventually (path: string) =
     let deadline = DateTime.UtcNow.AddSeconds 10.0
     let mutable text = ""

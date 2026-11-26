@@ -173,9 +173,9 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
             |> ignore
 
     let retire () =
-        stop ()
+        // Publish retired=1 BEFORE stop() unblocks acceptLoop so main thread always observes the 60s drain window.
         scheduleSelfTermination ()
-
+        stop ()
     let respawn () =
         if not options.Oneshot then
             match Environment.ProcessPath with

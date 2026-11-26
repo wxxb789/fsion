@@ -47,30 +47,35 @@ module private PosixSecurity =
     let [<Literal>] LOCK_EX = 2
     let [<Literal>] LOCK_NB = 4
 
+let private ensurePrivatePosixDirectory (dir: string) =
+    if not isWindows then
+        let info = DirectoryInfo dir
+        if info.Exists && not (isNull info.LinkTarget) then
+            raise (UnauthorizedAccessException("refusing symlinked POSIX socket directory: " + dir))
+        Directory.CreateDirectory dir |> ignore
+        if PosixSecurity.chmod(dir, 0o700u) <> 0 then
+            raise (UnauthorizedAccessException("failed to set 0700 permissions on POSIX socket directory: " + dir))
+        let actualMode = File.GetUnixFileMode dir
+        let forbidden = UnixFileMode.GroupRead ||| UnixFileMode.GroupWrite ||| UnixFileMode.GroupExecute ||| UnixFileMode.OtherRead ||| UnixFileMode.OtherWrite ||| UnixFileMode.OtherExecute
+        if (actualMode &&& forbidden) <> UnixFileMode.None then
+            raise (UnauthorizedAccessException("POSIX socket directory has unsafe permissions: " + dir))
+    dir
+
+let private posixUidString () =
+    if isWindows then "0"
+    else
+        try
+            string (PosixSecurity.geteuid ())
+        with _ ->
+            sanitizeName Environment.UserName
+
 let private posixSocketDirectory () =
-    let uid =
-        if isWindows then "0"
-        else
-            try
-                string (PosixSecurity.geteuid ())
-            with _ ->
-                sanitizeName Environment.UserName
+    let uid = posixUidString ()
     let baseRoot =
         match Environment.GetEnvironmentVariable "XDG_RUNTIME_DIR" with
         | null | "" -> Path.Combine(Path.GetTempPath(), "fsion-" + uid)
         | directory -> Path.Combine(directory, "fsion-" + uid)
-    if not isWindows then
-        let info = DirectoryInfo baseRoot
-        if info.Exists && not (isNull info.LinkTarget) then
-            raise (UnauthorizedAccessException("refusing symlinked POSIX socket directory: " + baseRoot))
-        Directory.CreateDirectory baseRoot |> ignore
-        if PosixSecurity.chmod(baseRoot, 0o700u) <> 0 then
-            raise (UnauthorizedAccessException("failed to set 0700 permissions on POSIX socket directory: " + baseRoot))
-        let actualMode = File.GetUnixFileMode baseRoot
-        let forbidden = UnixFileMode.GroupRead ||| UnixFileMode.GroupWrite ||| UnixFileMode.GroupExecute ||| UnixFileMode.OtherRead ||| UnixFileMode.OtherWrite ||| UnixFileMode.OtherExecute
-        if (actualMode &&& forbidden) <> UnixFileMode.None then
-            raise (UnauthorizedAccessException("POSIX socket directory has unsafe permissions: " + baseRoot))
-    baseRoot
+    ensurePrivatePosixDirectory baseRoot
 
 let socketPath (endpoint: Endpoint) =
     let baseDirectory = posixSocketDirectory ()
@@ -84,18 +89,7 @@ let socketPath (endpoint: Endpoint) =
             if Encoding.UTF8.GetByteCount(Path.Combine(baseDirectory, "fsion-0123456789abcdef.sock")) <= 100 then
                 baseDirectory
             else
-                let tmpRoot =
-                    let uid =
-                        if isWindows then "0"
-                        else
-                            try string (PosixSecurity.geteuid ())
-                            with _ -> sanitizeName Environment.UserName
-                    let dir = Path.Combine("/tmp", "fsion-" + uid)
-                    if not isWindows then
-                        Directory.CreateDirectory dir |> ignore
-                        try PosixSecurity.chmod(dir, 0o700u) |> ignore with _ -> ()
-                    dir
-                tmpRoot
+                ensurePrivatePosixDirectory (Path.Combine("/tmp", "fsion-" + posixUidString ()))
 
         let hash =
             SHA256.HashData(Encoding.UTF8.GetBytes sanitized)

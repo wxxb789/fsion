@@ -1560,8 +1560,11 @@ type SessionHost(options: SessionHostOptions) =
         let phase2 = Interlocked.Exchange(&pendingUnloadPhase2, 0)
         if phase2 > 0 then
             if isQuietNow () then
-                System.Runtime.GCSettings.LargeObjectHeapCompactionMode <- System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce
-                GC.Collect(2, GCCollectionMode.Forced, true, true)
+                if not forceSweep then
+                    System.Runtime.GCSettings.LargeObjectHeapCompactionMode <- System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce
+                    GC.Collect(2, GCCollectionMode.Forced, true, true)
+                else
+                    GC.Collect(2, GCCollectionMode.Forced, true, false)
                 let alive = drainReleasedSessions ()
                 let cumulative = Interlocked.Add(&totalReleased, phase2)
                 logDetail ($"unload released={cumulative} alive={alive}")
@@ -2212,6 +2215,14 @@ type SessionHost(options: SessionHostOptions) =
         with _ ->
             ()
 
+    let deleteSessionTombstoneIfCurrentGen (sessionId: string) =
+        try
+            let p = tombstonePath sessionId
+            if File.Exists p && File.ReadAllText(p).Trim() = options.GenerationId then
+                File.Delete p
+        with _ ->
+            ()
+
     let deleteSessionTombstone (sessionId: string) =
         try
             let p = tombstonePath sessionId
@@ -2219,7 +2230,6 @@ type SessionHost(options: SessionHostOptions) =
                 File.Delete p
         with _ ->
             ()
-
     let getOrCreateNamed (sessionId: string) =
         lock namedGate (fun () ->
             match namedSessions.TryGetValue sessionId with
@@ -2250,9 +2260,8 @@ type SessionHost(options: SessionHostOptions) =
                                 match namedSessions.TryGetValue sessionId with
                                 | true, existing when Object.ReferenceEquals(existing, entry) ->
                                     namedSessions.Remove sessionId |> ignore
-                                    deleteSessionTombstone sessionId
+                                    deleteSessionTombstoneIfCurrentGen sessionId
                                 | _ -> ())
-
                             match entry.Session with
                             | Some warm -> enqueueCleanupAndDrainIfCapped warm
                             | None -> ()
@@ -2778,6 +2787,30 @@ type SessionHost(options: SessionHostOptions) =
                         with :? OperationCanceledException ->
                             canceledOutcome ()
                     | Some sessionId ->
+                        let generationLostEarly =
+                            if request.Reset then
+                                false
+                            else
+                                lock namedGate (fun () ->
+                                    match namedSessions.TryGetValue sessionId with
+                                    | true, existing when existing.Session.IsSome -> false
+                                    | _ ->
+                                        match readSessionTombstone sessionId with
+                                        | Some previousGen when previousGen <> options.GenerationId -> true
+                                        | _ -> false)
+                        if generationLostEarly then
+                            { ExitCode = 1
+                              StandardOut = ""
+                              StandardError =
+                                "fsion: named session '"
+                                + sessionId
+                                + "' was lost when fsiond restarted; pass --session "
+                                + sessionId
+                                + " --reset to start a fresh session"
+                                + Environment.NewLine
+                              Diagnostics = [||]
+                              TimedOut = false }
+                        else
                         let acquired =
                             if request.Reset then
                                 acquireNamedReset sessionId

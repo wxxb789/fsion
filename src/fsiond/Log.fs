@@ -12,17 +12,19 @@ let private append (path: string) (line: string) =
     let name = "fsion-log-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes key))
     use gate = new Mutex(false, name)
 
-    try
-        gate.WaitOne() |> ignore
-    with :? AbandonedMutexException ->
-        ()
+    let acquired =
+        try
+            gate.WaitOne(2000)
+        with :? AbandonedMutexException ->
+            true
 
-    try
-        use stream = new FileStream(fullPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite ||| FileShare.Delete)
-        use writer = new StreamWriter(stream)
-        writer.Write line
-    finally
-        gate.ReleaseMutex()
+    if acquired then
+        try
+            use stream = new FileStream(fullPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite ||| FileShare.Delete)
+            use writer = new StreamWriter(stream)
+            writer.Write line
+        finally
+            gate.ReleaseMutex()
 
 let private write (logPath: string option) (level: string) (message: string) =
     let line = DateTime.UtcNow.ToString("o") + " [" + level + "] " + message + Environment.NewLine

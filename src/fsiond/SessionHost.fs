@@ -471,6 +471,14 @@ module private WinHandleTable =
     let mutable private assemblyLoadHooked = false
     let mutable private baselineEpoch = 0L
     let private pendingDefaultAsmCandidates = Dictionary<struct (uint32 * uint64), int64 * HashSet<nativeint>>()
+    let private runtimeTrustedRoot =
+        let dir = Path.GetDirectoryName(typeof<obj>.Assembly.Location)
+        if String.IsNullOrEmpty dir then "" else Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + string Path.DirectorySeparatorChar
+
+    let private isUnderRuntimeTrustedRoot (fullPath: string) =
+        runtimeTrustedRoot.Length > 0
+        && fullPath.StartsWith(runtimeTrustedRoot, StringComparison.OrdinalIgnoreCase)
+
     let private recordHandleBaselineForAssembly (asm: Assembly) =
         if OperatingSystem.IsWindows()
            && not asm.IsDynamic
@@ -483,57 +491,55 @@ module private WinHandleTable =
             if not (String.IsNullOrEmpty loc) then
                 try
                     let fullLoc = Path.GetFullPath loc
-                    match listRegularDiskFiles () with
-                    | ValueSome current ->
-                        let capChars = 1024u
-                        let pathBuf = Marshal.AllocHGlobal(int capChars * 2)
-                        try
-                            lock baselineSync (fun () ->
-                                match baselineHandlesOpt with
-                                | ValueSome baseline ->
-                                    // Only add immediately when there is a single matching handle (no concurrent user
-                                    // FileStream). If multiple handles match at AssemblyLoad time (e.g. a user held a
-                                    // FileStream open while loading the DLL into Default ALC), record the exact
-                                    // `(vol, fileIdx) -> {HandleValue}` candidates captured at load time; once the user
-                                    // closes their FileStream so only one of those exact load-time handles remains,
-                                    // `snapshot()` promotes that sole CoreCLR PE handle into `baseline` and clears the
-                                    // candidate entry.
-                                    let matched = ResizeArray<struct (nativeint * uint32 * uint64)>()
-                                    for id in current do
-                                        let struct (h, vol, _) = id
-                                        if vol <> 0xFFFFFFFFu then
-                                            let len = GetFinalPathNameByHandleW(h, pathBuf, capChars, 0u)
-                                            if len > 0u && len < capChars then
-                                                let raw = Marshal.PtrToStringUni(pathBuf, int len)
-                                                let normalized =
-                                                    if raw.StartsWith(@"\\?\", StringComparison.Ordinal) then raw.Substring 4 else raw
-                                                if String.Equals(normalized, fullLoc, StringComparison.OrdinalIgnoreCase) then
-                                                    matched.Add id
-                                    let distinctFiles = HashSet<struct (uint32 * uint64)>()
-                                    for id in matched do
-                                        let struct (_, vol, fileIdx) = id
-                                        distinctFiles.Add(struct (vol, fileIdx)) |> ignore
-                                    if matched.Count = 1 && not (baseline.Contains matched.[0]) then
-                                        baseline.Add matched.[0] |> ignore
-                                    elif matched.Count > 1 && distinctFiles.Count = 1 then
-                                        let registeredEpoch = Interlocked.Increment(&baselineEpoch)
+                    // Only admit assemblies from the shared .NET runtime directory (`Microsoft.NETCore.App`),
+                    // where CoreCLR maps and holds resident PE handles for framework BCL assemblies. Arbitrary
+                    // user/external assemblies (e.g. tools or user DLLs loaded via LoadFromAssemblyPath) are
+                    // never admitted so a user FileStream on them can never be misclassified as a runtime handle.
+                    if isUnderRuntimeTrustedRoot fullLoc then
+                        match listRegularDiskFiles () with
+                        | ValueSome current ->
+                            let capChars = 1024u
+                            let pathBuf = Marshal.AllocHGlobal(int capChars * 2)
+                            try
+                                lock baselineSync (fun () ->
+                                    match baselineHandlesOpt with
+                                    | ValueSome baseline ->
+                                        let matched = ResizeArray<struct (nativeint * uint32 * uint64)>()
+                                        for id in current do
+                                            let struct (h, vol, _) = id
+                                            if vol <> 0xFFFFFFFFu then
+                                                let len = GetFinalPathNameByHandleW(h, pathBuf, capChars, 0u)
+                                                if len > 0u && len < capChars then
+                                                    let raw = Marshal.PtrToStringUni(pathBuf, int len)
+                                                    let normalized =
+                                                        if raw.StartsWith(@"\\?\", StringComparison.Ordinal) then raw.Substring 4 else raw
+                                                    if String.Equals(normalized, fullLoc, StringComparison.OrdinalIgnoreCase) then
+                                                        matched.Add id
+                                        let distinctFiles = HashSet<struct (uint32 * uint64)>()
                                         for id in matched do
-                                            let struct (h, vol, fileIdx) = id
-                                            let fileKey = struct (vol, fileIdx)
-                                            let set =
-                                                match pendingDefaultAsmCandidates.TryGetValue fileKey with
-                                                | true, (_, existing) ->
-                                                    pendingDefaultAsmCandidates.[fileKey] <- (registeredEpoch, existing)
-                                                    existing
-                                                | false, _ ->
-                                                    let created = HashSet<nativeint>()
-                                                    pendingDefaultAsmCandidates.[fileKey] <- (registeredEpoch, created)
-                                                    created
-                                            set.Add h |> ignore
-                                | ValueNone -> ())
-                        finally
-                            Marshal.FreeHGlobal pathBuf
-                    | ValueNone -> ()
+                                            let struct (_, vol, fileIdx) = id
+                                            distinctFiles.Add(struct (vol, fileIdx)) |> ignore
+                                        if matched.Count = 1 && not (baseline.Contains matched.[0]) then
+                                            baseline.Add matched.[0] |> ignore
+                                        elif matched.Count > 1 && distinctFiles.Count = 1 then
+                                            let registeredEpoch = Interlocked.Increment(&baselineEpoch)
+                                            for id in matched do
+                                                let struct (h, vol, fileIdx) = id
+                                                let fileKey = struct (vol, fileIdx)
+                                                let set =
+                                                    match pendingDefaultAsmCandidates.TryGetValue fileKey with
+                                                    | true, (_, existing) ->
+                                                        pendingDefaultAsmCandidates.[fileKey] <- (registeredEpoch, existing)
+                                                        existing
+                                                    | false, _ ->
+                                                        let created = HashSet<nativeint>()
+                                                        pendingDefaultAsmCandidates.[fileKey] <- (registeredEpoch, created)
+                                                        created
+                                                set.Add h |> ignore
+                                    | ValueNone -> ())
+                            finally
+                                Marshal.FreeHGlobal pathBuf
+                        | ValueNone -> ()
                 with _ -> ()
 
     let initializeBaseline () =

@@ -261,6 +261,31 @@ def _python_source(workload: str, nonce: str, seed: int, rows: list[dict]) -> st
         + "sys.stdout.buffer.write(out.encode(\"utf-8\"))\n"
     )
 
+def _powershell_source(workload: str, nonce: str, seed: int, rows: list[dict]) -> str:
+    if workload == WORKLOAD_HELLO:
+        return (
+            f"$nonce = '{nonce}'\n"
+            f"$seed = {seed}\n"
+            "[Console]::Out.Write(\"hello $nonce $($seed * 2 + 7)`n\")\n"
+            "[Console]::Out.Flush()\n"
+        )
+    payload = _json_literal(rows).replace("'", "''")
+    return (
+        f"$raw = '{payload}'\n"
+        "$domain = if ([string]::IsNullOrEmpty($env:BENCH_DOMAIN)) { '<missing>' } else { $env:BENCH_DOMAIN }\n"
+        "$items = @((ConvertFrom-Json $raw) | ForEach-Object { $_ })\n"
+        "$ordered = @($items | Where-Object { $_.active } | Sort-Object @{ Expression = { -[int]$_.score } }, @{ Expression = { [string]$_.name } })\n"
+        "$sb = [System.Text.StringBuilder]::new()\n"
+        "[void]$sb.Append(\"domain=$domain`n\")\n"
+        "foreach ($row in $ordered) {\n"
+        "    [void]$sb.Append(\"$($row.name)|$($row.score)`n\")\n"
+        "}\n"
+        "[void]$sb.Append(\"count=$($ordered.Count)`n\")\n"
+        "[Console]::Out.Write($sb.ToString())\n"
+        "[Console]::Out.Flush()\n"
+    )
+
+
 
 def _diverse_source(ext: str, nonce: str, seed: int) -> str:
     variant = (int(nonce.split("-")[0][1:]) - 1) % 4
@@ -275,6 +300,15 @@ def _diverse_source(ext: str, nonce: str, seed: int) -> str:
             '            |> Array.sumBy int',
         )[variant]
         return f'let seed = {seed}\n{setup}\nSystem.Console.Out.Write(sprintf "diverse {nonce} %d\\n" value)\n'
+    if ext == "ps1":
+        setup = (
+            "$op = @{ kind = 'twice'; input = @{ value = $seed } }\n"
+            "$value = if ($op.kind -eq 'twice') { $op.input.value * 2 + 7 } else { $op.input.value }",
+            "$value = 0; foreach ($n in @($seed, $seed, 7)) { $value += $n }",
+            "try { if ($seed -gt 0) { throw 'positive' }; $value = $seed } catch { $value = $seed * 2 + 7 }",
+            "$value = 0; foreach ($p in (\"$($seed * 2) 7\").Split(' ')) { $value += [int]$p }",
+        )[variant]
+        return f"$seed = {seed}\n{setup}\n[Console]::Out.Write(\"diverse {nonce} $value`n\")\n[Console]::Out.Flush()\n"
     if ext == "py":
         setup = (
             'op = ("twice", {"value": seed})\nmatch op:\n    case ("twice", {"value": n}): value = n * 2 + 7\n    case (_, n): value = n',
@@ -302,8 +336,9 @@ def _render_source(runner: Runner, workload: str, nonce: str, seed: int, rows: l
         return _js_source(workload, nonce, seed, rows, typed=runner.ext == "ts")
     if runner.ext == "py":
         return _python_source(workload, nonce, seed, rows)
+    if runner.ext == "ps1":
+        return _powershell_source(workload, nonce, seed, rows)
     raise ValueError(f"no source generator for runner {runner.id}")
-
 
 def _run_command(command: list[str], work_dir: Path, env: dict, timeout: float) -> dict:
     started = time.perf_counter()
@@ -337,7 +372,8 @@ def _run_once(runner: Runner, script: Path, work_dir: Path, env: dict, timeout: 
 
 
 def _read_metrics(endpoint: str, env: dict, timeout: float) -> dict:
-    request = struct.pack("<iiB", 5, 4, 5)
+    protocol_version = 6
+    request = struct.pack("<iiB", 5, protocol_version, 5)
 
     def read_response(stream) -> list[int]:
         def read_exact(size: int) -> bytes:
@@ -355,10 +391,9 @@ def _read_metrics(endpoint: str, env: dict, timeout: float) -> dict:
         if size != struct.calcsize(fmt):
             raise ValueError(f"unexpected metrics response size: {size}")
         version, kind, *metrics = struct.unpack(fmt, read_exact(size))
-        if (version, kind) != (4, 16):
+        if (version, kind) != (protocol_version, 16):
             raise ValueError(f"unexpected metrics response: {version}/{kind}")
         return metrics
-
     if os.name == "nt":
         import queue
         import threading
@@ -518,12 +553,13 @@ def _host_environment(tfm: str, fsion: Path, fsiond: Path) -> dict:
         "dotnet": _command_version(["dotnet", "--version"]),
         "bun": _command_version(["bun", "--version"]),
         "node": _command_version(["node", "--version"]),
+        "pwsh": _command_version(["pwsh", "-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"]),
+        "powershell": _command_version(["powershell", "-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"]),
         "fsionTfm": tfm,
         "fsionBinary": str(fsion),
         "fsiondBinary": str(fsiond),
         "fsionSizeBytes": fsion.stat().st_size if fsion.is_file() else None,
     }
-
 
 def _command_version(command: list[str]) -> str | None:
     binary = _executable(command[0])
@@ -545,11 +581,11 @@ def _write_text(path: Path, text: str) -> None:
 def _report_markdown(results: dict) -> str:
     lines: list[str] = []
     env = results["environment"]
-    lines.append("# Goal 0006 — Unseen-Script Benchmark Report")
+    lines.append("# Unseen-Script Benchmark Report")
     lines.append("")
     lines.append(
         "Generated by `python bench/run-bench.py` on the Windows development host. "
-        "Every round renders fresh F#/TS/JS/Python source from a per-run salt and the round index; "
+        "Every round renders fresh F#/TS/JS/Python/PowerShell source from a per-run salt and the round index; "
         "timings are recorded only for rounds whose stdout was byte-identical across every present runner."
     )
     lines.append("")
@@ -900,8 +936,8 @@ def main(argv: list[str]) -> int:
                             if runner != "fsion"
                         )
                     )
-        burst_runners = [runner for runner in runners if runner.id in ("fsion", "bun")]
-        if WORKLOAD_TYPICAL in workloads and len(burst_runners) == 2:
+        burst_runners = [runner for runner in runners if runner.id in ("fsion", "bun", "pwsh", "powershell")]
+        if WORKLOAD_TYPICAL in workloads and any(r.id == "fsion" for r in burst_runners) and any(r.id == "bun" for r in burst_runners):
             burst = _burst(burst_runners, data, work_dir, base_env, args.timeout, salt)
         if args.phase_samples:
             shutdown = _run_command(fsion_runner.command + ["daemon", "stop"], work_dir, base_env, args.timeout)

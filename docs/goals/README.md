@@ -6,7 +6,7 @@ Read [Core Design](../core-design.md) for enduring architectural invariants and 
 
 ## Lifecycle Convention
 
-- **Active queue**: Empty (Goals `0001`–`0008` completed and archived).
+- **Active queue**: Empty (Goals `0001`-`0009` completed and archived).
 - **Archive**: Once a goal's outcome is accepted, move the completed goal file unchanged into `docs/goals/archive/`. Never rewrite archived contracts.
 
 ## Active Series
@@ -24,5 +24,6 @@ None.
 | [0006-hot-path-and-burst-resilience.md](archive/0006-hot-path-and-burst-resilience.md) | Completed | `0005` | Default-path hot-path slimming, two retained prelude pools, deterministic handle release, and a [measured 12-script zero-gap burst](../evidence/0006-benchmark-report.md#zero-gap-burst) |
 | [0007-protocol-security-and-fault-isolation.md](archive/0007-protocol-security-and-fault-isolation.md) | Completed | `0006` | Build/TFM-isolated endpoints & version-tolerant control frames, `CurrentUserOnly` / `0700`/`0600` + `flock` + `setsid` IPC, fair FIFO cancellable `ProcessStateGate` with nested deadlock prevention, non-collateral wedged drain, named-session generation tombstones, and idle LOH compaction + Windows working-set trim |
 | [0008-stdin-exit-parity-and-state-guards.md](archive/0008-stdin-exit-parity-and-state-guards.md) | Completed | `0007` | Demand-driven piped `stdin` forwarding in `file`/`-e` modes without open-pipe hangs, `exit <n>` parity inside `try ... with` blocks without marker leaks, and post-run global state guards (`Console.SetOut`, `AppDomain`/`AppContext` handlers, `CultureInfo`, `Trace.Listeners`) |
+| [0009-powershell-benchmark-comparison.md](archive/0009-powershell-benchmark-comparison.md) | Completed | `0008` | Windows PowerShell 5.1 & PowerShell 7 (`-NoProfile`) unseen-script & 12-run burst benchmark comparison (`ProtocolVersion = 6`, [report](../evidence/0009-benchmark-report.md)) |
 
-Evidence: [../evidence/0001-evidence.md](../evidence/0001-evidence.md), [../evidence/0002-evidence.md](../evidence/0002-evidence.md), [../evidence/0003-evidence.md](../evidence/0003-evidence.md), [../evidence/0004-evidence.md](../evidence/0004-evidence.md), [../evidence/0005-evidence.md](../evidence/0005-evidence.md), [../evidence/0006-evidence.md](../evidence/0006-evidence.md), [../evidence/0007-evidence.md](../evidence/0007-evidence.md), [../evidence/0008-evidence.md](../evidence/0008-evidence.md).
+Evidence: [../evidence/0001-evidence.md](../evidence/0001-evidence.md), [../evidence/0002-evidence.md](../evidence/0002-evidence.md), [../evidence/0003-evidence.md](../evidence/0003-evidence.md), [../evidence/0004-evidence.md](../evidence/0004-evidence.md), [../evidence/0005-evidence.md](../evidence/0005-evidence.md), [../evidence/0006-evidence.md](../evidence/0006-evidence.md), [../evidence/0007-evidence.md](../evidence/0007-evidence.md), [../evidence/0008-evidence.md](../evidence/0008-evidence.md), [../evidence/0009-evidence.md](../evidence/0009-evidence.md).

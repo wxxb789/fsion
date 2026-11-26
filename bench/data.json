@@ -58,6 +58,20 @@
       "command": ["python"],
       "ext": "py",
       "enabled": true
+    },
+    {
+      "id": "pwsh",
+      "kind": "powershell",
+      "command": ["pwsh", "-NoProfile", "-NonInteractive", "-File"],
+      "ext": "ps1",
+      "enabled": true
+    },
+    {
+      "id": "powershell",
+      "kind": "powershell",
+      "command": ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"],
+      "ext": "ps1",
+      "enabled": true
     }
   ]
 }

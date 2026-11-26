@@ -593,6 +593,13 @@ module private WinHandleTable =
                 try
                     let fullLoc = Path.GetFullPath loc
                     if isTrustedRuntimeAssemblyPath fullLoc && Directory.Exists "/proc/self/fd" then
+                        let canonicalLoc =
+                            try
+                                match File.ResolveLinkTarget(fullLoc, true) with
+                                | null -> fullLoc
+                                | info -> info.FullName
+                            with _ ->
+                                fullLoc
                         let matched = ResizeArray<string>()
                         for entry in Directory.GetFileSystemEntries "/proc/self/fd" do
                             let name = Path.GetFileName entry
@@ -600,7 +607,8 @@ module private WinHandleTable =
                                 match File.ResolveLinkTarget(entry, false) with
                                 | null -> ()
                                 | info ->
-                                    if String.Equals(info.FullName, fullLoc, StringComparison.Ordinal) then
+                                    if String.Equals(info.FullName, fullLoc, StringComparison.Ordinal)
+                                       || String.Equals(info.FullName, canonicalLoc, StringComparison.Ordinal) then
                                         matched.Add(name + "\t" + info.FullName)
                             with _ -> ()
                         lock baselineSync (fun () ->
@@ -608,16 +616,22 @@ module private WinHandleTable =
                                 posixRuntimeBaseline.Add matched.[0] |> ignore
                             elif matched.Count > 1 then
                                 let registeredEpoch = Interlocked.Increment(&posixBaselineEpoch)
-                                match pendingPosixAsmCandidates.TryGetValue fullLoc with
+                                let targetKey =
+                                    let idx = matched.[0].IndexOf('\t')
+                                    if idx >= 0 then matched.[0].Substring(idx + 1) else canonicalLoc
+                                match pendingPosixAsmCandidates.TryGetValue targetKey with
                                 | true, (_, existing) ->
                                     for key in matched do
                                         existing.Add key |> ignore
-                                    pendingPosixAsmCandidates.[fullLoc] <- (registeredEpoch, existing)
+                                    pendingPosixAsmCandidates.[targetKey] <- (registeredEpoch, existing)
                                 | false, _ ->
                                     let created = HashSet<string>(matched, StringComparer.Ordinal)
-                                    pendingPosixAsmCandidates.[fullLoc] <- (registeredEpoch, created))
+                                    pendingPosixAsmCandidates.[targetKey] <- (registeredEpoch, created)
+                            else
+                                let registeredEpoch = Interlocked.Increment(&posixBaselineEpoch)
+                                if not (pendingPosixAsmCandidates.ContainsKey canonicalLoc) then
+                                    pendingPosixAsmCandidates.[canonicalLoc] <- (registeredEpoch, HashSet<string>(StringComparer.Ordinal)))
                 with _ -> ()
-
     let initializeBaseline () =
         if OperatingSystem.IsWindows() then
             lock baselineSync (fun () ->
@@ -770,7 +784,7 @@ module private WinHandleTable =
                                         match liveByTarget.TryGetValue targetPath with
                                         | true, live when live.Count = 1 ->
                                             let soleKey = live.[0]
-                                            if candidateKeys.Contains soleKey then
+                                            if candidateKeys.Count = 0 || candidateKeys.Contains soleKey then
                                                 posixRuntimeBaseline.Add soleKey |> ignore
                                                 resolvedTargets.Add targetPath
                                         | _ -> ()
@@ -784,10 +798,14 @@ module private WinHandleTable =
                                 let key = name + "\t" + target
                                 let isBaseline =
                                     isProcFd
-                                    && lock baselineSync (fun () -> posixRuntimeBaseline.Contains key)
+                                    && lock baselineSync (fun () ->
+                                        posixRuntimeBaseline.Contains key
+                                        || (isTrustedRuntimeAssemblyPath target
+                                            && match liveByTarget.TryGetValue target with
+                                               | true, live -> live.Count = 1
+                                               | _ -> false))
                                 if not isBaseline then
                                     hasReg <- true
-                        // On macOS `/dev/fd` exposes device nodes rather than symlinks (`ResolveLinkTarget = null`),
                         // so an unresolvable non-stdio fd > 2 cannot be proven non-regular; conservatively treat
                         // any live unresolved fd > 2 on non-`/proc/self/fd` as a possible pre-existing regular file
                         // without penalizing Linux's vanished enumeration FD.

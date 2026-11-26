@@ -844,11 +844,6 @@ type IsolationTests(output: ITestOutputHelper) =
                         Int32.Parse(r.Stdout.Trim()) |]
                 Assert.True(warmLinuxCounts.[3] - warmLinuxCounts.[0] <= 1, sprintf "unexpected per-run Gen-2 on warm Linux daemon: %A" warmLinuxCounts)
                 assertRun (context.Run([ "-e"; linuxConcurrentLoadCode ], timeoutMs = 60000))
-                let diagFds =
-                    context.Run(
-                        [ "-e"
-                          "for e in System.IO.Directory.GetFileSystemEntries(\"/proc/self/fd\") do try match System.IO.File.ResolveLinkTarget(e, false) with null -> () | i -> if i.FullName.StartsWith(\"/\") then printfn \"%s->%s\" (System.IO.Path.GetFileName e) i.FullName with _ -> ()" ],
-                        timeoutMs = 60000)
                 let linuxAfterLoadCounts =
                     [| for _ in 1 .. 4 ->
                         let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
@@ -856,7 +851,7 @@ type IsolationTests(output: ITestOutputHelper) =
                         Int32.Parse(r.Stdout.Trim()) |]
                 Assert.True(
                     linuxAfterLoadCounts.[3] - linuxAfterLoadCounts.[0] <= 1,
-                    sprintf "unexpected per-run Gen-2 on Linux after concurrent load: %A\nFDs:\n%s" linuxAfterLoadCounts diagFds.Stdout)
+                    sprintf "unexpected per-run Gen-2 on Linux after concurrent load: %A" linuxAfterLoadCounts)
             let disposeEntered = Path.Combine(directory, "dispose-entered.txt")
             let disposeRelease = Path.Combine(directory, "dispose-release.txt")
             let slowDisposeScript = Path.Combine(directory, "slow-dispose.fsx")

@@ -802,10 +802,12 @@ module private WinHandleTable =
                                 for KeyValue(targetPath, (registeredEpoch, candidateKeys)) in pendingPosixAsmCandidates do
                                     if snapshotEpoch >= registeredEpoch then
                                         match liveByTarget.TryGetValue targetPath with
-                                        | true, live when live.Count = 1 ->
-                                            let soleKey = live.[0]
-                                            if candidateKeys.Count = 0 || candidateKeys.Contains soleKey then
-                                                posixRuntimeBaseline.Add soleKey |> ignore
+                                        | true, live when live.Count > 0 && live.Count <= 2 ->
+                                            // CoreCLR on Linux keeps up to 2 FDs per loaded framework DLL (PE + metadata/R2R).
+                                            // Once user streams close, promote the remaining runtime FDs captured at load time.
+                                            if candidateKeys.Count = 0 || (live |> Seq.forall (fun k -> candidateKeys.Contains k)) then
+                                                for k in live do
+                                                    posixRuntimeBaseline.Add k |> ignore
                                                 resolvedTargets.Add targetPath
                                         | _ -> ()
                                 for t in resolvedTargets do
@@ -822,7 +824,7 @@ module private WinHandleTable =
                                         posixRuntimeBaseline.Contains key
                                         || (isTrustedRuntimeAssemblyPath target
                                             && match liveByTarget.TryGetValue target with
-                                               | true, live -> live.Count = 1
+                                               | true, live -> live.Count <= 2
                                                | _ -> false))
                                 if not isBaseline then
                                     hasReg <- true

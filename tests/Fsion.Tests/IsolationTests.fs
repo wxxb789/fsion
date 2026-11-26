@@ -835,9 +835,18 @@ type IsolationTests(output: ITestOutputHelper) =
                           "use stream = System.IO.File.OpenRead path"
                           "System.Runtime.Loader.AssemblyLoadContext.Default.LoadFromAssemblyPath(path) |> ignore" ]
                 assertRun (runP0 [ "-e"; linuxConcurrentLoadCode ])
+                // Use a dedicated warm-pool daemon (--pool-size 4) so cold session creation under
+                // --pool-size 0 doesn't trigger natural Gen-1/Gen-2 GC inside runP0 on Linux runners.
+                let warmLinuxCounts =
+                    [| for _ in 1 .. 4 ->
+                        let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
+                        assertRun r
+                        Int32.Parse(r.Stdout.Trim()) |]
+                Assert.True(warmLinuxCounts.[3] - warmLinuxCounts.[0] <= 1, sprintf "unexpected per-run Gen-2 on warm Linux daemon: %A" warmLinuxCounts)
+                assertRun (context.Run([ "-e"; linuxConcurrentLoadCode ], timeoutMs = 60000))
                 let linuxAfterLoadCounts =
                     [| for _ in 1 .. 4 ->
-                        let r = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
+                        let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
                 Assert.True(linuxAfterLoadCounts.[3] - linuxAfterLoadCounts.[0] <= 1, sprintf "unexpected per-run Gen-2 on Linux after concurrent load: %A" linuxAfterLoadCounts)

@@ -328,10 +328,51 @@ let private sendAndReceive (stream: Stream) (timeoutMs: int option) (request: Re
         NotDelivered
     else
         let mutable stdinStream: Stream option = None
+        let stdinRequests = new System.Collections.Concurrent.BlockingCollection<int>()
+        let mutable stdinWorker: Thread option = None
+        let stdinDone = ref 0
+        let ensureStdinWorker () =
+            match stdinWorker with
+            | Some _ -> ()
+            | None ->
+                let input =
+                    match stdinStream with
+                    | Some s -> s
+                    | None ->
+                        let opened = Console.OpenStandardInput()
+                        stdinStream <- Some opened
+                        opened
+                let worker =
+                    Thread(fun () ->
+                        try
+                            for maxBytes in stdinRequests.GetConsumingEnumerable() do
+                                if Volatile.Read(&stdinDone.contents) = 0 then
+                                    let count = max 1 (min (64 * 1024) maxBytes)
+                                    let buffer = Array.zeroCreate<byte> count
+                                    let read =
+                                        try
+                                            input.Read(buffer, 0, count)
+                                        with _ ->
+                                            0
+                                    if Volatile.Read(&stdinDone.contents) = 0 then
+                                        let chunk =
+                                            if read <= 0 then
+                                                StdinChunk([||], true)
+                                            elif read = count then
+                                                StdinChunk(buffer, false)
+                                            else
+                                                StdinChunk(buffer.[0 .. read - 1], false)
+                                        try
+                                            sendRequest stream chunk
+                                        with _ ->
+                                            ()
+                        with _ ->
+                            ())
+                worker.IsBackground <- true
+                worker.Start()
+                stdinWorker <- Some worker
         let readNextResponse () =
             let mutable finished: Delivery option = None
-            let stdinPending = ref 0
-            let stdinDone = ref 0
             try
                 while finished.IsNone do
                     match tryReceiveFrame stream with
@@ -339,46 +380,13 @@ let private sendAndReceive (stream: Stream) (timeoutMs: int option) (request: Re
                     | Some payload ->
                         match parseResponse payload with
                         | StdinReadRequest maxBytes ->
-                            let input =
-                                match stdinStream with
-                                | Some s -> s
-                                | None ->
-                                    let opened = Console.OpenStandardInput()
-                                    stdinStream <- Some opened
-                                    opened
-                            let count = max 1 (min (64 * 1024) maxBytes)
-                            if Interlocked.CompareExchange(&stdinPending.contents, 1, 0) = 0 then
-                                let worker =
-                                    Thread(fun () ->
-                                        try
-                                            let buffer = Array.zeroCreate<byte> count
-                                            let read =
-                                                try
-                                                    input.Read(buffer, 0, count)
-                                                with _ ->
-                                                    0
-                                            if Volatile.Read(&stdinDone.contents) = 0 then
-                                                let chunk =
-                                                    if read <= 0 then
-                                                        StdinChunk([||], true)
-                                                    elif read = count then
-                                                        StdinChunk(buffer, false)
-                                                    else
-                                                        StdinChunk(buffer.[0 .. read - 1], false)
-                                                try
-                                                    sendRequest stream chunk
-                                                with _ ->
-                                                    ()
-                                        finally
-                                            Volatile.Write(&stdinPending.contents, 0))
-                                worker.IsBackground <- true
-                                worker.Start()
+                            ensureStdinWorker ()
+                            try stdinRequests.Add maxBytes with _ -> ()
                         | response -> finished <- Some(Delivered response)
                 finished.Value
             finally
                 Volatile.Write(&stdinDone.contents, 1)
-                if Volatile.Read(&stdinPending.contents) = 0 then
-                    stdinStream |> Option.iter (fun s -> try s.Dispose() with _ -> ())
+                try stdinRequests.CompleteAdding() with _ -> ()
         match timeoutMs with
         | Some timeoutMs when timeoutMs > 0 ->
             let receive = Task.Run(fun () -> readNextResponse ())

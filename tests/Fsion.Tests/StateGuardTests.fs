@@ -262,3 +262,35 @@ printfn "clean %.2f|%s" 1.5 (if isNull CultureInfo.DefaultThreadCurrentCulture t
             let r2 = context.Run([ "-e"; "System.Console.WriteLine(\"expected\")" ], timeoutMs = 60000)
             Assert.Equal(0, r2.ExitCode)
             Assert.Equal("expected" + Environment.NewLine, r2.Stdout))
+
+    [<Fact>]
+    member _.``caught exit with timeout preserves exit code without marker leakage, and named session --reset restores Console.Out`` () =
+        withContext "exit-timeout-reset" (fun context _ ->
+            let prime = context.Run([ "--pool-size"; "2"; "warmup" ], timeoutMs = 120000)
+            Assert.True(prime.ExitCode = 0, prime.Stderr)
+
+            // Finding 3: --reset with IDisposable poisoning Console.Out restores Console.Out before running new script.
+            let rBind =
+                context.Run(
+                    [ "--session"; "s-reset"; "-e"; "let d = { new System.IDisposable with member _.Dispose() = System.Console.SetOut(System.IO.TextWriter.Null) }" ],
+                    timeoutMs = 60000
+                )
+            Assert.Equal(0, rBind.ExitCode)
+            let rReset =
+                context.Run(
+                    [ "--session"; "s-reset"; "--reset"; "-e"; "System.Console.WriteLine(\"after-reset\")" ],
+                    timeoutMs = 60000
+                )
+            Assert.Equal(0, rReset.ExitCode)
+            Assert.Equal("after-reset" + Environment.NewLine, rReset.Stdout)
+
+            // Finding 4: caught exit followed by timeout preserves first exit code and strips markers.
+            let rCaughtTimeout =
+                context.Run(
+                    [ "--timeout"; "1000"; "-e"; "try printfn \"before\"; exit 5 with _ -> System.Threading.Thread.Sleep(5000)" ],
+                    timeoutMs = 60000
+                )
+            Assert.Equal(5, rCaughtTimeout.ExitCode)
+            Assert.Equal("before" + Environment.NewLine, rCaughtTimeout.Stdout)
+            Assert.DoesNotContain("@@FSION-EXIT", rCaughtTimeout.Stdout)
+            Assert.DoesNotContain("@@FSION-EXIT", rCaughtTimeout.Stderr))

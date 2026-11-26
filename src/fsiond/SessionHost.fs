@@ -296,18 +296,10 @@ let private captureGlobalState () : GlobalStateSnapshot =
       CurrentCulture = CultureInfo.CurrentCulture
       CurrentUICulture = CultureInfo.CurrentUICulture
       TraceListeners = listeners }
-
 let private restoreGlobalState (snap: GlobalStateSnapshot) =
     Ambient.ensureInstalled ()
     removeFieldDelegates firstChanceField null (addedHandlers snap.FirstChance (snapshotFieldDelegate firstChanceField null))
     removeFieldDelegates unhandledExceptionField null (addedHandlers snap.UnhandledException (snapshotFieldDelegate unhandledExceptionField null))
-    removeProcessExit (addedHandlers snap.ProcessExit (processExitSnapshot ()))
-    removeAssemblyResolve (addedHandlers snap.AssemblyResolve (assemblyResolveSnapshot ()))
-    let addedResolving = addedHandlers snap.Resolving (snapshotFieldDelegate resolvingField defaultLoadContext)
-    if addedResolving.Length > 0 && not (isNull resolvingEvent) then
-        for h in addedResolving do
-            try resolvingEvent.RemoveEventHandler(defaultLoadContext, h) with _ -> ()
-    removeUnmanagedDll (addedHandlers snap.ResolvingUnmanagedDll (unmanagedDllSnapshot ()))
     removeFieldDelegates unobservedTaskField null (addedHandlers snap.UnobservedTask (snapshotFieldDelegate unobservedTaskField null))
     if not (Object.ReferenceEquals(CultureInfo.DefaultThreadCurrentCulture, snap.DefaultCulture)) then
         CultureInfo.DefaultThreadCurrentCulture <- snap.DefaultCulture
@@ -2755,9 +2747,7 @@ type SessionHost(options: SessionHostOptions) =
 
         let outWriter = new RunTextWriter()
         let errWriter = new RunTextWriter()
-
-        // --timeout is a script execution deadline only. Session acquisition (cold creation, a busy
-        // named session's gate, the process-state transition) is not charged against it, and a
+        let mutable capturedExit: (int * string) option = None
         // queued turn whose deadline expires before evaluation aborts in place without draining.
         let gateDeadline =
             if timeoutMs > 0 then Environment.TickCount64 + int64 timeoutMs else Int64.MaxValue
@@ -2784,12 +2774,13 @@ type SessionHost(options: SessionHostOptions) =
             | None -> None
             | Some entry ->
                 match entry.Session with
-                | Some warm -> releaseSession warm
+                | Some warm ->
+                    releaseSession warm
+                    restoreGlobalState daemonBaselineGlobalState
                 | None -> ()
 
                 entry.Session <- None
                 Some entry
-
         let runInSession (claimed: WarmSession) (stateless: bool) =
             let started = Stopwatch.GetTimestamp()
             let mutable evaluateMs = 0.0
@@ -2821,6 +2812,12 @@ type SessionHost(options: SessionHostOptions) =
                                     property.SetValue(
                                         state,
                                         box (Action(fun () ->
+                                            let code =
+                                                match claimed.ExitCodeProperty with
+                                                | Some p -> p.GetValue state :?> int
+                                                | None -> 0
+                                            if capturedExit.IsNone then
+                                                capturedExit <- Some(code, claimed.ExitMarker)
                                             outWriter.Write claimed.ExitMarker
                                             errWriter.Write claimed.ExitMarker))
                                     )
@@ -3017,12 +3014,22 @@ type SessionHost(options: SessionHostOptions) =
             // Classify at the worker's completion point: reading the flag here, before the
             // caller observes the task, makes the timeout outcome deterministic even if the
             // deadline and the completion race.
-            if Volatile.Read(&timeoutFired.contents) = 1 then
+            match capturedExit with
+            | Some (code, marker) ->
+                let stripMarker (text: string) =
+                    let idx = text.IndexOf(marker, StringComparison.Ordinal)
+                    if idx >= 0 then text.Substring(0, idx) else text
+                { ExitCode = code
+                  StandardOut = stripMarker (outWriter.SafeText())
+                  StandardError = stripMarker (errWriter.SafeText())
+                  Diagnostics = [||]
+                  TimedOut = false }
+            | None when Volatile.Read(&timeoutFired.contents) = 1 ->
                 { outcome with
                     ExitCode = TimeoutExitCode
                     TimedOut = true
                     StandardError = appendMessage outcome.StandardError (timeoutMessage timeoutMs) }
-            else
+            | None ->
                 outcome
 
         let worker = Task.Factory.StartNew(work, TaskCreationOptions.LongRunning)
@@ -3048,16 +3055,33 @@ type SessionHost(options: SessionHostOptions) =
                     else
                         "fsion: run cancelled after the client disconnected" + Environment.NewLine
 
+                let stripCaptured (text: string) =
+                    match capturedExit with
+                    | Some (_, marker) ->
+                        let idx = text.IndexOf(marker, StringComparison.Ordinal)
+                        if idx >= 0 then text.Substring(0, idx) else text
+                    | None -> text
+
                 if Volatile.Read(&evaluationStarted.contents) = 1 then
                     // Only a run that entered evaluation can wedge a session. Acquisition waits
                     // always return here, so they never drain a healthy daemon.
-                    { Outcome =
-                        { ExitCode = TimeoutExitCode
-                          StandardOut = outWriter.SafeText()
-                          StandardError = appendMessage (errWriter.SafeText()) message
-                          Diagnostics = [||]
-                          TimedOut = timedOut }
-                      Wedged = true }
+                    match capturedExit with
+                    | Some (code, _) ->
+                        { Outcome =
+                            { ExitCode = code
+                              StandardOut = stripCaptured (outWriter.SafeText())
+                              StandardError = stripCaptured (errWriter.SafeText())
+                              Diagnostics = [||]
+                              TimedOut = false }
+                          Wedged = true }
+                    | None ->
+                        { Outcome =
+                            { ExitCode = TimeoutExitCode
+                              StandardOut = outWriter.SafeText()
+                              StandardError = appendMessage (errWriter.SafeText()) message
+                              Diagnostics = [||]
+                              TimedOut = timedOut }
+                          Wedged = true }
                 else
                     { Outcome =
                         { ExitCode = (if timedOut then TimeoutExitCode else 1)
@@ -3066,7 +3090,6 @@ type SessionHost(options: SessionHostOptions) =
                           Diagnostics = [||]
                           TimedOut = timedOut }
                       Wedged = false }
-
     member _.Metrics() : MetricsInfo =
         if not options.Oneshot && targetPoolSize > 0 then
             let slots = lock poolGate (fun () -> pools.ToArray())

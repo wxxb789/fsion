@@ -1162,32 +1162,20 @@ type PreludeTests(output: ITestOutputHelper) =
             let finalPrelude = Path.Combine(directory, "final-check.fsx")
             let fcEntered = Path.Combine(directory, "fc-entered.txt")
             let fcRelease = Path.Combine(directory, "fc-release.txt")
+            let fcV2Entered = Path.Combine(directory, "fc-v2-entered.txt")
             let fcV2Release = Path.Combine(directory, "fc-v2-release.txt")
-            // First `warmup` starts the daemon with PoolTarget = 1 and begins evaluating v1. Once v1 reaches
-            // `fc-entered.txt` and `GetStatus` answers, send a direct IPC `Ping` (`sendRequest` completes
-            // synchronously in <1 ms, so the daemon enters `EnsureWarm` / `waitForWarm` immediately with
-            // `lastDiskCheckMs = now` and `count = 0`), wait 15 ms (< 100 ms), then signal `fc-release.txt` so v1
-            // overwrites `final-check.fsx` with a gated v2 and completes in <1 ms (`count = 1`), deterministically
-            // exiting the loop into `waitForWarm`'s post-loop `tagOfSpec` check (which clears stale v1 via
-            // `refreshTagWith` so an immediate `GetStatus` observes `Warm = false`, distinguishing it from the
-            // in-loop check where v1 would remain in `slot.Warm` with `Warm = true`).
+            // Overwrite `final-check.fsx` with v2 while v1 is still blocked at `fc-entered.txt`: `warmup` fails via
+            // `waitForWarm`'s 100 ms supersede check and refreshes `slot.Tag` to v2, and once v1 is released,
+            // `replenish` verifies `liveTag = warm.Prelude` before enqueueing so superseded v1 is discarded rather
+            // than published (`GetStatus.Warm` stays `false` until v2 finishes).
             writeFile
                 directory
                 "final-check.fsx"
                 (sprintf
-                    "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 5\nSystem.IO.File.WriteAllText(@\"%s\", \"while not (System.IO.File.Exists(@\\\"%s\\\")) do System.Threading.Thread.Sleep 10\\nfailwith \\\"v2 boom\\\"\\n\")\nlet fcVal = 1\n"
+                    "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 5\nlet fcVal = 1\n"
                     fcEntered
-                    fcRelease
-                    finalPrelude
-                    fcV2Release)
+                    fcRelease)
             try
-                let fcBootstrap =
-                    System.Threading.Tasks.Task.Run(fun () ->
-                        fcContext.Run([ "--pool-size"; "1"; "--prelude"; finalPrelude; "warmup" ], timeoutMs = 120000))
-                let fcDeadline = DateTime.UtcNow.AddSeconds 30.0
-                while not (File.Exists fcEntered) && DateTime.UtcNow < fcDeadline do
-                    System.Threading.Thread.Sleep 10
-                Assert.True(File.Exists fcEntered, "fc v1 never entered evaluation")
                 let fcPipe =
                     fcContext.Environment
                     |> List.pick (fun (k, v) -> if k = "FSION_PIPE" then Some v else None)
@@ -1203,29 +1191,35 @@ type PreludeTests(output: ITestOutputHelper) =
                         | Fsion.Protocol.Status st -> st
                         | other -> failwithf "unexpected GetStatus response: %A" other
                     | None -> failwith "no response from GetStatus"
+                let fcBootstrap =
+                    System.Threading.Tasks.Task.Run(fun () ->
+                        fcContext.Run([ "--pool-size"; "1"; "--prelude"; finalPrelude; "warmup" ], timeoutMs = 120000))
+                let fcDeadline = DateTime.UtcNow.AddSeconds 30.0
+                while not (File.Exists fcEntered) && DateTime.UtcNow < fcDeadline do
+                    System.Threading.Thread.Sleep 10
+                Assert.True(File.Exists fcEntered, "fc v1 never entered evaluation")
                 Assert.False((readStatus ()).Warm)
-                use pingStream =
-                    match Fsion.Ipc.tryConnect { Name = fcPipe } (TimeSpan.FromSeconds 10.0) with
-                    | Some s -> s
-                    | None -> failwith "could not connect direct Ping stream"
-                Fsion.Protocol.sendRequest pingStream (Fsion.Protocol.Ping(Some finalPrelude, false))
-                pingStream.Flush()
-                System.Threading.Thread.Sleep 15
-                writeFile directory "fc-release.txt" "go"
-                let pingResponse =
-                    match Fsion.Protocol.tryReceiveFrame pingStream with
-                    | Some payload -> Fsion.Protocol.parseResponse payload
-                    | None -> failwith "no response from direct Ping"
-                match pingResponse with
-                | Fsion.Protocol.Failure msg ->
-                    Assert.Contains("configured prelude changed during warmup", msg)
-                | other ->
-                    failwithf "expected Failure from post-loop warmup check, got %A" other
-                Assert.False((readStatus ()).Warm, "post-loop check must clear stale v1 via refreshTagWith")
-                writeFile directory "fc-v2-release.txt" "go"
+                writeFile
+                    directory
+                    "final-check.fsx"
+                    (sprintf
+                        "System.IO.File.WriteAllText(@\"%s\", \"2\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 10\nlet fcVal = 2\n"
+                        fcV2Entered
+                        fcV2Release)
                 let fcRes1 = fcBootstrap.GetAwaiter().GetResult()
                 Assert.Equal(1, fcRes1.ExitCode)
                 Assert.Contains("configured prelude changed during warmup", fcRes1.Stderr)
+                Assert.False((readStatus ()).Warm, "in-loop supersede must clear pool")
+                writeFile directory "fc-release.txt" "go"
+                let v2EnterDeadline = DateTime.UtcNow.AddSeconds 30.0
+                while not (File.Exists fcV2Entered) && DateTime.UtcNow < v2EnterDeadline do
+                    System.Threading.Thread.Sleep 10
+                Assert.True(File.Exists fcV2Entered, "superseded v1 must be discarded so v2 starts warming")
+                Assert.False((readStatus ()).Warm, "superseded v1 must never report Warm = true after warmup failed")
+                writeFile directory "fc-v2-release.txt" "go"
+                let fcV2Warm = fcContext.Run([ "--prelude"; finalPrelude; "warmup" ], timeoutMs = 120000)
+                Assert.True(fcV2Warm.ExitCode = 0, fcV2Warm.Stderr)
+                Assert.True((readStatus ()).Warm)
             finally
                 writeFile directory "fc-release.txt" "go"
                 writeFile directory "fc-v2-release.txt" "go"

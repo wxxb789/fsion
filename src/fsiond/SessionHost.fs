@@ -434,10 +434,63 @@ module private WinHandleTable =
                 finally
                     Marshal.FreeHGlobal buf
 
+    let private loadedAssemblyIdCache =
+        System.Collections.Concurrent.ConcurrentDictionary<string, struct (uint32 * uint64) voption>(StringComparer.OrdinalIgnoreCase)
+
+    let private resolveFileIdByPath (path: string) : struct (uint32 * uint64) voption =
+        if String.IsNullOrEmpty path then
+            ValueNone
+        else
+            match loadedAssemblyIdCache.TryGetValue path with
+            | true, cached -> cached
+            | false, _ ->
+                let resolved =
+                    try
+                        use fs =
+                            new FileStream(
+                                path,
+                                FileMode.Open,
+                                FileAccess.Read,
+                                FileShare.ReadWrite ||| FileShare.Delete
+                            )
+                        let mutable info = Unchecked.defaultof<WinByHandleFileInformation>
+                        if GetFileInformationByHandle(fs.SafeFileHandle.DangerousGetHandle(), &info) then
+                            let fileIndex = (uint64 info.nFileIndexHigh <<< 32) ||| uint64 info.nFileIndexLow
+                            ValueSome(struct (info.dwVolumeSerialNumber, fileIndex))
+                        else
+                            ValueNone
+                    with _ ->
+                        ValueNone
+                if resolved.IsSome then
+                    loadedAssemblyIdCache.[path] <- resolved
+                resolved
+
+    let private currentLoadedAssemblyIds () : HashSet<struct (uint32 * uint64)> =
+        let hs = HashSet<struct (uint32 * uint64)>()
+        match Environment.ProcessPath with
+        | null | "" -> ()
+        | procPath ->
+            match resolveFileIdByPath procPath with
+            | ValueSome id -> hs.Add id |> ignore
+            | ValueNone -> ()
+        for asm in AppDomain.CurrentDomain.GetAssemblies() do
+            if not asm.IsDynamic then
+                let loc =
+                    try
+                        asm.Location
+                    with _ ->
+                        ""
+                if not (String.IsNullOrEmpty loc) then
+                    match resolveFileIdByPath loc with
+                    | ValueSome id -> hs.Add id |> ignore
+                    | ValueNone -> ()
+        hs
+
     let snapshot () : WinSnapshot voption =
         if not (OperatingSystem.IsWindows()) then
             ValueNone
         else
+            let assemblyIds = currentLoadedAssemblyIds ()
             let mutable size = 32768u
             let mutable retLen = 0u
             let mutable buf = Marshal.AllocHGlobal(int size)
@@ -453,21 +506,24 @@ module private WinHandleTable =
                 else
                     let count = int (Marshal.ReadIntPtr(buf, 0))
                     let hs = HashSet<struct (nativeint * uint32 * uint64)>()
+                    let fileHandleCounts = Dictionary<struct (uint32 * uint64), int>(count)
                     let mutable hasUserFiles = false
-                    let pointerCountOffset = sizeof<nativeint> * 2
                     for i = 0 to count - 1 do
                         let off = headerSize + i * entrySize
                         let h = Marshal.ReadIntPtr(buf, off)
-                        let pointerCount = Marshal.ReadIntPtr(buf, off + pointerCountOffset)
                         match tryRegularDiskIdentity h with
-                        | ValueSome id ->
+                        | ValueSome(struct (_, vol, fileIdx) as id) ->
                             hs.Add id |> ignore
-                            // Memory-mapped PE/assembly image handles carry kernel section object references
-                            // (PointerCount >= 32766 on Windows, vs PointerCount = 1..a few for ordinary CreateFileW /
-                            // FileStream handles even when opened with GENERIC_READ | GENERIC_EXECUTE). Any pre-existing
-                            // non-section regular file handle could be closed and reopened into the same numeric slot,
-                            // so escalate to Gen-2 conservatively whenever HasPreExistingUserFiles is true.
-                            if int64 pointerCount < 16384L then
+                            let fileKey = struct (vol, fileIdx)
+                            let nextCount =
+                                match fileHandleCounts.TryGetValue fileKey with
+                                | true, existing -> existing + 1
+                                | false, _ -> 1
+                            fileHandleCounts.[fileKey] <- nextCount
+                            // CoreCLR keeps at most one unclosable image handle per loaded disk assembly; any non-assembly
+                            // regular disk file OR any second handle to an assembly file is user-owned and could be closed
+                            // and reopened into the same numeric slot, so escalate to Gen-2 conservatively.
+                            if vol = 0xFFFFFFFFu || not (assemblyIds.Contains fileKey) || nextCount > 1 then
                                 hasUserFiles <- true
                         | ValueNone -> ()
                     ValueSome { AllDiskFiles = hs; HasPreExistingUserFiles = hasUserFiles }
@@ -1864,12 +1920,13 @@ type SessionHost(options: SessionHostOptions) =
                                                 let warm = createWarmSession failedWarm slot.Spec
                                                 if processState.IsRunsQuiet 250L then
                                                     GC.Collect(1, GCCollectionMode.Optimized, false)
+                                                let liveTag = tagOfSpec slot.Spec
                                                 lock poolGate (fun () ->
-                                                    if pools.Contains slot then
-                                                        refreshTagWith warm.Prelude slot |> ignore
+                                                    if pools.Contains slot && refreshTagWith liveTag slot = warm.Prelude then
                                                         slot.Warm.Enqueue warm
                                                     else
-                                                        discard.Enqueue warm)
+                                                        discard.Enqueue warm
+                                                        replenishSignal.Release() |> ignore)
                                             with
                                             | PreludeEvaluationFailure (exactTag, inner) ->
                                                 Log.error options.LogPath ("replenisher could not create a warm session: " + inner.Message)
@@ -1938,11 +1995,11 @@ type SessionHost(options: SessionHostOptions) =
             | ValueSome expected -> tag = expected
             | ValueNone -> true
         let mutable count, failure, retained, currentTag = state ()
-        let mutable superseded = false
+        let mutable supersededTag: Prelude.Tag voption = ValueNone
         let mutable lastDiskCheckMs = Environment.TickCount64
         while (count < targetPoolSize || not (matchesExpected currentTag))
               && failure.IsNone
-              && not superseded
+              && supersededTag.IsNone
               && retained
               && Environment.TickCount64 < deadline do
             let now = Environment.TickCount64
@@ -1953,10 +2010,12 @@ type SessionHost(options: SessionHostOptions) =
             if shouldCheckDisk then
                 lastDiskCheckMs <- now
                 match expectedTagOpt with
-                | ValueSome expected when tagOfSpec slot.Spec <> expected ->
-                    superseded <- true
-                | _ -> ()
-            if not superseded then
+                | ValueSome expected ->
+                    let diskTag = tagOfSpec slot.Spec
+                    if diskTag <> expected then
+                        supersededTag <- ValueSome diskTag
+                | ValueNone -> ()
+            if supersededTag.IsNone then
                 if count > 0 && not (matchesExpected currentTag) then
                     replenishSignal.Release() |> ignore
                 Thread.Sleep 5
@@ -1970,26 +2029,20 @@ type SessionHost(options: SessionHostOptions) =
                 Some "requested prelude pool was evicted during warmup"
             else
                 None
-        elif superseded then
-            Some "configured prelude changed during warmup; retry warmup"
         else
-            match failure with
-            | Some message -> Some message
-            | None when count < targetPoolSize || not (matchesExpected currentTag) ->
-                Some("timed out waiting for warm session pool to fill within " + string timeoutMs + " ms")
-            | None ->
-                match expectedTagOpt with
-                | ValueSome expected ->
-                    let currentTag = tagOfSpec slot.Spec
-                    if currentTag <> expected then
-                        lock poolGate (fun () ->
-                            if pools.Contains slot then
-                                refreshTagWith currentTag slot |> ignore)
-                        replenishSignal.Release() |> ignore
-                        Some "configured prelude changed during warmup; retry warmup"
-                    else
-                        None
-                | ValueNone -> None
+            match supersededTag with
+            | ValueSome diskTag ->
+                lock poolGate (fun () ->
+                    if pools.Contains slot then
+                        refreshTagWith diskTag slot |> ignore)
+                replenishSignal.Release() |> ignore
+                Some "configured prelude changed during warmup; retry warmup"
+            | ValueNone ->
+                match failure with
+                | Some message -> Some message
+                | None when count < targetPoolSize || not (matchesExpected currentTag) ->
+                    Some("timed out waiting for warm session pool to fill within " + string timeoutMs + " ms")
+                | None -> None
     member _.DesiredSpec = lock poolGate (fun () -> desiredSpec)
 
     member _.RespawnEnvironment() = processState.RespawnEnvironment()

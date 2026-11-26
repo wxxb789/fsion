@@ -719,11 +719,14 @@ type IsolationTests(output: ITestOutputHelper) =
                           "module RxNative ="
                           "    [<DllImport(\"kernel32.dll\", SetLastError = true)>]"
                           "    extern nativeint CreateFileW([<MarshalAs(UnmanagedType.LPWStr)>] string lpFileName, uint32 dwDesiredAccess, uint32 dwShareMode, nativeint lpSecurityAttributes, uint32 dwCreationDisposition, uint32 dwFlagsAndAttributes, nativeint hTemplateFile)"
+                          "    [<DllImport(\"kernel32.dll\", SetLastError = true)>]"
+                          "    extern uint32 GetFileType(nativeint hFile)"
                           "let p = fsi.CommandLineArgs.[1]"
                           "let handles ="
                           "    Array.init 384 (fun _ ->"
                           "        let h = RxNative.CreateFileW(p, 0x80000000u ||| 0x20000000u, 7u, 0n, 3u, 0x80u, 0n)"
                           "        if h = -1n then failwith \"CreateFileW failed\""
+                          "        RxNative.GetFileType h |> ignore"
                           "        h)"
                           "AppDomain.CurrentDomain.SetData(\"rx-handles\", handles)" ]
                 runP0 [ "--session"; "reuse-seed"; "-e"; rxSeedCode; rxSameFilePath ] |> assertRun

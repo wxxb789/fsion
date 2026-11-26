@@ -61,6 +61,20 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
                 if report.Wedged then
                     hooks.Retire ()
 
+                Log.info
+                    options.LogPath
+                    ("executed exit="
+                     + string report.Outcome.ExitCode
+                     + " timedOut="
+                     + string report.Outcome.TimedOut
+                     + " wedged="
+                     + string report.Wedged
+                     + (if options.Oneshot then " totalExecuted=" + string (hooks.Status().Executed) else "")
+                     + " daemonMs="
+                     + daemonMs.ToString("F3", CultureInfo.InvariantCulture)
+                     + " elapsedMs="
+                     + string (int daemonMs))
+
                 try
                     sendResponse
                         connection
@@ -75,22 +89,6 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
 
                     if report.Wedged then
                         hooks.Respawn ()
-
-                let elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
-
-                Log.info
-                    options.LogPath
-                    ("executed exit="
-                     + string report.Outcome.ExitCode
-                     + " timedOut="
-                     + string report.Outcome.TimedOut
-                     + " wedged="
-                     + string report.Wedged
-                     + (if options.Oneshot then " totalExecuted=" + string (hooks.Status().Executed) else "")
-                     + " daemonMs="
-                     + daemonMs.ToString("F3", CultureInfo.InvariantCulture)
-                     + " elapsedMs="
-                     + string (int elapsedMs))
 
                 if options.Oneshot && not report.Wedged then
                     hooks.Stop ()

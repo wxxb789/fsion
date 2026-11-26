@@ -469,8 +469,8 @@ module private WinHandleTable =
             Marshal.FreeHGlobal buf
 
     let mutable private assemblyLoadHooked = false
-    let private pendingDefaultAsmCandidates = Dictionary<struct (uint32 * uint64), HashSet<nativeint>>()
-
+    let mutable private baselineEpoch = 0L
+    let private pendingDefaultAsmCandidates = Dictionary<struct (uint32 * uint64), int64 * HashSet<nativeint>>()
     let private recordHandleBaselineForAssembly (asm: Assembly) =
         if OperatingSystem.IsWindows()
            && not asm.IsDynamic
@@ -512,15 +512,18 @@ module private WinHandleTable =
                                     if matched.Count = 1 && not (baseline.Contains matched.[0]) then
                                         baseline.Add matched.[0] |> ignore
                                     elif matched.Count > 1 then
+                                        let registeredEpoch = Interlocked.Increment(&baselineEpoch)
                                         for id in matched do
                                             let struct (h, vol, fileIdx) = id
                                             let fileKey = struct (vol, fileIdx)
                                             let set =
                                                 match pendingDefaultAsmCandidates.TryGetValue fileKey with
-                                                | true, existing -> existing
+                                                | true, (_, existing) ->
+                                                    pendingDefaultAsmCandidates.[fileKey] <- (registeredEpoch, existing)
+                                                    existing
                                                 | false, _ ->
                                                     let created = HashSet<nativeint>()
-                                                    pendingDefaultAsmCandidates.[fileKey] <- created
+                                                    pendingDefaultAsmCandidates.[fileKey] <- (registeredEpoch, created)
                                                     created
                                             set.Add h |> ignore
                                 | ValueNone -> ())
@@ -567,6 +570,7 @@ module private WinHandleTable =
         if not (OperatingSystem.IsWindows()) then
             ValueNone
         else
+            let snapshotEpoch = Volatile.Read(&baselineEpoch)
             match listRegularDiskFiles () with
             | ValueNone -> ValueNone
             | ValueSome current ->
@@ -589,14 +593,18 @@ module private WinHandleTable =
                                             created
                                     list.Add id
                             let resolved = ResizeArray<struct (uint32 * uint64)>()
-                            for KeyValue(fileKey, candidateHandles) in pendingDefaultAsmCandidates do
-                                match countsByFile.TryGetValue fileKey with
-                                | true, live when live.Count = 1 ->
-                                    let struct (h, _, _) as soleId = live.[0]
-                                    if candidateHandles.Contains h then
-                                        baseline.Add soleId |> ignore
-                                        resolved.Add fileKey
-                                | _ -> ()
+                            for KeyValue(fileKey, (registeredEpoch, candidateHandles)) in pendingDefaultAsmCandidates do
+                                // Only promote/resolve using a handle snapshot captured AFTER the candidate
+                                // was registered; a pre-registration snapshot could still see only the user's
+                                // handle before CoreCLR opened its PE handle.
+                                if snapshotEpoch >= registeredEpoch then
+                                    match countsByFile.TryGetValue fileKey with
+                                    | true, live when live.Count = 1 ->
+                                        let struct (h, _, _) as soleId = live.[0]
+                                        if candidateHandles.Contains h then
+                                            baseline.Add soleId |> ignore
+                                            resolved.Add fileKey
+                                    | _ -> ()
                             for key in resolved do
                                 pendingDefaultAsmCandidates.Remove key |> ignore
                         let hs = HashSet<struct (nativeint * uint32 * uint64)>()

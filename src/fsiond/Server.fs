@@ -56,6 +56,22 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
 
                 let started = Stopwatch.GetTimestamp()
                 let report = hooks.Execute request disconnects.Token
+                let daemonMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
+
+                let logExecuted () =
+                    Log.info
+                        options.LogPath
+                        ("executed exit="
+                         + string report.Outcome.ExitCode
+                         + " timedOut="
+                         + string report.Outcome.TimedOut
+                         + " wedged="
+                         + string report.Wedged
+                         + (if options.Oneshot then " totalExecuted=" + string (hooks.Status().Executed) else "")
+                         + " daemonMs="
+                         + daemonMs.ToString("F3", CultureInfo.InvariantCulture)
+                         + " elapsedMs="
+                         + string (int daemonMs))
 
                 if report.Wedged then
                     hooks.Retire ()
@@ -75,18 +91,7 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
                     if report.Wedged then
                         hooks.Respawn ()
 
-                let elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
-
-                Log.info
-                    options.LogPath
-                    ("executed exit="
-                     + string report.Outcome.ExitCode
-                     + " timedOut="
-                     + string report.Outcome.TimedOut
-                     + " wedged="
-                     + string report.Wedged
-                     + " elapsedMs="
-                     + string (int elapsedMs))
+                logExecuted ()
 
                 if options.Oneshot && not report.Wedged then
                     hooks.Stop ()
@@ -110,6 +115,8 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
         new SessionHost(
             { PoolSize = options.PoolSize
               SessionTtlMinutes = options.SessionTtlMinutes
+              Oneshot = options.Oneshot
+              LogPath = options.LogPath
               Prelude = options.Prelude }
         )
 
@@ -165,14 +172,14 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
                       "--pool-size"; string options.PoolSize ]
                     @ (match session.DesiredSpec with
                        | Prelude.Spec.Bare -> [ "--no-prelude" ]
-                       | Prelude.Spec.Builtin -> []
+                       | Prelude.Spec.Builtin -> [ "--builtin-prelude" ]
                        | Prelude.Spec.File path -> [ "--prelude"; path ])
                     @ (match options.LogPath with
                        | Some path -> [ "--log"; path ]
                        | None -> [])
 
                 try
-                    spawnDetached daemonPath arguments
+                    spawnDetachedWithEnvironment daemonPath arguments (session.RespawnEnvironment())
                     Log.info options.LogPath "spawned a replacement fsiond generation"
                 with ex ->
                     Log.error options.LogPath ("replacement spawn failed: " + ex.Message)

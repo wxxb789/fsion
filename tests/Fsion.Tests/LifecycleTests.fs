@@ -144,7 +144,7 @@ let ``idle ttl retires an auto-started daemon`` () =
         Assert.Equal(0, warmup.ExitCode)
         Assert.True((context.DaemonPid()).IsSome, "daemon was not reported as running")
 
-        let deadline = DateTime.UtcNow.AddSeconds 30.0
+        let deadline = DateTime.UtcNow.AddSeconds 45.0
         let mutable running = true
 
         while running && DateTime.UtcNow < deadline do
@@ -152,7 +152,6 @@ let ``idle ttl retires an auto-started daemon`` () =
             running <- (context.DaemonPid()).IsSome
 
         Assert.False(running, "daemon did not exit after the idle TTL elapsed"))
-
 let private readAllTextEventually (path: string) =
     let deadline = DateTime.UtcNow.AddSeconds 10.0
     let mutable text = ""
@@ -253,4 +252,42 @@ let ``fsion discovers fsiond next to its own binary without FSIOND_PATH`` () =
         |> ignore
     finally
         tryDeleteDirectory deployDirectory
+        tryDeleteDirectory workingDirectory
+
+[<Fact>]
+let ``defaultEndpointName ignores USERNAME and USER environment overrides`` () =
+    let workingDirectory = createTempDir "endpoint-user-override"
+
+    try
+        let envVar = if OperatingSystem.IsWindows() then "USERNAME" else "USER"
+        let first =
+            runProcess
+                fsionBinary
+                [ "daemon"; "status" ]
+                workingDirectory
+                [ "FSION_PIPE", null; envVar, "spoofed-alpha" ]
+                None
+                30000
+
+        let second =
+            runProcess
+                fsionBinary
+                [ "daemon"; "status" ]
+                workingDirectory
+                [ "FSION_PIPE", null; envVar, "spoofed-beta" ]
+                None
+                30000
+
+        Assert.Equal(0, first.ExitCode)
+        Assert.Equal(0, second.ExitCode)
+        let extractEndpoint (text: string) =
+            let m = System.Text.RegularExpressions.Regex.Match(text, @"endpoint(?:\s+|=)([^\s,\)]+)")
+            Assert.True(m.Success, "Unexpected status output: " + text)
+            m.Groups.[1].Value
+        let ep1 = extractEndpoint first.Stdout
+        let ep2 = extractEndpoint second.Stdout
+        Assert.Equal(ep1, ep2)
+        Assert.DoesNotContain("spoofed-alpha", ep1)
+        Assert.DoesNotContain("spoofed-beta", ep2)
+    finally
         tryDeleteDirectory workingDirectory

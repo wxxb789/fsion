@@ -24,7 +24,8 @@ let sanitizeName (name: string) =
             else '_')
     new String(mapped)
 
-let defaultEndpointName () = "fsion-" + sanitizeName Environment.UserName
+let defaultEndpointName () =
+    "fsion-" + sanitizeName Environment.UserName
 
 let validateEndpointName (name: string) =
     if name.Contains '\\' || name.Contains '/' then
@@ -65,7 +66,7 @@ let connect (endpoint: Endpoint) (timeout: TimeSpan) : Stream =
             let candidate =
                 if isWindows then
                     let pipe =
-                        new NamedPipeClientStream(".", endpoint.Name, PipeDirection.InOut, PipeOptions.Asynchronous)
+                        new NamedPipeClientStream(".", endpoint.Name, PipeDirection.InOut, PipeOptions.None)
                     try
                         pipe.Connect 250
                         pipe :> Stream
@@ -243,32 +244,47 @@ let private quoteWindowsArgument (value: string) =
         builder.Append('\\', backslashes * 2).Append '"' |> ignore
         builder.ToString()
 
+let private windowsEnvironmentBlock (environment: (string * string)[]) =
+    environment
+    |> Array.sortWith (fun (left, _) (right, _) -> StringComparer.OrdinalIgnoreCase.Compare(left, right))
+    |> Array.map (fun (key, value) -> key + "=" + value)
+    |> String.concat "\u0000"
+    |> fun block -> Marshal.StringToHGlobalUni(block + "\u0000")
+
 // Process.Start sets bInheritHandles=true on Windows, so a long-lived child would inherit
 // the caller's stdout/stderr pipe write ends and keep a redirected ReadToEnd blocked after
 // the caller exits. CreateProcessW with bInheritHandles=false leaves the child detached.
-let private spawnDetachedWindows (executable: string) (arguments: string list) =
+let private spawnDetachedWindows (executable: string) (arguments: string list) environment =
     let commandLine = executable :: arguments |> List.map quoteWindowsArgument |> String.concat " "
     let mutable startupInfo = Unchecked.defaultof<StartupInfo>
     startupInfo.Cb <- uint32 (Marshal.SizeOf<StartupInfo>())
     let mutable processInformation = Unchecked.defaultof<ProcessInformation>
     let creationFlags = 0x08000000u ||| 0x00000008u
 
-    let created =
-        CreateProcessW(
-            executable,
-            commandLine,
-            IntPtr.Zero,
-            IntPtr.Zero,
-            false,
-            creationFlags,
-            IntPtr.Zero,
-            Path.GetDirectoryName executable,
-            &startupInfo,
-            &processInformation
-        )
+    let environmentBlock = environment |> Option.map windowsEnvironmentBlock |> Option.defaultValue IntPtr.Zero
+    let createUnicodeEnvironment = 0x00000400u
+    let flags = if environment.IsSome then creationFlags ||| createUnicodeEnvironment else creationFlags
 
-    if not created then
-        raise (Win32Exception(Marshal.GetLastWin32Error(), "failed to start " + executable))
+    try
+        let created =
+            CreateProcessW(
+                executable,
+                commandLine,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                false,
+                flags,
+                environmentBlock,
+                Path.GetDirectoryName executable,
+                &startupInfo,
+                &processInformation
+            )
+
+        if not created then
+            raise (Win32Exception(Marshal.GetLastWin32Error(), "failed to start " + executable))
+    finally
+        if environmentBlock <> IntPtr.Zero then
+            Marshal.FreeHGlobal environmentBlock
 
     if processInformation.Process <> IntPtr.Zero then
         CloseHandle processInformation.Process |> ignore
@@ -276,7 +292,7 @@ let private spawnDetachedWindows (executable: string) (arguments: string list) =
     if processInformation.Thread <> IntPtr.Zero then
         CloseHandle processInformation.Thread |> ignore
 
-let private spawnDetachedManaged (executable: string) (arguments: string list) =
+let private spawnDetachedManaged (executable: string) (arguments: string list) environment =
     let startInfo = ProcessStartInfo(executable)
     startInfo.UseShellExecute <- false
     startInfo.CreateNoWindow <- true
@@ -287,6 +303,11 @@ let private spawnDetachedManaged (executable: string) (arguments: string list) =
 
     for argument in arguments do
         startInfo.ArgumentList.Add argument
+
+    environment |> Option.iter (fun variables ->
+        startInfo.Environment.Clear()
+        for key, value in variables do
+            startInfo.Environment.[key] <- value)
 
     let child = Process.Start startInfo
 
@@ -307,8 +328,13 @@ let private spawnDetachedManaged (executable: string) (arguments: string list) =
             ())
     |> ignore
 
-let spawnDetached (executable: string) (arguments: string list) =
+let private spawnWithEnvironment executable arguments environment =
     if isWindows then
-        spawnDetachedWindows executable arguments
+        spawnDetachedWindows executable arguments environment
     else
-        spawnDetachedManaged executable arguments
+        spawnDetachedManaged executable arguments environment
+
+let spawnDetached executable arguments = spawnWithEnvironment executable arguments None
+
+let spawnDetachedWithEnvironment executable arguments environment =
+    spawnWithEnvironment executable arguments (Some environment)

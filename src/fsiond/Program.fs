@@ -34,6 +34,7 @@ let private parse (argv: string[]) =
     let mutable logPath = None
     let mutable preludePath = None
     let mutable noPrelude = false
+    let mutable builtinPrelude = false
     let mutable index = 0
     let mutable valid = true
     while valid && index < argv.Length do
@@ -72,11 +73,14 @@ let private parse (argv: string[]) =
         | "--no-prelude" ->
             noPrelude <- true
             index <- index + 1
+        | "--builtin-prelude" ->
+            builtinPrelude <- true
+            index <- index + 1
         | "--log" when index + 1 < argv.Length ->
             logPath <- Some argv.[index + 1]
             index <- index + 2
         | _ -> valid <- false
-    if (not valid || (noPrelude && preludePath.IsSome)) && argv.Length > 0 then
+    if (not valid || ((if noPrelude then 1 else 0) + (if builtinPrelude then 1 else 0) + (if preludePath.IsSome then 1 else 0) > 1)) && argv.Length > 0 then
         Log.error logPath ("invalid arguments: " + String.Join(" ", argv))
         None
     else
@@ -125,6 +129,8 @@ let private parse (argv: string[]) =
         let prelude =
             if noPrelude then
                 Spec.Bare
+            elif builtinPrelude then
+                Spec.Builtin
             else
                 match configuredPrelude |> Option.orElseWith userPreludePath with
                 | Some path -> Spec.File(Path.GetFullPath path)
@@ -154,7 +160,7 @@ let private runDaemon (options: Options) (releaseOwnership: unit -> unit) =
 [<EntryPoint>]
 let main argv =
     Ambient.install ()
-
+    initializeProcessCaches ()
     match parse argv with
     | None -> 1
     | Some options when options.Oneshot -> runDaemon options ignore

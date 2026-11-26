@@ -16,7 +16,7 @@ Read [../core-design.md](../core-design.md) and [../specs/2026-11-22-fsion-core-
 
 ## Prerequisite
 
-Accepted completion of [0006-hot-path-and-burst-resilience.md](0006-hot-path-and-burst-resilience.md).
+Accepted completion of [0006-hot-path-and-burst-resilience.md](archive/0006-hot-path-and-burst-resilience.md).
 
 ## Material Scope, Constraints, and Assumptions
 
@@ -32,8 +32,9 @@ Accepted completion of [0006-hot-path-and-burst-resilience.md](0006-hot-path-and
 - **Non-Collateral Wedged Drain & Named-Session Generation Tracking**:
   - When a runaway evaluation wedges, `retire` immediately stops accepting new connections, releases endpoint ownership, and spawns the replacement `fsiond` generation so new callers proceed at once—**but** delays self-termination of the retiring process until all *other* non-wedged active evaluations complete (bounded by a generous drain ceiling / their own timeouts rather than killing healthy siblings at `1 s`).
   - Track known named-session IDs across client/daemon or persist lightweight tombstones per endpoint so that if a `--session <id>` was previously established and the daemon generation subsequently restarted/respawned (due to crash or another turn's wedge), the first subsequent call to `--session <id>` without `--reset` reports an explicit, actionable session-lost error (non-zero exit, clear stderr/JSON message naming `<id>` and advising `--reset`) instead of silently evaluating in an empty session; `--session <id> --reset` clears the tombstone and starts fresh.
-- **Atomic Lifecycle State**:
+- **Atomic Lifecycle State & Idle Memory Compaction**:
   - All `Server.fs` request counters (`activeRequests`), activity timestamps, and stop flags use thread-safe atomic operations (`Interlocked` / `Volatile`).
+  - Configure `fsiond` with `System.GC.ConserveMemory = 9`, request `GCLargeObjectHeapCompactionMode.CompactOnce` during the existing `500 ms` quiet `drainPendingCleanups` collection (never on the synchronous execution hot path), and on Windows trim the idle process working set (`EmptyWorkingSet`, feeding Windows Memory Compression) once `fsiond` has been continuously idle (`activeRuns = 0`) for at least `5` minutes (configurable via `FSION_TRIM_IDLE_MINUTES`, `0` disables; resetting so it runs at most once per idle epoch after activity).
 - **Out of Scope**:
   - Piped `stdin` forwarding for file/`-e` runs, `exit` inside user `try ... with` blocks, and in-process `Console.SetOut` / `AppDomain` event-handler restoration (owned by Goal `0008`).
 
@@ -53,4 +54,5 @@ Accepted completion of [0006-hot-path-and-burst-resilience.md](0006-hot-path-and
      - Script C started right after B times out is served immediately by the fresh replacement `fsiond` PID;
      - Once script A finishes, the retired wedged `fsiond` PID terminates within its post-drain window (zero leaked runaway processes).
   5. **Explicit Named-Session Generation Loss Notice**: Establish `let x = 42` in `--session alpha`, trigger a wedged respawn on an unrelated stateless run, then invoke `fsion --session alpha -e "x + 1"`: it exits non-zero with an explicit message stating that session `alpha` was lost when `fsiond` restarted (not an unexplained `FS0039`), after which `fsion --session alpha --reset -e "let x = 99\nprintfn \"%d\" x"` succeeds with exit `0`.
+  6. **Idle LOH Compaction & Working-Set Trim**: Verify `fsiond.runtimeconfig.json` carries `System.GC.ConserveMemory = 9`, idle `drainPendingCleanups` compacts LOH without regressing warm latency, and on Windows setting a short `FSION_TRIM_IDLE_MINUTES` (for example `0.03`) trims `fsiond` `WorkingSet64` materially during idle while a subsequent script still executes with exit `0` and exact stdout.
 - Follow the Goal Close Ritual in `AGENTS.md`: record `docs/plans/2026-11-24-goal-0007-implementation-choices.md` and `docs/evidence/0007-evidence.md`, move `docs/goals/0007-protocol-security-and-fault-isolation.md` unchanged to `docs/goals/archive/`, and update `docs/goals/README.md`, `README.md`, and `AGENTS.md`.

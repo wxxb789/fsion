@@ -93,7 +93,10 @@ let runProcess
         startInfo.ArgumentList.Add argument
 
     for key, value in environment do
-        startInfo.Environment.[key] <- value
+        if isNull value then
+            startInfo.Environment.Remove key |> ignore
+        else
+            startInfo.Environment.[key] <- value
 
     let stopwatch = Stopwatch.StartNew()
     use childProcess = Process.Start startInfo

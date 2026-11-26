@@ -3,9 +3,12 @@ module Fsiond.SessionHost
 open System
 open System.Collections.Concurrent
 open System.Collections.Generic
+open System.Diagnostics
 open System.Globalization
 open System.IO
 open System.Reflection
+open System.Runtime.CompilerServices
+open System.Runtime.InteropServices
 open System.Runtime.Loader
 open System.Text
 open System.Threading
@@ -31,6 +34,8 @@ type ExecutionReport =
 type SessionHostOptions =
     { PoolSize: int
       SessionTtlMinutes: float
+      Oneshot: bool
+      LogPath: string option
       Prelude: Prelude.Spec }
 
 type private RunTextWriter() =
@@ -136,6 +141,8 @@ type private WarmSession() =
     member val ExitMarker: string = "" with get, set
     member val Prelude: Prelude.Tag = Prelude.Tag.Builtin with get, set
     member val CompilerDirectory: string = "" with get, set
+    member val SetCompilerDirectory: (string -> unit) option = None with get, set
+    member val PreludeTypes = HashSet<Type>() with get, set
     member val ProcessExitHandlers: Delegate[] = [||] with get, set
     member val UnmanagedDllHandlers: Delegate[] = [||] with get, set
     member val AssemblyResolveHandlers: Delegate[] = [||] with get, set
@@ -245,16 +252,32 @@ let private detachSessionCallback (session: FsiEvaluationSession) =
     with _ ->
         ()
 
+let private fxClearStaticCaches =
+    match typeof<FsiEvaluationSession>.Assembly.GetType("FSharp.Compiler.FxResolver") with
+    | null -> null
+    | resolverType ->
+        resolverType.GetMethod(
+            "ClearStaticCaches",
+            BindingFlags.Static ||| BindingFlags.Public ||| BindingFlags.NonPublic,
+            Type.EmptyTypes
+        )
+
 let private clearCheckerCaches (session: FsiEvaluationSession) =
     try
         match checkerField.GetValue session with
         | null -> ()
         | checker ->
-            match checker.GetType().GetMethod("ClearLanguageServiceRootCachesAndCollectAndFinalizeAllTransients") with
+            match checker.GetType().GetMethod("InvalidateAll", Type.EmptyTypes) with
             | null -> ()
             | method -> method.Invoke(checker, [||]) |> ignore
     with _ ->
         ()
+
+    if not (isNull fxClearStaticCaches) then
+        try
+            fxClearStaticCaches.Invoke(null, [||]) |> ignore
+        with _ ->
+            ()
 
 let private scriptAssemblies () =
     AppDomain.CurrentDomain.GetAssemblies()
@@ -263,34 +286,43 @@ let private scriptAssemblies () =
         not (isNull name) && name.StartsWith("FSI-", StringComparison.Ordinal))
 
 // FSI emits one collectible FSI-ASSEMBLY dynamic assembly per session. Static fields on its
-// FSI_000n types hold top-level bindings and leaked@ closures; a top-level
-// `let reader = new StreamReader(...)` keeps its Windows file handle locked until the binding is
-// disposed or the field is nulled (initonly fields cannot be nulled, so they must be disposed).
-// Nulling the rest lets GC unload the assembly and finalize any remaining streams.
-let private clearScriptStatics (assemblies: Assembly[]) =
+// FSI_000n types hold top-level bindings and leaked@ closures. Top-level IDisposable bindings
+// (`let reader = new StreamReader(...)`) are disposed directly; all non-initonly static fields
+// (including `[<Struct>]` records, nested modules, tuples, and arrays) are reset to default/null
+// so sweepTransientFinalizers deterministically finalizes any nested streams without traversing
+// into shared process-wide BCL objects like Async.DefaultCancellationToken's backing CTS.
+let private clearScriptStatics (preludeTypes: HashSet<Type>) (assemblies: Assembly[]) =
     for assembly in assemblies do
         try
-            for scriptType in assembly.GetTypes() do
+            for scriptType in assembly.GetTypes() |> Array.filter (preludeTypes.Contains >> not) do
                 for field in scriptType.GetFields(BindingFlags.Static ||| BindingFlags.Public ||| BindingFlags.NonPublic) do
                     if
                         not field.IsLiteral
-                        && not field.FieldType.IsValueType
+                        && not field.FieldType.IsPrimitive
+                        && not field.FieldType.IsEnum
                         && not field.FieldType.IsPointer
+                        && field.FieldType <> typeof<string>
                     then
-                        try
-                            match field.GetValue null with
-                            | :? IDisposable as disposable ->
-                                try
-                                    disposable.Dispose()
-                                with _ ->
-                                    ()
-                            | _ -> ()
-                        with _ ->
-                            ()
+                        if not field.FieldType.IsValueType then
+                            try
+                                match field.GetValue null with
+                                | :? IDisposable as disposable ->
+                                    try
+                                        disposable.Dispose()
+                                    with _ ->
+                                        ()
+                                | _ -> ()
+                            with _ ->
+                                ()
 
                         if not field.IsInitOnly then
                             try
-                                field.SetValue(null, null)
+                                let resetValue =
+                                    if field.FieldType.IsValueType then
+                                        RuntimeHelpers.GetUninitializedObject field.FieldType
+                                    else
+                                        null
+                                field.SetValue(null, resetValue)
                             with _ ->
                                 ()
         with _ ->
@@ -312,18 +344,563 @@ let private clearCompilerAsyncLocals () =
         let valueType = local.GetType().GetGenericArguments().[0]
         valueProperty.SetValue(local, Activator.CreateInstance valueType)
 
-let private sweepFinalizers () =
-    GC.Collect(2, GCCollectionMode.Forced, true, true)
-    GC.WaitForPendingFinalizers()
-    GC.Collect(2, GCCollectionMode.Forced, true, true)
 
-// Top-level IDisposable bindings are disposed by clearScriptStatics; this Gen-0 sweep finalizes
-// throwaway streams created inside functions so their Windows handles close before the response
-// while the collectible unload (checker caches, session dispose, full sweep) stays off the
-// request's critical path.
-let private sweepTransientFinalizers () =
-    GC.Collect(0, GCCollectionMode.Forced, true, false)
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type private WinProcessHandleSnapshotHeader =
+    val mutable NumberOfHandles: unativeint
+    val mutable Reserved: unativeint
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type private WinProcessHandleTableEntryInfo =
+    val mutable HandleValue: nativeint
+    val mutable HandleCount: unativeint
+    val mutable PointerCount: unativeint
+    val mutable GrantedAccess: uint32
+    val mutable ObjectTypeIndex: uint32
+    val mutable HandleAttributes: uint32
+    val mutable Reserved: uint32
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type private WinByHandleFileInformation =
+    val mutable dwFileAttributes: uint32
+    val mutable ftCreationTimeLow: uint32
+    val mutable ftCreationTimeHigh: uint32
+    val mutable ftLastAccessTimeLow: uint32
+    val mutable ftLastAccessTimeHigh: uint32
+    val mutable ftLastWriteTimeLow: uint32
+    val mutable ftLastWriteTimeHigh: uint32
+    val mutable dwVolumeSerialNumber: uint32
+    val mutable nFileSizeHigh: uint32
+    val mutable nFileSizeLow: uint32
+    val mutable nNumberOfLinks: uint32
+    val mutable nFileIndexHigh: uint32
+    val mutable nFileIndexLow: uint32
+
+module private WinHandleTable =
+    [<DllImport("ntdll.dll")>]
+    extern int NtQueryInformationProcess(
+        nativeint ProcessHandle,
+        int ProcessInformationClass,
+        nativeint ProcessInformation,
+        uint32 ProcessInformationLength,
+        uint32& ReturnLength)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern uint32 GetFileType(nativeint hFile)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool GetFileInformationByHandle(nativeint hFile, WinByHandleFileInformation& lpFileInformation)
+
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern uint32 GetFileAttributesW(string lpFileName)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern uint32 GetFinalPathNameByHandleW(nativeint hFile, nativeint lpszFilePath, uint32 cchFilePath, uint32 dwFlags)
+
+    let private headerSize = Marshal.SizeOf<WinProcessHandleSnapshotHeader>()
+    let private entrySize = Marshal.SizeOf<WinProcessHandleTableEntryInfo>()
+
+    [<NoComparison; NoEquality>]
+    type WinSnapshot =
+        { AllDiskFiles: HashSet<struct (nativeint * uint32 * uint64)>
+          HasPreExistingUserFiles: bool }
+
+    let private tryRegularDiskIdentity (hFile: nativeint) : struct (nativeint * uint32 * uint64) voption =
+        if GetFileType hFile <> 1u then
+            ValueNone
+        else
+            let mutable info = Unchecked.defaultof<WinByHandleFileInformation>
+            if GetFileInformationByHandle(hFile, &info) then
+                if (info.dwFileAttributes &&& 0x10u) <> 0u then
+                    ValueNone
+                else
+                    let fileIndex = (uint64 info.nFileIndexHigh <<< 32) ||| uint64 info.nFileIndexLow
+                    ValueSome(struct (hFile, info.dwVolumeSerialNumber, fileIndex))
+            else
+                // Directory handles opened with FILE_TRAVERSE (0x100020, e.g. CurrentDirectory) fail
+                // GetFileInformationByHandle; check path attributes so directories do not force Gen-2.
+                let buf = Marshal.AllocHGlobal 2048
+                try
+                    let len = GetFinalPathNameByHandleW(hFile, buf, 1024u, 0u)
+                    if len > 0u && len < 1024u then
+                        let path = Marshal.PtrToStringUni(buf, int len)
+                        let attrs = GetFileAttributesW path
+                        if attrs <> 0xFFFFFFFFu && (attrs &&& 0x10u) <> 0u then
+                            ValueNone
+                        else
+                            ValueSome(struct (hFile, 0xFFFFFFFFu, uint64 (path.GetHashCode())))
+                    else
+                        ValueSome(struct (hFile, 0xFFFFFFFFu, 0UL))
+                finally
+                    Marshal.FreeHGlobal buf
+
+    let private baselineSync = obj ()
+    let mutable private baselineHandlesOpt: HashSet<struct (nativeint * uint32 * uint64)> voption = ValueNone
+    let mutable private builtinSeeded = false
+
+    // Track exact `(HandleValue, dwVolumeSerialNumber, FileIndex)` triples opened by CoreCLR when
+    // loading runtime assemblies (`AppDomain.CurrentDomain.AssemblyLoad` + startup/builtin snapshots),
+    // rather than reopening `Assembly.Location` paths from disk. That way dynamically loaded BCL/NuGet
+    // DLLs remain fast-path exempt while a user handle on a renamed/replaced DLL or `Environment.ProcessPath`
+    // is never misclassified as a runtime handle.
+    let private listRegularDiskFiles () : ResizeArray<struct (nativeint * uint32 * uint64)> voption =
+        let mutable size = 32768u
+        let mutable retLen = 0u
+        let mutable buf = Marshal.AllocHGlobal(int size)
+        try
+            let mutable status = NtQueryInformationProcess(-1n, 51, buf, size, &retLen)
+            while status = 0xC0000004 do
+                Marshal.FreeHGlobal buf
+                size <- max (size * 2u) (retLen + 4096u)
+                buf <- Marshal.AllocHGlobal(int size)
+                status <- NtQueryInformationProcess(-1n, 51, buf, size, &retLen)
+            if status <> 0 then
+                ValueNone
+            else
+                let count = int (Marshal.ReadIntPtr(buf, 0))
+                let list = ResizeArray<struct (nativeint * uint32 * uint64)>()
+                for i = 0 to count - 1 do
+                    let h = Marshal.ReadIntPtr(buf, headerSize + i * entrySize)
+                    match tryRegularDiskIdentity h with
+                    | ValueSome id -> list.Add id
+                    | ValueNone -> ()
+                ValueSome list
+        finally
+            Marshal.FreeHGlobal buf
+
+    let mutable private assemblyLoadHooked = false
+    let mutable private baselineEpoch = 0L
+    let private pendingDefaultAsmCandidates = Dictionary<struct (uint32 * uint64), int64 * HashSet<nativeint>>()
+    let private resolveCanonicalPath (path: string) =
+        let full = Path.GetFullPath path
+        try
+            match File.ResolveLinkTarget(full, true) with
+            | null -> full
+            | info -> info.FullName
+        with _ ->
+            full
+
+    let private runtimeTrustedRoots =
+        let roots = HashSet<string>(if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal)
+        let addDir (dir: string) =
+            if not (String.IsNullOrEmpty dir) then
+                let full = Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + string Path.DirectorySeparatorChar
+                roots.Add full |> ignore
+                let canonical = resolveCanonicalPath dir
+                let canonicalNorm = canonical.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + string Path.DirectorySeparatorChar
+                roots.Add canonicalNorm |> ignore
+        addDir (Path.GetDirectoryName(typeof<obj>.Assembly.Location))
+        [| for r in roots -> r |]
+
+    let private bundledTrustedAssemblies =
+        let appDir =
+            let dir = Path.GetDirectoryName(typeof<FsiEvaluationSession>.Assembly.Location)
+            if String.IsNullOrEmpty dir then "" else Path.GetFullPath dir
+        let names =
+            [ "FSharp.DependencyManager.Nuget.dll"
+              "FSharp.Compiler.Interactive.Settings.dll"
+              "FSharp.Compiler.Service.dll"
+              "FSharp.Core.dll"
+              "Fsion.Protocol.dll" ]
+        let set = HashSet<string>(if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal)
+        if appDir.Length > 0 then
+            for name in names do
+                let p = Path.Combine(appDir, name)
+                set.Add p |> ignore
+                set.Add(resolveCanonicalPath p) |> ignore
+        set
+
+    let private isTrustedRuntimeAssemblyPath (fullPath: string) =
+        let comparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+        (runtimeTrustedRoots |> Array.exists (fun root -> fullPath.StartsWith(root, comparison)))
+        || bundledTrustedAssemblies.Contains fullPath
+
+    let private recordHandleBaselineForAssembly (asm: Assembly) =
+        if OperatingSystem.IsWindows()
+           && not asm.IsDynamic
+           && Object.ReferenceEquals(AssemblyLoadContext.GetLoadContext asm, AssemblyLoadContext.Default) then
+            let loc =
+                try
+                    asm.Location
+                with _ ->
+                    ""
+            if not (String.IsNullOrEmpty loc) then
+                try
+                    let fullLoc = Path.GetFullPath loc
+                    // Only admit assemblies from the shared .NET runtime directory (`Microsoft.NETCore.App`) or
+                    // the explicit bundled FSI/daemon dependency list (e.g. `FSharp.DependencyManager.Nuget.dll`),
+                    // where CoreCLR holds resident PE handles. Arbitrary user/external binaries are never admitted.
+                    if isTrustedRuntimeAssemblyPath fullLoc then
+                        match listRegularDiskFiles () with
+                        | ValueSome current ->
+                            let capChars = 1024u
+                            let pathBuf = Marshal.AllocHGlobal(int capChars * 2)
+                            try
+                                lock baselineSync (fun () ->
+                                    match baselineHandlesOpt with
+                                    | ValueSome baseline ->
+                                        let matched = ResizeArray<struct (nativeint * uint32 * uint64)>()
+                                        for id in current do
+                                            let struct (h, vol, _) = id
+                                            if vol <> 0xFFFFFFFFu then
+                                                let len = GetFinalPathNameByHandleW(h, pathBuf, capChars, 0u)
+                                                if len > 0u && len < capChars then
+                                                    let raw = Marshal.PtrToStringUni(pathBuf, int len)
+                                                    let normalized =
+                                                        if raw.StartsWith(@"\\?\", StringComparison.Ordinal) then raw.Substring 4 else raw
+                                                    if String.Equals(normalized, fullLoc, StringComparison.OrdinalIgnoreCase) then
+                                                        matched.Add id
+                                        let distinctFiles = HashSet<struct (uint32 * uint64)>()
+                                        for id in matched do
+                                            let struct (_, vol, fileIdx) = id
+                                            distinctFiles.Add(struct (vol, fileIdx)) |> ignore
+                                        if matched.Count = 1 && not (baseline.Contains matched.[0]) then
+                                            baseline.Add matched.[0] |> ignore
+                                        elif matched.Count > 1 && distinctFiles.Count = 1 then
+                                            let registeredEpoch = Interlocked.Increment(&baselineEpoch)
+                                            for id in matched do
+                                                let struct (h, vol, fileIdx) = id
+                                                let fileKey = struct (vol, fileIdx)
+                                                let set =
+                                                    match pendingDefaultAsmCandidates.TryGetValue fileKey with
+                                                    | true, (_, existing) ->
+                                                        pendingDefaultAsmCandidates.[fileKey] <- (registeredEpoch, existing)
+                                                        existing
+                                                    | false, _ ->
+                                                        let created = HashSet<nativeint>()
+                                                        pendingDefaultAsmCandidates.[fileKey] <- (registeredEpoch, created)
+                                                        created
+                                                set.Add h |> ignore
+                                    | ValueNone -> ())
+                            finally
+                                Marshal.FreeHGlobal pathBuf
+                        | ValueNone -> ()
+                with _ -> ()
+    let private posixRuntimeBaseline = HashSet<string>(StringComparer.Ordinal)
+    let mutable private posixBaselineSeeded = false
+    let mutable private posixBaselineEpoch = 0L
+    let private pendingPosixAsmCandidates = Dictionary<string, int64 * HashSet<string>>(StringComparer.Ordinal)
+
+    let private recordPosixBaseline () =
+        if not (OperatingSystem.IsWindows()) then
+            lock baselineSync (fun () ->
+                if not posixBaselineSeeded then
+                    posixBaselineSeeded <- true
+                    if Directory.Exists "/proc/self/fd" then
+                        try
+                            for entry in Directory.GetFileSystemEntries "/proc/self/fd" do
+                                let name = Path.GetFileName entry
+                                try
+                                    match File.ResolveLinkTarget(entry, false) with
+                                    | null -> ()
+                                    | info ->
+                                        let target = info.FullName
+                                        if name <> "0" && name <> "1" && name <> "2" && target.StartsWith("/", StringComparison.Ordinal) then
+                                            posixRuntimeBaseline.Add(name + "\t" + target) |> ignore
+                                with _ -> ()
+                        with _ -> ())
+
+    let private recordPosixHandleForAssembly (asm: Assembly) =
+        if OperatingSystem.IsLinux()
+           && not asm.IsDynamic
+           && Object.ReferenceEquals(AssemblyLoadContext.GetLoadContext asm, AssemblyLoadContext.Default) then
+            let loc =
+                try
+                    asm.Location
+                with _ ->
+                    ""
+            if not (String.IsNullOrEmpty loc) then
+                try
+                    let fullLoc = Path.GetFullPath loc
+                    if isTrustedRuntimeAssemblyPath fullLoc && Directory.Exists "/proc/self/fd" then
+                        let canonicalLoc =
+                            try
+                                match File.ResolveLinkTarget(fullLoc, true) with
+                                | null -> fullLoc
+                                | info -> info.FullName
+                            with _ ->
+                                fullLoc
+                        let matched = ResizeArray<string>()
+                        for entry in Directory.GetFileSystemEntries "/proc/self/fd" do
+                            let name = Path.GetFileName entry
+                            try
+                                match File.ResolveLinkTarget(entry, false) with
+                                | null -> ()
+                                | info ->
+                                    if String.Equals(info.FullName, fullLoc, StringComparison.Ordinal)
+                                       || String.Equals(info.FullName, canonicalLoc, StringComparison.Ordinal) then
+                                        matched.Add(name + "\t" + info.FullName)
+                            with _ -> ()
+                        lock baselineSync (fun () ->
+                            if matched.Count = 1 then
+                                posixRuntimeBaseline.Add matched.[0] |> ignore
+                            elif matched.Count > 1 then
+                                let registeredEpoch = Interlocked.Increment(&posixBaselineEpoch)
+                                let targetKey =
+                                    let idx = matched.[0].IndexOf('\t')
+                                    if idx >= 0 then matched.[0].Substring(idx + 1) else canonicalLoc
+                                match pendingPosixAsmCandidates.TryGetValue targetKey with
+                                | true, (_, existing) ->
+                                    for key in matched do
+                                        existing.Add key |> ignore
+                                    pendingPosixAsmCandidates.[targetKey] <- (registeredEpoch, existing)
+                                | false, _ ->
+                                    let created = HashSet<string>(matched, StringComparer.Ordinal)
+                                    pendingPosixAsmCandidates.[targetKey] <- (registeredEpoch, created)
+                            else
+                                let registeredEpoch = Interlocked.Increment(&posixBaselineEpoch)
+                                if not (pendingPosixAsmCandidates.ContainsKey canonicalLoc) then
+                                    pendingPosixAsmCandidates.[canonicalLoc] <- (registeredEpoch, HashSet<string>(StringComparer.Ordinal)))
+                with _ -> ()
+    let initializeBaseline () =
+        if OperatingSystem.IsWindows() then
+            lock baselineSync (fun () ->
+                match listRegularDiskFiles () with
+                | ValueSome list ->
+                    let hs = HashSet<struct (nativeint * uint32 * uint64)>()
+                    for id in list do
+                        let struct (_, vol, _) = id
+                        if vol <> 0xFFFFFFFFu then
+                            hs.Add id |> ignore
+                    baselineHandlesOpt <- ValueSome hs
+                | ValueNone -> ()
+                if not assemblyLoadHooked then
+                    assemblyLoadHooked <- true
+                    AppDomain.CurrentDomain.AssemblyLoad.Add(fun args -> recordHandleBaselineForAssembly args.LoadedAssembly))
+        elif OperatingSystem.IsLinux() then
+            lock baselineSync (fun () ->
+                if not assemblyLoadHooked then
+                    assemblyLoadHooked <- true
+                    AppDomain.CurrentDomain.AssemblyLoad.Add(fun args -> recordPosixHandleForAssembly args.LoadedAssembly))
+    let recordBuiltinWarmBaseline () =
+        if OperatingSystem.IsWindows() then
+            lock baselineSync (fun () ->
+                if not builtinSeeded then
+                    builtinSeeded <- true
+                    match listRegularDiskFiles () with
+                    | ValueSome list ->
+                        let hs =
+                            match baselineHandlesOpt with
+                            | ValueSome existing -> existing
+                            | ValueNone -> HashSet<struct (nativeint * uint32 * uint64)>()
+                        for id in list do
+                            let struct (_, vol, _) = id
+                            if vol <> 0xFFFFFFFFu then
+                                hs.Add id |> ignore
+                        baselineHandlesOpt <- ValueSome hs
+                    | ValueNone -> ())
+        else
+            recordPosixBaseline ()
+
+    let snapshot () : WinSnapshot voption =
+        if not (OperatingSystem.IsWindows()) then
+            ValueNone
+        else
+            let snapshotEpoch = Volatile.Read(&baselineEpoch)
+            match listRegularDiskFiles () with
+            | ValueNone -> ValueNone
+            | ValueSome current ->
+                lock baselineSync (fun () ->
+                    match baselineHandlesOpt with
+                    | ValueNone -> ValueNone
+                    | ValueSome baseline ->
+                        if pendingDefaultAsmCandidates.Count > 0 then
+                            let countsByFile = Dictionary<struct (uint32 * uint64), ResizeArray<struct (nativeint * uint32 * uint64)>>()
+                            for id in current do
+                                let struct (_, vol, fileIdx) = id
+                                let fileKey = struct (vol, fileIdx)
+                                if pendingDefaultAsmCandidates.ContainsKey fileKey then
+                                    let list =
+                                        match countsByFile.TryGetValue fileKey with
+                                        | true, existing -> existing
+                                        | false, _ ->
+                                            let created = ResizeArray()
+                                            countsByFile.[fileKey] <- created
+                                            created
+                                    list.Add id
+                            let resolved = ResizeArray<struct (uint32 * uint64)>()
+                            for KeyValue(fileKey, (registeredEpoch, candidateHandles)) in pendingDefaultAsmCandidates do
+                                // Only promote/resolve using a handle snapshot captured AFTER the candidate
+                                // was registered; a pre-registration snapshot could still see only the user's
+                                // handle before CoreCLR opened its PE handle.
+                                if snapshotEpoch >= registeredEpoch then
+                                    match countsByFile.TryGetValue fileKey with
+                                    | true, live when live.Count = 1 ->
+                                        let struct (h, _, _) as soleId = live.[0]
+                                        if candidateHandles.Contains h then
+                                            baseline.Add soleId |> ignore
+                                            resolved.Add fileKey
+                                    | _ -> ()
+                            for key in resolved do
+                                pendingDefaultAsmCandidates.Remove key |> ignore
+                        let hs = HashSet<struct (nativeint * uint32 * uint64)>()
+                        let seenFiles = HashSet<struct (uint32 * uint64)>()
+                        let mutable hasUserFiles = false
+                        for id in current do
+                            hs.Add id |> ignore
+                            let struct (_, vol, fileIdx) = id
+                            let fileKey = struct (vol, fileIdx)
+                            let duplicateFile = not (seenFiles.Add fileKey)
+                            if vol = 0xFFFFFFFFu || duplicateFile || not (baseline.Contains id) then
+                                hasUserFiles <- true
+                        ValueSome { AllDiskFiles = hs; HasPreExistingUserFiles = hasUserFiles })
+
+    [<NoComparison; NoEquality>]
+    type PosixSnapshot =
+        { AllFds: HashSet<string>
+          HasPreExistingRegularFiles: bool }
+
+    // `posixRuntimeBaseline` is populated once on builtin warmup via `recordPosixBaseline ()` above.
+    let posixFdSnapshot () : PosixSnapshot voption =
+        if OperatingSystem.IsWindows() then
+            ValueNone
+        else
+            try
+                let dir =
+                    if Directory.Exists "/proc/self/fd" then Some ("/proc/self/fd", true)
+                    elif Directory.Exists "/dev/fd" then Some ("/dev/fd", false)
+                    else None
+                match dir with
+                | None -> ValueNone
+                | Some (d, isProcFd) ->
+                    let snapshotEpoch = Volatile.Read(&posixBaselineEpoch)
+                    let entries = ResizeArray<struct (string * string * bool * bool)>()
+                    let liveByTarget = Dictionary<string, ResizeArray<string>>(StringComparer.Ordinal)
+                    for entry in Directory.GetFileSystemEntries d do
+                        let name = Path.GetFileName entry
+                        let mutable target = ""
+                        let mutable resolved = false
+                        let mutable vanished = false
+                        try
+                            match File.ResolveLinkTarget(entry, false) with
+                            | null -> ()
+                            | info ->
+                                target <- info.FullName
+                                resolved <- true
+                                if isProcFd && name <> "0" && name <> "1" && name <> "2" && target.StartsWith("/", StringComparison.Ordinal) then
+                                    let list =
+                                        match liveByTarget.TryGetValue target with
+                                        | true, existing -> existing
+                                        | false, _ ->
+                                            let created = ResizeArray<string>()
+                                            liveByTarget.[target] <- created
+                                            created
+                                    list.Add(name + "\t" + target)
+                        with
+                        | :? FileNotFoundException
+                        | :? DirectoryNotFoundException ->
+                            // On Linux `/proc/self/fd`, `Directory.GetFileSystemEntries` includes its own
+                            // enumeration directory FD, which is already closed (`ENOENT`) by the time
+                            // `ResolveLinkTarget` inspects it.
+                            vanished <- true
+                        | _ -> ()
+                        entries.Add(struct (name, target, resolved, vanished))
+                    if isProcFd then
+                        lock baselineSync (fun () ->
+                            if pendingPosixAsmCandidates.Count > 0 then
+                                let resolvedTargets = ResizeArray<string>()
+                                for KeyValue(targetPath, (registeredEpoch, candidateKeys)) in pendingPosixAsmCandidates do
+                                    if snapshotEpoch >= registeredEpoch then
+                                        match liveByTarget.TryGetValue targetPath with
+                                        | true, live when live.Count > 0 && live.Count <= 2 ->
+                                            // CoreCLR on Linux keeps up to 2 FDs per loaded framework DLL (PE + metadata/R2R).
+                                            // Once user streams close, promote the remaining runtime FDs captured at load time.
+                                            if candidateKeys.Count = 0 || (live |> Seq.forall (fun k -> candidateKeys.Contains k)) then
+                                                for k in live do
+                                                    posixRuntimeBaseline.Add k |> ignore
+                                                resolvedTargets.Add targetPath
+                                        | _ -> ()
+                                for t in resolvedTargets do
+                                    pendingPosixAsmCandidates.Remove t |> ignore)
+                    let hs = HashSet<string>(StringComparer.Ordinal)
+                    let mutable hasReg = false
+                    for struct (name, target, resolved, vanished) in entries do
+                        if resolved && name <> "0" && name <> "1" && name <> "2" && target.StartsWith("/", StringComparison.Ordinal) then
+                            if File.Exists target && not (Directory.Exists target) then
+                                let key = name + "\t" + target
+                                let isBaseline =
+                                    isProcFd
+                                    && lock baselineSync (fun () ->
+                                        posixRuntimeBaseline.Contains key
+                                        || (isTrustedRuntimeAssemblyPath target
+                                            && match liveByTarget.TryGetValue target with
+                                               | true, live -> live.Count <= 2
+                                               | _ -> false))
+                                if not isBaseline then
+                                    hasReg <- true
+                        // so an unresolvable non-stdio fd > 2 cannot be proven non-regular; conservatively treat
+                        // any live unresolved fd > 2 on non-`/proc/self/fd` as a possible pre-existing regular file
+                        // without penalizing Linux's vanished enumeration FD.
+                        if not resolved && not vanished && (not isProcFd) && name <> "0" && name <> "1" && name <> "2" then
+                            hasReg <- true
+                        if not vanished then
+                            hs.Add(name + "\t" + target) |> ignore
+                    ValueSome { AllFds = hs; HasPreExistingRegularFiles = hasReg }
+            with _ ->
+                ValueNone
+    let hasNewHandle
+        (winBeforeOpt: WinSnapshot voption)
+        (posixBeforeOpt: PosixSnapshot voption)
+        : bool =
+        if OperatingSystem.IsWindows() then
+            match winBeforeOpt with
+            | ValueNone -> true
+            | ValueSome before when before.HasPreExistingUserFiles -> true
+            | ValueSome before ->
+                match listRegularDiskFiles () with
+                | ValueNone -> true
+                | ValueSome after ->
+                    let mutable found = false
+                    for id in after do
+                        if not found && not (before.AllDiskFiles.Contains id) then
+                            found <- true
+                    found
+        else
+            match posixBeforeOpt with
+            | ValueNone -> true
+            | ValueSome before when before.HasPreExistingRegularFiles -> true
+            | ValueSome before ->
+                match posixFdSnapshot () with
+                | ValueNone -> true
+                | ValueSome after ->
+                    let mutable found = false
+                    for fd in after.AllFds do
+                        if not found && not (before.AllFds.Contains fd) then
+                            found <- true
+                    found
+
+let private sweepFinalizers () =
+    GC.Collect(2, GCCollectionMode.Forced, true, false)
     GC.WaitForPendingFinalizers()
+    GC.Collect(2, GCCollectionMode.Forced, true, false)
+
+let private sweepTransientFinalizers
+    (winHandlesBefore: WinHandleTable.WinSnapshot voption)
+    (posixFdsBefore: WinHandleTable.PosixSnapshot voption)
+    collectionsBefore
+    =
+    let collect generation = GC.Collect(generation, GCCollectionMode.Forced, true, false)
+    let mutable collectedGen2 = false
+    match collectionsBefore with
+    | ValueSome(struct (gen0, gen1)) when GC.CollectionCount 1 = gen1 ->
+        let collectGen1 () =
+            collect 1
+            if GC.CollectionCount 1 <> gen1 + 1 then
+                collect 2
+                collectedGen2 <- true
+
+        if GC.CollectionCount 0 = gen0 then
+            collect 0
+            if GC.CollectionCount 0 <> gen0 + 1 then collectGen1 ()
+        else
+            collectGen1 ()
+    | _ ->
+        collect 2
+        collectedGen2 <- true
+    GC.WaitForPendingFinalizers()
+    if not collectedGen2 && WinHandleTable.hasNewHandle winHandlesBefore posixFdsBefore then
+        collect 2
+        GC.WaitForPendingFinalizers()
 let private severityText (severity: FSharpDiagnosticSeverity) =
     match severity with
     | FSharpDiagnosticSeverity.Error -> "error"
@@ -558,13 +1135,21 @@ module Fsion =
         |> List.map (fun warmType -> warmType.Assembly.GetName().Name)
 
     let private warmTypicalJsonPipeline =
-        let root = (System.Text.Json.JsonDocument.Parse "[{\"a\":1,\"b\":\"x\",\"ok\":true}]").RootElement
+        use document = System.Text.Json.JsonDocument.Parse "[{\"a\":1,\"b\":\"x\",\"ok\":true}]"
+        let root = document.RootElement
         root.EnumerateArray()
         |> Seq.filter (fun item -> item.GetProperty("ok").GetBoolean())
         |> Seq.map (fun item -> item.GetProperty("b").GetString(), item.GetProperty("a").GetInt32())
         |> Seq.sortBy (fun (label, score) -> -score, label)
         |> Seq.toArray
         |> Array.length
+
+    type private WarmInput = { Number: int }
+    type private WarmExpression = | Input of WarmInput | Constant of int
+    let private warmCodegen =
+        let value = match Input { Number = warmTypicalJsonPipeline } with Input row -> row.Number | Constant n -> n
+        let text = System.Text.StringBuilder().Append(sprintf "%d" value).Append(' ').Append(0).ToString()
+        try text.Split() |> Array.sumBy int with _ -> 0
 
     let cwd () : string = System.IO.Directory.GetCurrentDirectory()
     let path (rel: string) : string = System.IO.Path.GetFullPath rel
@@ -587,80 +1172,152 @@ let private environmentComparer =
     else
         StringComparer.Ordinal
 
-let private applyEnvironment (snapshot: (string * string)[]) =
-    let desired = Dictionary<string, string>(environmentComparer)
-
+let private environmentMap (snapshot: (string * string)[]) =
+    let variables = Dictionary<string, string>(snapshot.Length, environmentComparer)
     for key, value in snapshot do
-        desired.[key] <- value
+        variables.[key] <- value
+    variables
 
-    let current = Environment.GetEnvironmentVariables()
+let private readProcessEnvironment () =
+    let snapshot = Environment.GetEnvironmentVariables()
+    let variables = Dictionary<string, string>(snapshot.Count, environmentComparer)
+    for entry in snapshot do
+        let pair = unbox<System.Collections.DictionaryEntry> entry
+        let key = unbox<string> pair.Key
+        if key.Length > 0 && key.IndexOf '=' < 0 then
+            variables.[key] <- unbox<string> pair.Value
+    variables
 
-    for entry in current.Keys do
-        let key = entry :?> string
-
-        if key.Length > 0 && key.IndexOf '=' < 0 && not (desired.ContainsKey key) then
+let private applyEnvironment (current: Dictionary<string, string>) (desired: Dictionary<string, string>) =
+    for key in current.Keys do
+        if not (desired.ContainsKey key) then
             Environment.SetEnvironmentVariable(key, null, EnvironmentVariableTarget.Process)
 
-    for key, value in snapshot do
-        Environment.SetEnvironmentVariable(key, value, EnvironmentVariableTarget.Process)
+    for KeyValue(key, value) in desired do
+        match current.TryGetValue key with
+        | true, existing when String.Equals(existing, value, StringComparison.Ordinal) -> ()
+        | _ -> Environment.SetEnvironmentVariable(key, value, EnvironmentVariableTarget.Process)
 
-let private environmentEquals (left: (string * string)[]) (right: (string * string)[]) =
-    if left.Length <> right.Length then
-        false
-    else
-        let map = Dictionary<string, string>(environmentComparer)
-
-        for key, value in left do
-            map.[key] <- value
-
-        right
-        |> Array.forall (fun (key, value) ->
-            match map.TryGetValue key with
-            | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
-            | _ -> false)
-
-// Process working directory and environment are OS-global. Runs that need the same
-// (directory, environment) share one epoch and execute concurrently; a run that needs a
-// different epoch waits for all active runs before transitioning. FSI's #cd only updates
-// per-session compiler state, so script directories do not need to be part of the key.
 type private ProcessStateGate() =
     let sync = obj ()
     let daemonDirectory = Directory.GetCurrentDirectory()
-    let daemonEnvironment = environmentSnapshot ()
     let mutable activeRuns = 0
+    let mutable activeFilePreludes = 0
+    let mutable lastExit = Environment.TickCount64
     let mutable currentDirectory = daemonDirectory
-    let mutable currentEnvironment = daemonEnvironment
+    let daemonBaseline = readProcessEnvironment ()
+    let mutable currentEnvironment = daemonBaseline
+
+    let matchesEnvironment (environment: (string * string)[]) =
+        currentEnvironment.Count = environment.Length
+        && (environment |> Array.forall (fun (key, value) ->
+            match currentEnvironment.TryGetValue key with
+            | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
+            | _ -> false))
 
     member _.Enter(directory: string, environment: (string * string)[]) =
         lock sync (fun () ->
-            let matches () =
-                currentDirectory = directory && environmentEquals currentEnvironment environment
-
-            while activeRuns > 0 && not (matches ()) do
+            while activeFilePreludes > 0
+                  || (activeRuns > 0 && (currentDirectory <> directory || not (matchesEnvironment environment))) do
                 Monitor.Wait sync |> ignore
 
             if activeRuns = 0 then
-                Directory.SetCurrentDirectory directory
-                applyEnvironment environment
+                if not (String.Equals(Directory.GetCurrentDirectory(), directory, StringComparison.Ordinal)) then
+                    Directory.SetCurrentDirectory directory
                 currentDirectory <- directory
-                currentEnvironment <- environment
+                if not (matchesEnvironment environment) then
+                    currentEnvironment <- environmentMap environment
+
+                // Script code can mutate process variables without updating the cached request map.
+                applyEnvironment (readProcessEnvironment ()) currentEnvironment
 
             activeRuns <- activeRuns + 1)
 
     member _.Exit() =
         lock sync (fun () ->
             activeRuns <- activeRuns - 1
+            lastExit <- Environment.TickCount64
 
             if activeRuns = 0 then
-                applyEnvironment daemonEnvironment
+                try
+                    Directory.SetCurrentDirectory daemonDirectory
+                    currentDirectory <- daemonDirectory
+                finally
+                    Monitor.PulseAll sync)
+
+    member _.EnterFilePreludeBlocking() =
+        lock sync (fun () ->
+            while activeRuns > 0 || activeFilePreludes > 0 do
+                Monitor.Wait sync |> ignore
+
+            if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
                 Directory.SetCurrentDirectory daemonDirectory
+            currentDirectory <- daemonDirectory
+            applyEnvironment (readProcessEnvironment ()) daemonBaseline
+            currentEnvironment <- daemonBaseline
+            activeFilePreludes <- 1)
+
+    member _.TryEnterFilePrelude() =
+        lock sync (fun () ->
+            if activeRuns = 0 && activeFilePreludes = 0 then
+                if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
+                    Directory.SetCurrentDirectory daemonDirectory
                 currentDirectory <- daemonDirectory
-                currentEnvironment <- daemonEnvironment
+                applyEnvironment (readProcessEnvironment ()) daemonBaseline
+                currentEnvironment <- daemonBaseline
+                activeFilePreludes <- 1
+                true
+            else
+                false)
+
+    member _.ExitFilePrelude() =
+        lock sync (fun () ->
+            activeFilePreludes <- activeFilePreludes - 1
+            try
+                if activeRuns = 0 && activeFilePreludes = 0 then
+                    Directory.SetCurrentDirectory daemonDirectory
+                    currentDirectory <- daemonDirectory
+            finally
                 Monitor.PulseAll sync)
 
+    member _.CanEnterFilePreludeNow() =
+        lock sync (fun () -> activeRuns = 0 && activeFilePreludes = 0)
+
+    member _.EnsureBaselineWhenIdle(isFilePrelude: bool) =
+        lock sync (fun () ->
+            if activeRuns = 0 && (isFilePrelude || activeFilePreludes = 0) then
+                if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
+                    Directory.SetCurrentDirectory daemonDirectory
+                currentDirectory <- daemonDirectory
+                applyEnvironment (readProcessEnvironment ()) daemonBaseline
+                currentEnvironment <- daemonBaseline)
+    member _.RespawnEnvironment() =
+        daemonBaseline |> Seq.map (fun (KeyValue(key, value)) -> key, value) |> Seq.toArray
+
+    member _.IsQuiet(quietMs: int64) =
+        lock sync (fun () -> activeRuns = 0 && activeFilePreludes = 0 && Environment.TickCount64 - lastExit >= quietMs)
+
+    member _.IsRunsQuiet(quietMs: int64) =
+        lock sync (fun () -> activeRuns = 0 && Environment.TickCount64 - lastExit >= quietMs)
+
+type private PreludePool(spec: Prelude.Spec, tag: Prelude.Tag) =
+    member _.Spec = spec
+    member val Tag = tag with get, set
+    member val Warm = Queue<WarmSession>()
+    member val Failure: string option = None with get, set
+    member val Claimers = 0 with get, set
+    member val WarmupWaiters = 0 with get, set
+    member val Publishing = false with get, set
+exception private PreludeEvaluationFailure of attemptedTag: Prelude.Tag * inner: exn
+
 type SessionHost(options: SessionHostOptions) =
-    let targetPoolSize = max 0 options.PoolSize
-    let pool = ConcurrentQueue<WarmSession>()
+    let targetPoolSize = if options.Oneshot then 1 else max 0 options.PoolSize
+    let poolGate = obj ()
+    let pools = ResizeArray<PreludePool>()
+    let mutable desiredSpec = options.Prelude
+    let mutable claimWaiters = 0
+    let mutable ensureWarmActive = 0
+    let mutable sessionsCreated = 0
     let creationGate = new SemaphoreSlim(1, 1)
     let replenishSignal = new SemaphoreSlim(0)
     let pendingCleanups = ConcurrentQueue<CleanupWork>()
@@ -668,38 +1325,42 @@ type SessionHost(options: SessionHostOptions) =
     let processState = ProcessStateGate()
     let coldClaims = ref 0
     let executed = ref 0
-    let mutable pendingCreations = 0
-    let mutable stopped = false
-
+    let logDetail message = options.LogPath |> Option.iter (fun _ -> Log.info options.LogPath message)
     let evaluateUserPrelude (session: FsiEvaluationSession) (path: string) : Prelude.Tag * string =
         match Prelude.readAndHashFile path with
-        | None -> failwith ("configured prelude file could not be read: " + path)
+        | None ->
+            let missingTag = Prelude.Tag.File(Path.GetFullPath path, "unreadable")
+            raise (PreludeEvaluationFailure(missingTag, InvalidOperationException("configured prelude file could not be read: " + path)))
         | Some (text, contentHash) ->
-            let directory =
-                match Path.GetDirectoryName path with
-                | null | "" -> AppContext.BaseDirectory
-                | directory -> directory
+            let exactTag = Prelude.Tag.File(Path.GetFullPath path, contentHash)
+            try
+                let directory =
+                    match Path.GetDirectoryName path with
+                    | null | "" -> AppContext.BaseDirectory
+                    | directory -> directory
 
-            session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
-            match NugetCache.prepare text directory path with
-            | Some plan ->
-                session.EvalInteraction(NugetCache.referenceBlock plan, "fsion-prelude-refs.fsx")
-                session.EvalInteraction(plan.RewrittenSource + "\n()", path)
-            | None -> session.EvalInteraction(text + "\n()", path)
+                session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
+                match NugetCache.prepare text directory path with
+                | Some plan ->
+                    session.EvalInteraction(NugetCache.referenceBlock plan, "fsion-prelude-refs.fsx")
+                    session.EvalInteraction(plan.RewrittenSource + "\n()", path)
+                | None -> session.EvalInteraction(text + "\n()", path)
 
-            let trackedDirectory =
-                if mayMutateCompilerDirectory text then "" else directory
+                let trackedDirectory =
+                    if mayMutateCompilerDirectory text then "" else directory
 
-            Prelude.Tag.File(path, contentHash), trackedDirectory
-    let releaseSession (claimed: WarmSession) =
+                exactTag, trackedDirectory
+            with ex ->
+                raise (PreludeEvaluationFailure(exactTag, ex))
+    let prepareCleanupWork (claimed: WarmSession) : CleanupWork =
         match claimed.Session with
-        | Some session -> clearScriptStatics session.DynamicAssemblies
+        | Some session -> clearScriptStatics claimed.PreludeTypes session.DynamicAssemblies
         | None -> ()
 
         clearCompilerAsyncLocals ()
-        sweepTransientFinalizers ()
+        claimed.PreludeTypes.Clear()
 
-        pendingCleanups.Enqueue
+        let work =
             { Session = claimed.Session
               ProcessExitHandlers = claimed.ProcessExitHandlers
               UnmanagedDllHandlers = claimed.UnmanagedDllHandlers
@@ -711,11 +1372,146 @@ type SessionHost(options: SessionHostOptions) =
         claimed.ExitedProperty <- None
         claimed.ExitCodeProperty <- None
         claimed.CancellationTokenProperty <- None
+        claimed.SetCompilerDirectory <- None
         claimed.ProcessExitHandlers <- [||]
         claimed.UnmanagedDllHandlers <- [||]
         claimed.AssemblyResolveHandlers <- [||]
+        work
+    let removeHandlers (work: CleanupWork) =
+        removeProcessExit work.ProcessExitHandlers
+        removeUnmanagedDll work.UnmanagedDllHandlers
+        removeAssemblyResolve work.AssemblyResolveHandlers
 
-    let createWarmSession (spec: Prelude.Spec) : WarmSession =
+    let releasedGate = obj ()
+
+    let drainReleasedSessions () =
+        lock releasedGate (fun () ->
+            let survivors = ResizeArray<WeakReference>()
+            let mutable weak = Unchecked.defaultof<WeakReference>
+
+            while releasedSessions.TryDequeue(&weak) do
+                if weak.IsAlive then
+                    survivors.Add weak
+
+            for survivor in survivors do
+                releasedSessions.Enqueue survivor
+
+            survivors.Count)
+
+    let mutable totalReleased = 0
+    let mutable pendingUnloadPhase1 = 0
+    let mutable pendingUnloadPhase2 = 0
+
+    let disposePendingCleanups () =
+        let mutable work = Unchecked.defaultof<CleanupWork>
+        let mutable drained = 0
+
+        while pendingCleanups.TryDequeue(&work) do
+            drained <- drained + 1
+
+            match work.Session with
+            | Some session ->
+                detachSessionCallback session
+                clearCheckerCaches session
+                lock releasedGate (fun () -> releasedSessions.Enqueue(WeakReference(session)))
+
+                try
+                    (session :> IDisposable).Dispose()
+                with _ ->
+                    ()
+            | None -> ()
+
+            removeHandlers work
+
+        drained
+
+    let completeUnloadSweep (forceSweep: bool) =
+        let isQuietNow () = forceSweep || (Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L)
+        let phase1 = Interlocked.Exchange(&pendingUnloadPhase1, 0)
+        if phase1 > 0 then
+            if isQuietNow () then
+                GC.Collect(2, GCCollectionMode.Forced, true, false)
+                GC.WaitForPendingFinalizers()
+                Interlocked.Add(&pendingUnloadPhase2, phase1) |> ignore
+            else
+                Interlocked.Add(&pendingUnloadPhase1, phase1) |> ignore
+
+        let phase2 = Interlocked.Exchange(&pendingUnloadPhase2, 0)
+        if phase2 > 0 then
+            if isQuietNow () then
+                GC.Collect(2, GCCollectionMode.Forced, true, false)
+                let alive = drainReleasedSessions ()
+                let cumulative = Interlocked.Add(&totalReleased, phase2)
+                logDetail ($"unload released={cumulative} alive={alive}")
+            else
+                Interlocked.Add(&pendingUnloadPhase2, phase2) |> ignore
+
+    let drainCleanups () =
+        let mutable forceSweep = false
+        if not pendingCleanups.IsEmpty then
+            let acquired =
+                if pendingCleanups.Count >= 16 then
+                    creationGate.Wait()
+                    true
+                else
+                    creationGate.Wait 0
+
+            if acquired then
+                try
+                    if pendingCleanups.Count >= 16 then
+                        forceSweep <- true
+                        let drained = disposePendingCleanups ()
+                        if drained > 0 then
+                            Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
+                    elif Volatile.Read(&claimWaiters) = 0 && processState.IsQuiet 500L then
+                        let drained = disposePendingCleanups ()
+                        if drained > 0 then
+                            Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
+                finally
+                    creationGate.Release() |> ignore
+
+        if Volatile.Read(&pendingUnloadPhase1) > 0 || Volatile.Read(&pendingUnloadPhase2) > 0 then
+            completeUnloadSweep forceSweep
+
+    let drainCleanupsBlocking () =
+        creationGate.Wait()
+
+        try
+            let drained = disposePendingCleanups ()
+            if drained > 0 then
+                Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
+        finally
+            creationGate.Release() |> ignore
+
+        completeUnloadSweep true
+
+    let cleanupBackpressureGate = new SemaphoreSlim(1, 1)
+
+    let enqueueCleanupAndDrainIfCapped (claimed: WarmSession) =
+        let work = prepareCleanupWork claimed
+        cleanupBackpressureGate.Wait()
+        try
+            if pendingCleanups.Count >= 15 then
+                creationGate.Wait()
+                try
+                    pendingCleanups.Enqueue work
+                    let drained = disposePendingCleanups ()
+                    if drained > 0 then
+                        Interlocked.Add(&pendingUnloadPhase1, drained) |> ignore
+                finally
+                    creationGate.Release() |> ignore
+                completeUnloadSweep true
+            else
+                pendingCleanups.Enqueue work
+        finally
+            cleanupBackpressureGate.Release() |> ignore
+
+    let releaseSessionWith winHandlesBefore posixFdsBefore collectionsBefore (claimed: WarmSession) =
+        enqueueCleanupAndDrainIfCapped claimed
+        sweepTransientFinalizers winHandlesBefore posixFdsBefore collectionsBefore
+    let releaseSession = releaseSessionWith ValueNone ValueNone ValueNone
+    let createWarmSession (failedWarmOut: WarmSession option ref) (spec: Prelude.Spec) : WarmSession =
+        processState.EnsureBaselineWhenIdle(match spec with Prelude.Spec.File _ -> true | _ -> false)
         let processExitBefore = processExitSnapshot ()
         let unmanagedDllBefore = unmanagedDllSnapshot ()
         let assemblyResolveBefore = assemblyResolveSnapshot ()
@@ -732,6 +1528,8 @@ type SessionHost(options: SessionHostOptions) =
                 collectible = true
             )
 
+        let created = Interlocked.Increment(&sessionsCreated)
+        logDetail ("session-created total=" + string created)
         let processExitHandlers = addedHandlers processExitBefore (processExitSnapshot ())
         let unmanagedDllHandlers = addedHandlers unmanagedDllBefore (unmanagedDllSnapshot ())
         let assemblyResolveHandlers = addedHandlers assemblyResolveBefore (assemblyResolveSnapshot ())
@@ -747,32 +1545,40 @@ type SessionHost(options: SessionHostOptions) =
             let creationOut = new StringWriter()
             let creationErr = new StringWriter()
             Ambient.set { Out = creationOut; Error = creationErr; In = TextReader.Null }
-            let mutable preludeTag = Prelude.Tag.Builtin
-            let mutable compilerDirectory = ""
-
-            try
+            let preludeTag, compilerDirectory =
                 try
-                    match spec with
-                    | Prelude.Spec.Bare ->
-                        session.EvalInteraction(prelude exitMarker)
-                        preludeTag <- Prelude.Tag.Bare
-                    | Prelude.Spec.Builtin ->
-                        session.EvalInteraction(prelude exitMarker + builtinPrelude)
-                        preludeTag <- Prelude.Tag.Builtin
-                    | Prelude.Spec.File path ->
-                        session.EvalInteraction(prelude exitMarker + builtinPrelude)
-                        let fileTag, fileDirectory = evaluateUserPrelude session path
-                        preludeTag <- fileTag
-                        compilerDirectory <- fileDirectory
-                with :? FsiCompilationException ->
-                    let diagnostics = creationErr.ToString()
+                    try
+                        match spec with
+                        | Prelude.Spec.Bare ->
+                            session.EvalInteraction(prelude exitMarker)
+                            WinHandleTable.recordBuiltinWarmBaseline ()
+                            Prelude.Tag.Bare, ""
+                        | Prelude.Spec.Builtin ->
+                            session.EvalInteraction(prelude exitMarker + builtinPrelude)
+                            WinHandleTable.recordBuiltinWarmBaseline ()
+                            Prelude.Tag.Builtin, ""
+                        | Prelude.Spec.File path ->
+                            session.EvalInteraction(prelude exitMarker + builtinPrelude)
+                            WinHandleTable.recordBuiltinWarmBaseline ()
+                            evaluateUserPrelude session path
+                    with
+                    | PreludeEvaluationFailure (exactTag, (:? FsiCompilationException as compEx)) ->
+                        let diagnostics = creationErr.ToString()
+                        let wrapped =
+                            if diagnostics.Trim().Length = 0 then
+                                compEx :> exn
+                            else
+                                Exception("configured prelude did not compile:" + Environment.NewLine + diagnostics)
+                        raise (PreludeEvaluationFailure(exactTag, wrapped))
+                    | :? FsiCompilationException ->
+                        let diagnostics = creationErr.ToString()
 
-                    if diagnostics.Trim().Length = 0 then
-                        reraise ()
-                    else
-                        failwith ("configured prelude did not compile:" + Environment.NewLine + diagnostics)
-            finally
-                Ambient.clear ()
+                        if diagnostics.Trim().Length = 0 then
+                            reraise ()
+                        else
+                            failwith ("configured prelude did not compile:" + Environment.NewLine + diagnostics)
+                finally
+                    Ambient.clear ()
 
             let state =
                 match session.TryFindBoundValue "fsionFsiState" with
@@ -789,108 +1595,210 @@ type SessionHost(options: SessionHostOptions) =
             warm.ExitMarker <- exitMarker
             warm.Prelude <- preludeTag
             warm.CompilerDirectory <- compilerDirectory
+            if not (isNull tcConfigBField) then
+                let builder = tcConfigBField.GetValue session
+                let property = builder.GetType().GetProperty("implicitIncludeDir", BindingFlags.Instance ||| BindingFlags.Public ||| BindingFlags.NonPublic)
+                if not (isNull property) && property.CanWrite then
+                    warm.CompilerDirectory <- property.GetValue builder :?> string
+                    warm.SetCompilerDirectory <- Some(fun directory -> property.SetValue(builder, directory))
+            match spec with
+            | Prelude.Spec.File _ -> ()
+            | _ ->
+                for assembly in session.DynamicAssemblies do
+                    warm.PreludeTypes.UnionWith(assembly.GetTypes())
             succeeded <- true
             warm
         finally
             if not succeeded then
-                releaseSession warm
-                replenishSignal.Release() |> ignore
-    let desiredGate = obj ()
-    let mutable desiredSpec = options.Prelude
-    let mutable failedTag: Prelude.Tag option = None
-    let mutable failedError: string option = None
+                failedWarmOut.Value <- Some warm
+    let tagOfSpec spec = Prelude.tagOfSpec spec
 
-    let rec claimSession (tag: Prelude.Tag) (cancelToken: CancellationToken) : WarmSession =
-        match pool.TryDequeue() with
-        | true, warm when warm.Prelude = tag -> warm
-        | true, warm ->
-            releaseSession warm
-            claimSession tag cancelToken
-        | _ ->
-            Interlocked.Increment(&coldClaims.contents) |> ignore
-            creationGate.Wait(cancelToken)
+    let discard = ConcurrentQueue<WarmSession>()
 
-            let created =
-                try
-                    createWarmSession (Prelude.specOfTag tag)
-                finally
-                    creationGate.Release() |> ignore
+    let clearPool (slot: PreludePool) =
+        while slot.Warm.Count > 0 do
+            discard.Enqueue(slot.Warm.Dequeue())
 
-            let cleared =
-                lock desiredGate (fun () ->
-                    if failedTag.IsSome then
-                        failedTag <- None
-                        failedError <- None
-                        true
+    let refreshTagWith tag (slot: PreludePool) =
+        if slot.Tag <> tag then
+            clearPool slot
+            slot.Tag <- tag
+            slot.Failure <- None
+        tag
+
+    let trimExcessPools () =
+        while pools.Count > 2 && pools.Exists(fun candidate -> candidate.Claimers = 0) do
+            let mutable evictIdx = -1
+            let mutable idx = 0
+            while idx < pools.Count && evictIdx < 0 do
+                if pools.[idx].Claimers = 0 && pools.[idx].Spec <> desiredSpec then
+                    evictIdx <- idx
+                idx <- idx + 1
+            if evictIdx < 0 then
+                evictIdx <- pools.FindIndex(fun candidate -> candidate.Claimers = 0)
+            let evicted = pools.[evictIdx]
+            clearPool evicted
+            pools.RemoveAt evictIdx
+
+    let activateSpec spec =
+        let tag = tagOfSpec spec
+        lock poolGate (fun () ->
+            desiredSpec <- spec
+            let index = pools.FindIndex(fun slot -> slot.Spec = spec)
+            let slot =
+                if index >= 0 then
+                    let existing = pools.[index]
+                    pools.RemoveAt index
+                    existing
+                else
+                    PreludePool(spec, tag)
+            pools.Add slot
+            trimExcessPools ()
+            slot, refreshTagWith tag slot)
+    let poolCount () = lock poolGate (fun () -> pools |> Seq.sumBy (fun slot -> slot.Warm.Count))
+
+    let claimSession (spec: Prelude.Spec) (cancelToken: CancellationToken) : WarmSession =
+        let initialTag = tagOfSpec spec
+        let slot =
+            lock poolGate (fun () ->
+                desiredSpec <- spec
+                let index = pools.FindIndex(fun candidate -> candidate.Spec = spec)
+                let resolved =
+                    if index >= 0 then
+                        let existing = pools.[index]
+                        pools.RemoveAt index
+                        existing
                     else
-                        false)
-
-            if cleared then
-                replenishSignal.Release() |> ignore
-
-            created
-
-    let removeHandlers (work: CleanupWork) =
-        removeProcessExit work.ProcessExitHandlers
-        removeUnmanagedDll work.UnmanagedDllHandlers
-        removeAssemblyResolve work.AssemblyResolveHandlers
-
-    let drainReleasedSessions () =
-        let survivors = ResizeArray<WeakReference>()
-        let mutable weak = Unchecked.defaultof<WeakReference>
-
-        while releasedSessions.TryDequeue(&weak) do
-            if weak.IsAlive then
-                survivors.Add weak
-
-        for survivor in survivors do
-            releasedSessions.Enqueue survivor
-
-        survivors.Count
-
-    let drainPendingCleanups () =
-        let mutable work = Unchecked.defaultof<CleanupWork>
-        let mutable drained = 0
-
-        while pendingCleanups.TryDequeue(&work) do
-            drained <- drained + 1
-
-            match work.Session with
-            | Some session ->
-                detachSessionCallback session
-                clearCheckerCaches session
-                releasedSessions.Enqueue(WeakReference(session))
-
-                try
-                    (session :> IDisposable).Dispose()
-                with _ ->
-                    ()
-            | None -> ()
-
-            removeHandlers work
-
-        if drained > 0 then
-            sweepFinalizers ()
-            drainReleasedSessions () |> ignore
-
-    // Handler removal and collectible-session disposal need creationGate so delegate adds and
-    // removes never interleave, but a run must not stall behind a slow background session
-    // creation. The replenisher drains this queue after refilling the warm pool (it runs with
-    // --pool-size 0 too), and Metrics drains it before sampling.
-    let drainCleanups () =
-        if creationGate.Wait 0 then
-            try
-                drainPendingCleanups ()
-            finally
-                creationGate.Release() |> ignore
-
-    let drainCleanupsBlocking () =
-        creationGate.Wait()
+                        PreludePool(spec, initialTag)
+                pools.Add resolved
+                resolved.Claimers <- resolved.Claimers + 1
+                trimExcessPools ()
+                resolved)
 
         try
-            drainPendingCleanups ()
+            let tryClaimOutsideGate (knownTag: Prelude.Tag voption) =
+                let hasCandidates = lock poolGate (fun () -> slot.Warm.Count > 0)
+                if not hasCandidates then
+                    None
+                else
+                    let tag =
+                        match knownTag with
+                        | ValueSome existing -> existing
+                        | ValueNone -> tagOfSpec slot.Spec
+                    lock poolGate (fun () ->
+                        refreshTagWith tag slot |> ignore
+                        if slot.Warm.Count = 0 then None else Some(slot.Warm.Dequeue()))
+
+            match tryClaimOutsideGate (ValueSome initialTag) with
+            | Some warm -> warm
+            | None ->
+                Interlocked.Increment(&claimWaiters) |> ignore
+                try
+                    logDetail "session-claim waiting"
+                    let mutable claimedOpt = None
+                    while claimedOpt.IsNone do
+                        match tryClaimOutsideGate ValueNone with
+                        | Some warm -> claimedOpt <- Some warm
+                        | None ->
+                            let failedWarm = ref None
+                            try
+                                creationGate.Wait(cancelToken)
+                                let mutable releaseCreationGate = true
+                                try
+                                    let hasWarmOrPublishing =
+                                        lock poolGate (fun () -> slot.Warm.Count > 0 || slot.Publishing)
+                                    if hasWarmOrPublishing then
+                                        // Either a warm session is already queued or replenish is finalizing
+                                        // a ready session's disk tag check outside creationGate; release the
+                                        // global gate and re-check so we never perform duplicate cold compilation.
+                                        let waitPublishing = lock poolGate (fun () -> slot.Warm.Count = 0 && slot.Publishing)
+                                        creationGate.Release() |> ignore
+                                        releaseCreationGate <- false
+                                        if waitPublishing then
+                                            Thread.Sleep 5
+                                    else
+                                        let createCold (releaseFilePrelude: unit -> unit) =
+                                            Interlocked.Increment(&coldClaims.contents) |> ignore
+                                            let mutable coldOutcome: Choice<WarmSession, Prelude.Tag * exn, exn> voption = ValueNone
+                                            try
+                                                let warm = createWarmSession failedWarm slot.Spec
+                                                coldOutcome <- ValueSome(Choice1Of3 warm)
+                                            with
+                                            | PreludeEvaluationFailure (exactTag, inner) ->
+                                                coldOutcome <- ValueSome(Choice2Of3(exactTag, inner))
+                                            | ex ->
+                                                coldOutcome <- ValueSome(Choice3Of3 ex)
+
+                                            releaseFilePrelude ()
+                                            creationGate.Release() |> ignore
+                                            releaseCreationGate <- false
+                                            match coldOutcome with
+                                            | ValueNone -> ()
+                                            | ValueSome(Choice1Of3 warm) ->
+                                                lock poolGate (fun () ->
+                                                    if refreshTagWith warm.Prelude slot = warm.Prelude then
+                                                        slot.Failure <- None)
+                                                claimedOpt <- Some warm
+                                            | ValueSome(Choice2Of3(exactTag, inner)) ->
+                                                let currentTag = tagOfSpec slot.Spec
+                                                lock poolGate (fun () ->
+                                                    if refreshTagWith currentTag slot = exactTag then
+                                                        slot.Failure <- Some inner.Message)
+                                                raise inner
+                                            | ValueSome(Choice3Of3 ex) ->
+                                                let fallbackTag = tagOfSpec slot.Spec
+                                                lock poolGate (fun () ->
+                                                    if refreshTagWith fallbackTag slot = fallbackTag then
+                                                        slot.Failure <- Some ex.Message)
+                                                raise ex
+                                        let canCreateNow =
+                                            match slot.Spec with
+                                            | Prelude.Spec.File _ -> processState.TryEnterFilePrelude()
+                                            | _ -> true
+                                        let mutable filePreludeEntered = false
+                                        let exitFilePreludeIfHeld () =
+                                            if filePreludeEntered then
+                                                filePreludeEntered <- false
+                                                processState.ExitFilePrelude()
+                                        if not canCreateNow then
+                                            creationGate.Release() |> ignore
+                                            releaseCreationGate <- false
+                                            processState.EnterFilePreludeBlocking()
+                                            filePreludeEntered <- true
+                                            try
+                                                creationGate.Wait(cancelToken)
+                                                releaseCreationGate <- true
+                                                if not (lock poolGate (fun () -> slot.Warm.Count > 0)) then
+                                                    createCold exitFilePreludeIfHeld
+                                            finally
+                                                exitFilePreludeIfHeld ()
+                                        else
+                                            filePreludeEntered <-
+                                                match slot.Spec with
+                                                | Prelude.Spec.File _ -> true
+                                                | _ -> false
+                                            try
+                                                createCold exitFilePreludeIfHeld
+                                            finally
+                                                exitFilePreludeIfHeld ()
+                                finally
+                                    if releaseCreationGate then
+                                        creationGate.Release() |> ignore
+                            finally
+                                match failedWarm.Value with
+                                | Some failed ->
+                                    try
+                                        releaseSession failed
+                                    finally
+                                        if not options.Oneshot then replenishSignal.Release() |> ignore
+                                | None -> ()
+                    claimedOpt.Value
+                finally
+                    Interlocked.Decrement(&claimWaiters) |> ignore
         finally
-            creationGate.Release() |> ignore
+            lock poolGate (fun () ->
+                slot.Claimers <- slot.Claimers - 1
+                trimExcessPools ())
 
     let stripLeadingBom (text: string) =
         if text.Length > 0 && text.[0] = '\uFEFF' then text.Substring 1 else text
@@ -959,7 +1867,9 @@ type SessionHost(options: SessionHostOptions) =
 
         let changeDirectory (directory: string) =
             if not (String.Equals(claimed.CompilerDirectory, directory, StringComparison.Ordinal)) then
-                session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
+                match claimed.SetCompilerDirectory with
+                | Some setDirectory when Path.IsPathFullyQualified directory && Directory.Exists directory -> setDirectory directory
+                | _ -> session.EvalInteraction("#cd @\"" + Prelude.escapeVerbatim directory + "\"")
                 claimed.CompilerDirectory <- directory
 
         let escapedSource = request.Source.Replace("\"", "\"\"")
@@ -1033,14 +1943,13 @@ type SessionHost(options: SessionHostOptions) =
                     // FCS `EvalInteraction` returns without throwing on syntax/indentation errors (printing
                     // `): error FSxxxx:` without emitting any CLR types), whereas warning-only empty/stray-`;`
                     // interactions print only `warning FSxxxx:` and must stay exit 0.
-                    if emittedTypeCount () = typesBeforeCurrentEval then
-                        let errAfter = errWriter.SafeText()
-
-                        if
-                            errAfter.Length > errLenBefore
-                            && errAfter.IndexOf("): error FS", errLenBefore, StringComparison.Ordinal) >= 0
-                        then
-                            raise (FsiCompilationException("compile error", None))
+                    let errAfter = errWriter.SafeText()
+                    if
+                        errAfter.Length > errLenBefore
+                        && errAfter.IndexOf("): error FS", errLenBefore, StringComparison.Ordinal) >= 0
+                        && emittedTypeCount () = typesBeforeCurrentEval
+                    then
+                        raise (FsiCompilationException("compile error", None))
             finally
                 if mayMutateCompilerDirectory code then
                     claimed.CompilerDirectory <- ""
@@ -1162,6 +2071,7 @@ type SessionHost(options: SessionHostOptions) =
                 lock namedGate (fun () ->
                     [ for KeyValue(sessionId, entry) in namedSessions -> sessionId, entry ])
 
+            let mutable evictedAny = false
             for sessionId, entry in snapshot do
                 let expired () =
                     not entry.Evicted
@@ -1171,6 +2081,7 @@ type SessionHost(options: SessionHostOptions) =
                     try
                         if expired () then
                             entry.Evicted <- true
+                            evictedAny <- true
 
                             lock namedGate (fun () ->
                                 match namedSessions.TryGetValue sessionId with
@@ -1179,165 +2090,326 @@ type SessionHost(options: SessionHostOptions) =
                                 | _ -> ())
 
                             match entry.Session with
-                            | Some warm -> releaseSession warm
+                            | Some warm -> enqueueCleanupAndDrainIfCapped warm
                             | None -> ()
 
                             entry.Session <- None
                     finally
                         entry.Gate.Release() |> ignore
-
-    let setDesiredSpec (spec: Prelude.Spec) =
-        let changed =
-            lock desiredGate (fun () ->
-                if desiredSpec = spec then
-                    false
-                else
-                    desiredSpec <- spec
-                    failedTag <- None
-                    failedError <- None
-                    true)
-
-        if changed then
-            replenishSignal.Release() |> ignore
-
-    let recycleStalePoolSessions () =
-        let current = lock desiredGate (fun () -> Prelude.tagOfSpec desiredSpec)
-        let retained = ResizeArray<WarmSession>()
-        let mutable warm = Unchecked.defaultof<WarmSession>
-
-        while pool.TryDequeue(&warm) do
-            if warm.Prelude = current then
-                retained.Add warm
-            else
-                try
-                    releaseSession warm
-                with ex ->
-                    Log.error None ("replenisher failed to release a stale warm session: " + ex.Message)
-
-        for warm in retained do
-            pool.Enqueue warm
+            if evictedAny then
+                replenishSignal.Release() |> ignore
+    let drainDiscarded () =
+        let mutable stale = Unchecked.defaultof<WarmSession>
+        while discard.TryDequeue(&stale) do
+            enqueueCleanupAndDrainIfCapped stale
 
     let replenish () =
-        while not stopped do
-            replenishSignal.Wait 250 |> ignore
-            recycleStalePoolSessions ()
+        while true do
+            replenishSignal.Wait 125 |> ignore
+            drainDiscarded ()
+            drainCleanups ()
 
-            let mutable working = true
-
-            while working && not stopped do
-                let spec, currentTag, skipBroken =
-                    lock desiredGate (fun () ->
-                        let tag = Prelude.tagOfSpec desiredSpec
-                        desiredSpec, tag, failedTag = Some tag)
-
-                if not skipBroken && pool.Count + pendingCreations < targetPoolSize then
-                    pendingCreations <- pendingCreations + 1
-
-                    let created =
+            let mutable filling = targetPoolSize > 0
+            while filling
+                  && Volatile.Read(&claimWaiters) = 0
+                  && (Volatile.Read(&ensureWarmActive) > 0 || processState.IsQuiet 250L) do
+                let quietIdle = processState.IsQuiet 250L
+                let next =
+                    let snapshot =
+                        lock poolGate (fun () ->
+                            [| for candidate in pools do
+                                   if quietIdle || candidate.WarmupWaiters > 0 then
+                                       yield candidate |])
+                    let tags = [| for candidate in snapshot -> candidate, tagOfSpec candidate.Spec |]
+                    lock poolGate (fun () ->
+                        for candidate, tag in tags do
+                            if pools.Contains candidate then
+                                refreshTagWith tag candidate |> ignore
+                        let quietNow = processState.IsQuiet 250L
+                        pools
+                        |> Seq.rev
+                        |> Seq.filter (fun slot ->
+                            slot.Failure.IsNone
+                            && slot.Warm.Count < targetPoolSize
+                            && (quietNow || slot.WarmupWaiters > 0)
+                            && (match slot.Spec with
+                                | Prelude.Spec.File _ ->
+                                    (slot.Spec = desiredSpec || slot.WarmupWaiters > 0)
+                                    && processState.CanEnterFilePreludeNow()
+                                | _ -> true))
+                        |> Seq.sortBy (fun slot -> (if slot.WarmupWaiters > 0 then 0 else 1), slot.Warm.Count)
+                        |> Seq.tryHead
+                        |> Option.map (fun slot -> slot, slot.Tag))
+                match next with
+                | None -> filling <- false
+                | Some (slot, _) ->
+                    let slotEligible () =
+                        processState.IsQuiet 250L || lock poolGate (fun () -> slot.WarmupWaiters > 0)
+                    if Volatile.Read(&claimWaiters) > 0
+                       || not (slotEligible ())
+                       || not (creationGate.Wait 0) then
+                        filling <- false
+                    else
+                        let failedWarm = ref None
+                        let mutable gateHeld = true
+                        let mutable postCompileFailure: (Prelude.Tag voption * string) voption = ValueNone
+                        let stillActive =
+                            lock poolGate (fun () ->
+                                if pools.Contains slot
+                                   && slot.Failure.IsNone
+                                   && slot.Warm.Count < targetPoolSize
+                                   && (processState.IsQuiet 250L || slot.WarmupWaiters > 0) then
+                                    slot.Claimers <- slot.Claimers + 1
+                                    true
+                                else
+                                    false)
+                        let mutable createdWarm: WarmSession voption = ValueNone
                         try
                             try
-                                creationGate.Wait()
+                                if not stillActive || Volatile.Read(&claimWaiters) > 0 then
+                                    filling <- false
+                                else
+                                    let entered =
+                                        match slot.Spec with
+                                        | Prelude.Spec.File _ ->
+                                            if processState.TryEnterFilePrelude() then ValueSome true else ValueNone
+                                        | _ -> ValueSome false
+                                    match entered with
+                                    | ValueNone -> filling <- false
+                                    | ValueSome isFile ->
+                                        try
+                                            try
+                                                let warm = createWarmSession failedWarm slot.Spec
+                                                if processState.IsRunsQuiet 250L then
+                                                    GC.Collect(1, GCCollectionMode.Optimized, false)
+                                                createdWarm <- ValueSome warm
+                                            with
+                                            | PreludeEvaluationFailure (exactTag, inner) ->
+                                                Log.error options.LogPath ("replenisher could not create a warm session: " + inner.Message)
+                                                postCompileFailure <- ValueSome(ValueSome exactTag, inner.Message)
+                                            | ex ->
+                                                Log.error options.LogPath ("replenisher could not create a warm session: " + ex.Message)
+                                                postCompileFailure <- ValueSome(ValueNone, ex.Message)
+                                        finally
+                                            if isFile then
+                                                processState.ExitFilePrelude()
 
-                                try
-                                    let warm = createWarmSession spec
-
-                                    lock desiredGate (fun () ->
-                                        if failedTag = Some currentTag then
-                                            failedTag <- None
-                                            failedError <- None)
-
-                                    Some warm
-                                finally
+                                        match createdWarm with
+                                        | ValueNone -> ()
+                                        | ValueSome warm ->
+                                            // ExitFilePrelude has already run above. Mark `slot.Publishing = true`
+                                            // before releasing `creationGate` so:
+                                            //  1. Unrelated cold claims (e.g. `--no-prelude`) never block behind
+                                            //     file-prelude `tagOfSpec` disk/FUSE I/O;
+                                            //  2. Same-pool claimants wait briefly for this ready session to finish
+                                            //     publishing instead of doing duplicate cold compilation.
+                                            lock poolGate (fun () -> slot.Publishing <- true)
+                                            try
+                                                if gateHeld then
+                                                    gateHeld <- false
+                                                    creationGate.Release() |> ignore
+                                                let liveTag = tagOfSpec slot.Spec
+                                                lock poolGate (fun () ->
+                                                    if pools.Contains slot && refreshTagWith liveTag slot = warm.Prelude then
+                                                        slot.Warm.Enqueue warm
+                                                    else
+                                                        discard.Enqueue warm
+                                                        replenishSignal.Release() |> ignore)
+                                            finally
+                                                lock poolGate (fun () -> slot.Publishing <- false)
+                            finally
+                                if gateHeld then
+                                    gateHeld <- false
                                     creationGate.Release() |> ignore
-                            with ex ->
-                                Log.error None ("replenisher could not create a warm session: " + ex.Message)
-
-                                lock desiredGate (fun () ->
-                                    failedTag <- Some currentTag
-                                    failedError <- Some ex.Message)
-
-                                None
+                            match postCompileFailure with
+                            | ValueNone -> ()
+                            | ValueSome(ValueSome exactTag, message) ->
+                                let currentTag = tagOfSpec slot.Spec
+                                lock poolGate (fun () ->
+                                    if pools.Contains slot && refreshTagWith currentTag slot = exactTag then
+                                        slot.Failure <- Some message
+                                    else
+                                        replenishSignal.Release() |> ignore)
+                            | ValueSome(ValueNone, message) ->
+                                let fallbackTag = tagOfSpec slot.Spec
+                                lock poolGate (fun () ->
+                                    if pools.Contains slot && refreshTagWith fallbackTag slot = fallbackTag then
+                                        slot.Failure <- Some message
+                                    else
+                                        replenishSignal.Release() |> ignore)
                         finally
-                            pendingCreations <- pendingCreations - 1
+                            if stillActive then
+                                lock poolGate (fun () ->
+                                    slot.Claimers <- slot.Claimers - 1
+                                    trimExcessPools ())
+                            match failedWarm.Value with
+                            | Some failed ->
+                                enqueueCleanupAndDrainIfCapped failed
+                                replenishSignal.Release() |> ignore
+                            | None -> ()
+                drainDiscarded ()
+                drainCleanups ()
 
-                    match created with
-                    | Some warm -> pool.Enqueue warm
-                    | None -> working <- false
-                else
-                    working <- false
-
-            if not pendingCleanups.IsEmpty && (pendingCleanups.Count >= 4 || pool.Count >= targetPoolSize || (lock desiredGate (fun () -> failedTag.IsSome))) then
-                try
-                    drainCleanups ()
-                with ex ->
-                    Log.error None ("replenisher failed to drain cleanups: " + ex.Message)
     do
-        Task.Factory.StartNew(replenish, TaskCreationOptions.LongRunning) |> ignore
-        replenishSignal.Release() |> ignore
-        if sessionTtlMs > 0L then
-            let sweepIntervalMs = max 250 (min 5000 (int (sessionTtlMs / 4L)))
+        WinHandleTable.initializeBaseline ()
+        if not options.Oneshot then
+            activateSpec options.Prelude |> ignore
+            Task.Factory.StartNew(replenish, TaskCreationOptions.LongRunning) |> ignore
+            replenishSignal.Release() |> ignore
+            if sessionTtlMs > 0L then
+                let sweepIntervalMs = max 250 (min 5000 (int (sessionTtlMs / 4L)))
+                Task.Factory.StartNew(
+                    (fun () ->
+                        while true do
+                            Thread.Sleep sweepIntervalMs
+                            sweepNamedSessions ()),
+                    TaskCreationOptions.LongRunning
+                )
+                |> ignore
 
-            Task.Factory.StartNew(
-                (fun () ->
-                    while true do
-                        Thread.Sleep sweepIntervalMs
-                        sweepNamedSessions ()),
-                TaskCreationOptions.LongRunning
-            )
-            |> ignore
+    let waitForWarm timeoutMs failOnEvict (expectedTagOpt: Prelude.Tag voption) (slot: PreludePool) =
+        let deadline = Environment.TickCount64 + timeoutMs
+        let state () = lock poolGate (fun () -> slot.Warm.Count, slot.Failure, pools.Contains slot, slot.Tag)
+        let matchesExpected tag =
+            match expectedTagOpt with
+            | ValueSome expected -> tag = expected
+            | ValueNone -> true
+        let mutable count, failure, retained, currentTag = state ()
+        let mutable supersededTag: Prelude.Tag voption = ValueNone
+        let mutable lastDiskCheckMs = Environment.TickCount64
+        while (count < targetPoolSize || not (matchesExpected currentTag))
+              && failure.IsNone
+              && supersededTag.IsNone
+              && retained
+              && Environment.TickCount64 < deadline do
+            let now = Environment.TickCount64
+            let shouldCheckDisk =
+                match expectedTagOpt with
+                | ValueSome expected -> currentTag <> expected || now - lastDiskCheckMs >= 100L
+                | ValueNone -> false
+            if shouldCheckDisk then
+                lastDiskCheckMs <- now
+                match expectedTagOpt with
+                | ValueSome expected ->
+                    let diskTag = tagOfSpec slot.Spec
+                    if diskTag <> expected then
+                        supersededTag <- ValueSome diskTag
+                | ValueNone -> ()
+            if supersededTag.IsNone then
+                if count > 0 && not (matchesExpected currentTag) then
+                    replenishSignal.Release() |> ignore
+                Thread.Sleep 5
+                let nextCount, nextFailure, nextRetained, nextTag = state ()
+                count <- nextCount
+                failure <- nextFailure
+                retained <- nextRetained
+                currentTag <- nextTag
+        if not retained then
+            if failOnEvict then
+                Some "requested prelude pool was evicted during warmup"
+            else
+                None
+        else
+            match supersededTag with
+            | ValueSome diskTag ->
+                lock poolGate (fun () ->
+                    if pools.Contains slot then
+                        refreshTagWith diskTag slot |> ignore)
+                replenishSignal.Release() |> ignore
+                Some "configured prelude changed during warmup; retry warmup"
+            | ValueNone ->
+                match failure with
+                | Some message -> Some message
+                | None when count < targetPoolSize || not (matchesExpected currentTag) ->
+                    Some("timed out waiting for warm session pool to fill within " + string timeoutMs + " ms")
+                | None ->
+                    match expectedTagOpt with
+                    | ValueSome expected ->
+                        let finalDiskTag = tagOfSpec slot.Spec
+                        if finalDiskTag <> expected then
+                            lock poolGate (fun () ->
+                                if pools.Contains slot then
+                                    refreshTagWith finalDiskTag slot |> ignore)
+                            replenishSignal.Release() |> ignore
+                            Some "configured prelude changed during warmup; retry warmup"
+                        else
+                            let stillRetained, finalTag =
+                                lock poolGate (fun () -> pools.Contains slot, slot.Tag)
+                            if not stillRetained then
+                                if failOnEvict then
+                                    Some "requested prelude pool was evicted during warmup"
+                                else
+                                    None
+                            elif finalTag <> expected then
+                                Some "configured prelude changed during warmup; retry warmup"
+                            else
+                                None
+                    | ValueNone -> None
+    member _.DesiredSpec = lock poolGate (fun () -> desiredSpec)
 
-    member _.DesiredSpec = lock desiredGate (fun () -> desiredSpec)
+    member _.RespawnEnvironment() = processState.RespawnEnvironment()
 
     member _.EnsureWarm(spec: Prelude.Spec) =
-        lock desiredGate (fun () ->
-            desiredSpec <- spec
-            failedTag <- None
-            failedError <- None)
-
-        if targetPoolSize > 0 then
-            recycleStalePoolSessions ()
-            drainCleanups ()
-            replenishSignal.Release() |> ignore
-            let deadline = Environment.TickCount64 + 60000L
-            let mutable filling = true
-
-            while filling do
-                let broken =
-                    lock desiredGate (fun () -> failedTag = Some(Prelude.tagOfSpec desiredSpec))
-
-                filling <-
-                    not stopped
-                    && not broken
-                    && pool.Count < targetPoolSize
-                    && Environment.TickCount64 < deadline
-                if filling then
-                    Thread.Sleep 5
-
-            let failure =
-                lock desiredGate (fun () ->
-                    if failedTag = Some(Prelude.tagOfSpec desiredSpec) then
-                        Some(defaultArg failedError "configured prelude failed during warmup")
-                    else
-                        None)
-
-            match failure with
-            | Some message -> failwith message
-            | None -> ()
-        else
-            match spec with
-            | Prelude.Spec.File _ ->
-                creationGate.Wait()
-
-                let probe =
+        if not options.Oneshot then
+            let slot, expectedTag = activateSpec spec
+            lock poolGate (fun () ->
+                slot.Failure <- None
+                if targetPoolSize > 0 then
+                    slot.WarmupWaiters <- slot.WarmupWaiters + 1)
+            if targetPoolSize > 0 then
+                Interlocked.Increment(&ensureWarmActive) |> ignore
+                try
+                    replenishSignal.Release() |> ignore
+                    match waitForWarm 60000L true (ValueSome expectedTag) slot with
+                    | Some message -> failwith message
+                    | None -> ()
+                finally
+                    lock poolGate (fun () -> slot.WarmupWaiters <- slot.WarmupWaiters - 1)
+                    Interlocked.Decrement(&ensureWarmActive) |> ignore
+            else
+                match spec with
+                | Prelude.Spec.File _ ->
+                    let failedWarm = ref None
+                    let mutable probeTag: Prelude.Tag voption = ValueNone
                     try
-                        createWarmSession spec
+                        let probe =
+                            processState.EnterFilePreludeBlocking()
+                            try
+                                creationGate.Wait()
+                                try
+                                    createWarmSession failedWarm spec
+                                finally
+                                    creationGate.Release() |> ignore
+                            finally
+                                processState.ExitFilePrelude()
+                        probeTag <- ValueSome probe.Prelude
+                        try
+                            releaseSession probe
+                        finally
+                            replenishSignal.Release() |> ignore
                     finally
-                        creationGate.Release() |> ignore
+                        match failedWarm.Value with
+                        | Some failed ->
+                            try
+                                releaseSession failed
+                            finally
+                                replenishSignal.Release() |> ignore
+                        | None -> ()
+                    let finalDiskTag = tagOfSpec spec
+                    match probeTag with
+                    | ValueSome evaluatedTag when evaluatedTag = expectedTag && finalDiskTag = expectedTag -> ()
+                    | _ ->
+                        lock poolGate (fun () ->
+                            if pools.Contains slot then
+                                refreshTagWith finalDiskTag slot |> ignore)
+                        failwith "configured prelude changed during warmup; retry warmup"
+                | _ -> ()
 
-                releaseSession probe
-                replenishSignal.Release() |> ignore
-            | _ -> ()
-    member _.IsWarm = pool.Count > 0
+    member _.IsWarm =
+        lock poolGate (fun () ->
+            match pools |> Seq.tryFind (fun slot -> slot.Spec = desiredSpec) with
+            | Some slot -> slot.Warm.Count > 0
+            | None -> false)
 
     member _.ExecutedCount = executed.Value
 
@@ -1395,9 +2467,15 @@ type SessionHost(options: SessionHostOptions) =
                 Some entry
 
         let runInSession (claimed: WarmSession) (stateless: bool) =
+            let started = Stopwatch.GetTimestamp()
+            let mutable evaluateMs = 0.0
+            let mutable collectionsBefore = ValueNone
+            let mutable winHandlesBefore = ValueNone
+            let mutable posixFdsBefore = ValueNone
+            let mutable entered = false
             try
                 processState.Enter(request.WorkingDirectory, request.Environment)
-
+                entered <- true
                 try
                     Ambient.set { Out = outWriter; Error = errWriter; In = TextReader.Null }
 
@@ -1429,9 +2507,15 @@ type SessionHost(options: SessionHostOptions) =
                                     else
                                         Unchecked.defaultof<Timer>
 
+                                if stateless then
+                                    winHandlesBefore <- WinHandleTable.snapshot ()
+                                    posixFdsBefore <- WinHandleTable.posixFdSnapshot ()
+                                    collectionsBefore <- ValueSome(struct (GC.CollectionCount 0, GC.CollectionCount 1))
+                                let evaluateStarted = Stopwatch.GetTimestamp()
                                 let exitCode, diagnostics =
                                     evaluate claimed request prepared outWriter errWriter runCts.Token
 
+                                evaluateMs <- Stopwatch.GetElapsedTime(evaluateStarted).TotalMilliseconds
                                 Interlocked.Increment(&executed.contents) |> ignore
 
                                 { ExitCode = exitCode
@@ -1448,13 +2532,25 @@ type SessionHost(options: SessionHostOptions) =
                     finally
                         Ambient.clear ()
                 finally
-                    processState.Exit ()
+                    if entered then
+                        processState.Exit ()
             finally
-                if stateless then
-                    releaseSession claimed
-
-                replenishSignal.Release() |> ignore
-
+                try
+                    if stateless then
+                        if entered then
+                            releaseSessionWith winHandlesBefore posixFdsBefore collectionsBefore claimed
+                        else
+                            releaseSession claimed
+                finally
+                    if options.LogPath.IsSome then
+                        let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs
+                        logDetail (
+                            "run-phases evalMs="
+                            + evaluateMs.ToString("F3", CultureInfo.InvariantCulture)
+                            + " gateReleaseMs="
+                            + gateReleaseMs.ToString("F3", CultureInfo.InvariantCulture)
+                        )
+                    if not options.Oneshot then replenishSignal.Release() |> ignore
         let canceledOutcome () =
             Interlocked.Increment(&executed.contents) |> ignore
 
@@ -1466,14 +2562,12 @@ type SessionHost(options: SessionHostOptions) =
 
         let work () =
             let targetSpec = Prelude.specOfRequest request
-            setDesiredSpec targetSpec
-            let expectedTag = Prelude.tagOfSpec targetSpec
 
             let outcome =
                 try
                     match request.SessionId with
                     | None ->
-                        let claimed = claimSession expectedTag disconnectToken
+                        let claimed = claimSession targetSpec disconnectToken
 
                         try
                             runInSession claimed true
@@ -1497,6 +2591,7 @@ type SessionHost(options: SessionHostOptions) =
                               TimedOut = true }
                         | Some entry ->
                             try
+                                let _, expectedTag = activateSpec targetSpec
                                 match entry.Session with
                                 | Some warm when warm.Prelude <> expectedTag ->
                                     releaseSession warm
@@ -1504,7 +2599,7 @@ type SessionHost(options: SessionHostOptions) =
                                 | _ -> ()
 
                                 if entry.Session.IsNone then
-                                    entry.Session <- Some(claimSession expectedTag disconnectToken)
+                                    entry.Session <- Some(claimSession targetSpec disconnectToken)
 
                                 let outcome =
                                     try
@@ -1573,19 +2668,11 @@ type SessionHost(options: SessionHostOptions) =
                       Wedged = false }
 
     member _.Metrics() : MetricsInfo =
-        if targetPoolSize > 0 then
-            let shouldWait () =
-                let broken =
-                    lock desiredGate (fun () -> failedTag = Some(Prelude.tagOfSpec desiredSpec))
-
-                not stopped && not broken && pool.Count < targetPoolSize
-
-            if shouldWait () then
-                replenishSignal.Release() |> ignore
-                let deadline = Environment.TickCount64 + 30000L
-
-                while shouldWait () && Environment.TickCount64 < deadline do
-                    Thread.Sleep 10
+        if not options.Oneshot && targetPoolSize > 0 then
+            let slots = lock poolGate (fun () -> pools.ToArray())
+            replenishSignal.Release() |> ignore
+            for slot in slots do
+                waitForWarm 30000L false ValueNone slot |> ignore
 
         drainCleanupsBlocking ()
         sweepFinalizers ()
@@ -1594,7 +2681,7 @@ type SessionHost(options: SessionHostOptions) =
         let aliveDisposedSessions = drainReleasedSessions ()
 
         { PoolTarget = targetPoolSize
-          PoolWarm = pool.Count
+          PoolWarm = poolCount ()
           ColdClaims = coldClaims.Value
           Executed = executed.Value
           ManagedHeapBytes = GC.GetTotalMemory true

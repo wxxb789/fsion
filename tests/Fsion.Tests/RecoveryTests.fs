@@ -82,6 +82,69 @@ type RecoveryTests(output: ITestOutputHelper) =
             Assert.NotEqual(oldPid, newPid))
 
     [<Fact>]
+    member _.``a replacement daemon cold prelude does not inherit the wedged script environment`` () =
+        withContext "recovery-wedge-environment" (fun context directory ->
+            let cleanEnvironment = [ "FSION_WEDGE_LEAK", null ]
+            let prime = context.Run([ "--pool-size"; "0"; "-e"; "()" ], extraEnv = cleanEnvironment)
+            Assert.Equal(0, prime.ExitCode)
+            let oldPid = context.DaemonPid()
+            Assert.True(oldPid.IsSome, "daemon was not reported as running")
+
+            let wedge = """System.Environment.SetEnvironmentVariable("FSION_WEDGE_LEAK", "leaked"); while true do ()"""
+            let timed = context.Run([ "--timeout"; "1200"; "-e"; wedge ], extraEnv = cleanEnvironment)
+            Assert.Equal(124, timed.ExitCode)
+            Assert.True(processGone oldPid.Value 15000, "the drained daemon did not terminate")
+            let replacement = context.DaemonPid()
+            Assert.True(replacement.IsSome, "no replacement daemon appeared without a client auto-start")
+            Assert.NotEqual(oldPid, replacement)
+
+            writeFile directory "prelude.fsx"
+                """let wedgeProbe = System.Environment.GetEnvironmentVariable("FSION_WEDGE_LEAK") |> Option.ofObj"""
+            let prelude = Path.Combine(directory, "prelude.fsx")
+            let next =
+                context.Run(
+                    [ "--pool-size"; "0"; "--prelude"; prelude; "-e"; """System.Console.Write(defaultArg wedgeProbe "<null>")""" ],
+                    extraEnv = cleanEnvironment
+                )
+            Assert.True(next.ExitCode = 0, next.Stderr)
+            Assert.Equal(replacement, context.DaemonPid())
+            Assert.Equal("<null>", next.Stdout)
+
+            let bootMarker = Path.Combine(directory, "boot-prelude-runs.txt")
+            let bootPrelude = Path.Combine(directory, "boot-prelude.fsx")
+            writeFile
+                directory
+                "boot-prelude.fsx"
+                (sprintf "System.IO.File.AppendAllText(@\"%s\", \"run\\n\")\nlet bootVal = 1\n" bootMarker)
+            let bootPipe = "fsion-test-bootp-" + Guid.NewGuid().ToString("N")
+            let bootStartEnv =
+                [ "FSION_PIPE", bootPipe
+                  "FSIOND_PATH", fsiondBinary
+                  "FSION_CONFIG_DIR", Path.Combine(directory, ".fsion-bootp-config")
+                  "FSION_PRELUDE", bootPrelude ]
+            let bootClearEnv =
+                [ "FSION_PIPE", bootPipe
+                  "FSIOND_PATH", fsiondBinary
+                  "FSION_CONFIG_DIR", Path.Combine(directory, ".fsion-bootp-config")
+                  "FSION_PRELUDE", null ]
+            try
+                let bootWarm = runProcess fsionBinary [ "--pool-size"; "1"; "warmup" ] directory bootStartEnv None 120000
+                Assert.True(bootWarm.ExitCode = 0, bootWarm.Stderr)
+                let bootCountBefore = File.ReadAllLines(bootMarker).Length
+                Assert.True(bootCountBefore >= 1)
+                let wedgeBuiltin =
+                    runProcess fsionBinary [ "--timeout"; "500"; "-e"; "while true do ()" ] directory bootClearEnv None 60000
+                Assert.Equal(124, wedgeBuiltin.ExitCode)
+                let afterBuiltin =
+                    runProcess fsionBinary [ "-e"; "System.Console.Write(\"builtin-ok\")" ] directory bootClearEnv None 120000
+                Assert.True(afterBuiltin.ExitCode = 0, afterBuiltin.Stderr)
+                Assert.Equal("builtin-ok", afterBuiltin.Stdout)
+                Thread.Sleep 800
+                Assert.Equal(bootCountBefore, File.ReadAllLines(bootMarker).Length)
+            finally
+                runProcess fsionBinary [ "daemon"; "stop" ] directory bootClearEnv None 20000 |> ignore)
+
+    [<Fact>]
     member _.``client disconnect cancels a cooperative wait without retiring the daemon`` () =
         withContext "recovery-disconnect" (fun context directory ->
             let marker = Path.Combine(directory, "started.txt")

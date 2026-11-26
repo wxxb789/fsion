@@ -1,0 +1,1855 @@
+{
+  "schema": 2,
+  "burst": {
+    "runners": {
+      "fsion": {
+        "individualMs": [
+          115.13659986667335,
+          72.72609998472035,
+          84.58460005931556,
+          88.72210001572967,
+          77.79220002703369,
+          93.02689996547997,
+          86.97999990545213,
+          75.9523999877274,
+          75.62060002237558,
+          90.18329996615648,
+          190.888199955225,
+          70.70270017720759
+        ],
+        "n": 12,
+        "median": 85.78229998238385,
+        "mean": 93.52630832775806,
+        "stdev": 32.9382908398012,
+        "min": 70.70270017720759,
+        "max": 190.888199955225,
+        "p95": 190.888199955225
+      },
+      "bun": {
+        "individualMs": [
+          60.854800045490265,
+          55.51089998334646,
+          63.147000037133694,
+          64.59169997833669,
+          72.16989994049072,
+          64.92019980214536,
+          61.24360021203756,
+          57.707499945536256,
+          68.13610019162297,
+          59.12759993225336,
+          280.2586001344025,
+          65.34729991108179
+        ],
+        "n": 12,
+        "median": 63.86935000773519,
+        "mean": 81.0846000094898,
+        "stdev": 62.889270956350245,
+        "min": 55.51089998334646,
+        "max": 280.2586001344025,
+        "p95": 280.2586001344025
+      }
+    },
+    "nonces": [
+      "r001-eb967cec",
+      "r002-8254165b",
+      "r003-bfafbf4e",
+      "r004-5d2defc7",
+      "r005-5bdaa140",
+      "r006-03570388",
+      "r007-b2b932ff",
+      "r008-fd2e80cd",
+      "r009-12f116f6",
+      "r010-aba01c60",
+      "r011-44c253d6",
+      "r012-c00ffec8"
+    ],
+    "outputSha256": [
+      "896b8ef3433bebab7d2cb6202c67acc9a44d77378f57804dee173f4c7c71e69d",
+      "96c466513a6a0ab73061869eddc84aa7ffc95b7e8589ea6a03b083dfd87eb4c8",
+      "fa6f96deac8f22e54c47fb0288d9f722d0cdc76ed975b9fa306f64a8551820bb",
+      "70408d6417c281b0d43b52a5489be41f41d90b3332cfc9db89a89fc6633bb653",
+      "2e3c15a95c9717349c9328959d9fa37eb28ccd92f85d868e8b812dbdb8eb4c34",
+      "a1aa65b19d8f0c3f2825865a153a38d364914aadf46c272b89fe2264d79bd162",
+      "72e3858371b141bf03b686cf1842b922311a3c4b81f1fed02a776467f59da9b8",
+      "44a689f0078e2127da7b23b10174199b020cf756e6880c48e95643cbba69f24c",
+      "8eaa9902fa4159bae7d907e1c73c6cb388d84491c3f7e47577b8817b135b7cb4",
+      "46b207c982855884fabc03574be8aade3be9be9a529f65008285f235761096f5",
+      "97a47ffb134d78c638b27ecc146f3dcc1f8de28eb7c0e288051461e9cbcd2eab",
+      "3ff3440d9855f02b61943f0a0a6327b9ed43b65cb5adac09a61be7c1853cf52f"
+    ],
+    "coldClaimsDelta": 0,
+    "before": {
+      "poolTarget": 12,
+      "poolWarm": 12,
+      "coldClaims": 0,
+      "executed": 99,
+      "managedHeapBytes": 555254424,
+      "scriptAssemblies": 12,
+      "aliveDisposedSessions": 0,
+      "namedSessions": 0
+    },
+    "after": {
+      "poolTarget": 12,
+      "poolWarm": 12,
+      "coldClaims": 0,
+      "executed": 111,
+      "managedHeapBytes": 438411480,
+      "scriptAssemblies": 12,
+      "aliveDisposedSessions": 0,
+      "namedSessions": 0
+    }
+  },
+  "phases": {
+    "samples": [
+      {
+        "nonce": "r001-ee663cfa",
+        "wallMs": 282.9981001559645,
+        "fcsMs": 104.757,
+        "daemonGateReleaseMs": 143.593,
+        "clientIpcMs": 34.6481001559645
+      },
+      {
+        "nonce": "r002-50480514",
+        "wallMs": 88.41089997440577,
+        "fcsMs": 42.2,
+        "daemonGateReleaseMs": 14.738999999999997,
+        "clientIpcMs": 31.471899974405765
+      },
+      {
+        "nonce": "r003-faca6e8a",
+        "wallMs": 86.99549990706146,
+        "fcsMs": 47.074,
+        "daemonGateReleaseMs": 8.716000000000001,
+        "clientIpcMs": 31.20549990706146
+      },
+      {
+        "nonce": "r004-517e73b0",
+        "wallMs": 81.17419993504882,
+        "fcsMs": 38.045,
+        "daemonGateReleaseMs": 11.086999999999996,
+        "clientIpcMs": 32.04219993504882
+      },
+      {
+        "nonce": "r005-1f0edd17",
+        "wallMs": 94.11650011315942,
+        "fcsMs": 50.454,
+        "daemonGateReleaseMs": 8.435000000000002,
+        "clientIpcMs": 35.227500113159415
+      },
+      {
+        "nonce": "r006-dcf15359",
+        "wallMs": 293.4276000596583,
+        "fcsMs": 56.32,
+        "daemonGateReleaseMs": 13.818999999999996,
+        "clientIpcMs": 223.28860005965828
+      },
+      {
+        "nonce": "r007-55eb13b0",
+        "wallMs": 112.35790001228452,
+        "fcsMs": 59.339,
+        "daemonGateReleaseMs": 16.924999999999997,
+        "clientIpcMs": 36.09390001228452
+      },
+      {
+        "nonce": "r008-17624073",
+        "wallMs": 107.86260012537241,
+        "fcsMs": 57.626,
+        "daemonGateReleaseMs": 12.937000000000005,
+        "clientIpcMs": 37.29960012537241
+      },
+      {
+        "nonce": "r009-45656686",
+        "wallMs": 97.83479990437627,
+        "fcsMs": 41.35,
+        "daemonGateReleaseMs": 14.689,
+        "clientIpcMs": 41.79579990437627
+      },
+      {
+        "nonce": "r010-d5a17c22",
+        "wallMs": 100.9506001137197,
+        "fcsMs": 42.731,
+        "daemonGateReleaseMs": 23.769,
+        "clientIpcMs": 34.4506001137197
+      },
+      {
+        "nonce": "r011-15adb49d",
+        "wallMs": 217.74449991062284,
+        "fcsMs": 48.539,
+        "daemonGateReleaseMs": 29.262,
+        "clientIpcMs": 139.94349991062285
+      },
+      {
+        "nonce": "r012-7776ade9",
+        "wallMs": 103.01849991083145,
+        "fcsMs": 38.92,
+        "daemonGateReleaseMs": 25.093999999999994,
+        "clientIpcMs": 39.004499910831456
+      }
+    ],
+    "medians": {
+      "wallMs": 101.98455001227558,
+      "fcsMs": 47.8065,
+      "daemonGateReleaseMs": 14.713999999999999,
+      "clientIpcMs": 35.66070006272197
+    }
+  },
+  "goal0006": {
+    "hello FSI speedup": [
+      59.893200881835604,
+      ">= 50x",
+      true
+    ],
+    "hello fsion minus bun ms": [
+      -4.313249955885112,
+      "<= 3 ms or <= 1.05x bun",
+      true
+    ],
+    "typical FSI speedup": [
+      43.241926076966266,
+      ">= 40x",
+      true
+    ],
+    "typical fsion median ms": [
+      82.75069994851947,
+      "< 84.9 ms",
+      true
+    ],
+    "diverse FSI speedup": [
+      58.8342949191535,
+      ">= 40x",
+      true
+    ],
+    "diverse fsion median ms": [
+      60.18249993212521,
+      "< 75.6 ms",
+      true
+    ],
+    "burst median vs spaced typical": [
+      1.0366353400726567,
+      "<= 1.25x",
+      true
+    ],
+    "burst max ms": [
+      190.888199955225,
+      "< 750 ms",
+      true
+    ],
+    "burst alive disposed": [
+      0,
+      "zero",
+      true
+    ]
+  },
+  "startedAt": "2026-11-26T12:33:03+08:00",
+  "finishedAt": "2026-11-26T12:40:33+08:00",
+  "salt": "714ecfed",
+  "rounds": 30,
+  "warmupRounds": 3,
+  "workloads": [
+    "hello",
+    "typical",
+    "diverse"
+  ],
+  "presentRunners": [
+    "fsion",
+    "dotnet-fsi",
+    "bun",
+    "node",
+    "python"
+  ],
+  "skipped": [],
+  "fsiRunnerId": "dotnet-fsi",
+  "environment": {
+    "host": "CPC-lhan-XF3D0M",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "processor": "AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD",
+    "python": "3.15.2",
+    "dotnet": "11.0.100",
+    "bun": "1.4.5",
+    "node": "v26.13.1",
+    "fsionTfm": "net10.0",
+    "fsionBinary": "Q:\\repos\\fsion\\artifacts\\package\\fsion-win-x64-net10.0\\fsion.exe",
+    "fsiondBinary": "Q:\\repos\\fsion\\artifacts\\package\\fsion-win-x64-net10.0\\fsiond.exe",
+    "fsionSizeBytes": 4210176
+  },
+  "aggregates": {
+    "hello": {
+      "fsion": {
+        "n": 30,
+        "median": 57.42879991885275,
+        "mean": 94.9001666624099,
+        "stdev": 105.32237364273303,
+        "min": 47.85700002685189,
+        "max": 538.6316999793053,
+        "p95": 292.3397000413388
+      },
+      "dotnet-fsi": {
+        "n": 30,
+        "median": 3439.594649942592,
+        "mean": 3611.854013358243,
+        "stdev": 487.8869061857392,
+        "min": 3018.558699870482,
+        "max": 5069.174000062048,
+        "p95": 4724.1709001827985
+      },
+      "bun": {
+        "n": 30,
+        "median": 61.74204987473786,
+        "mean": 84.79275334005554,
+        "stdev": 60.311767074731655,
+        "min": 53.85460006073117,
+        "max": 307.97030008397996,
+        "p95": 234.19760004617274
+      },
+      "node": {
+        "n": 30,
+        "median": 88.9587999554351,
+        "mean": 108.47151333000511,
+        "stdev": 60.14181746004527,
+        "min": 72.27670005522668,
+        "max": 315.4275000561029,
+        "p95": 283.16049999557436
+      },
+      "python": {
+        "n": 30,
+        "median": 59.8743500886485,
+        "mean": 83.09510334705313,
+        "stdev": 60.88208932830198,
+        "min": 50.23719999007881,
+        "max": 267.02099991962314,
+        "p95": 236.64360004477203
+      }
+    },
+    "typical": {
+      "fsion": {
+        "n": 30,
+        "median": 82.75069994851947,
+        "mean": 117.89755999731521,
+        "stdev": 90.38978078562171,
+        "min": 64.25970001146197,
+        "max": 441.6352999396622,
+        "p95": 301.3027999550104
+      },
+      "dotnet-fsi": {
+        "n": 30,
+        "median": 3578.299649991095,
+        "mean": 3749.3388866850487,
+        "stdev": 445.47276754587926,
+        "min": 3292.691000038758,
+        "max": 4821.353300008923,
+        "p95": 4727.407300146297
+      },
+      "bun": {
+        "n": 30,
+        "median": 62.410400016233325,
+        "mean": 73.74131332617253,
+        "stdev": 41.787096516114495,
+        "min": 51.36790010146797,
+        "max": 285.58699996210635,
+        "p95": 100.84139998070896
+      },
+      "node": {
+        "n": 30,
+        "median": 91.13804996013641,
+        "mean": 93.56274333937715,
+        "stdev": 13.715830917739584,
+        "min": 74.81470005586743,
+        "max": 123.47369990311563,
+        "p95": 120.00830005854368
+      },
+      "python": {
+        "n": 30,
+        "median": 88.31019990611821,
+        "mean": 114.26228332954149,
+        "stdev": 64.07746100791441,
+        "min": 73.13369982875884,
+        "max": 281.9787999615073,
+        "p95": 278.23149994947016
+      }
+    },
+    "diverse": {
+      "fsion": {
+        "n": 30,
+        "median": 60.18249993212521,
+        "mean": 72.77685332422455,
+        "stdev": 43.34634643436826,
+        "min": 46.18289996869862,
+        "max": 224.88430002704263,
+        "p95": 209.6062998753041
+      },
+      "dotnet-fsi": {
+        "n": 30,
+        "median": 3540.79494997859,
+        "mean": 3700.24478668347,
+        "stdev": 504.8921395978206,
+        "min": 3118.060600012541,
+        "max": 5498.080400051549,
+        "p95": 4665.727500105277
+      },
+      "bun": {
+        "n": 30,
+        "median": 64.3555000424385,
+        "mean": 72.50491668625425,
+        "stdev": 36.696655799612735,
+        "min": 52.89390007965267,
+        "max": 257.96890002675354,
+        "p95": 95.30420019291341
+      },
+      "node": {
+        "n": 30,
+        "median": 92.1354501042515,
+        "mean": 125.30960665705304,
+        "stdev": 81.80698987228169,
+        "min": 72.53889995627105,
+        "max": 364.15169993415475,
+        "p95": 313.07319994084537
+      },
+      "python": {
+        "n": 30,
+        "median": 57.61990009341389,
+        "mean": 68.78048999545474,
+        "stdev": 47.73433483651172,
+        "min": 50.94380001537502,
+        "max": 317.10959994234145,
+        "p95": 90.14529990963638
+      }
+    }
+  },
+  "fsionPerRound": {
+    "hello": [
+      53.471799939870834,
+      61.77090015262365,
+      57.547499891370535,
+      65.53260004147887,
+      55.58879999443889,
+      55.96520006656647,
+      72.18050002120435,
+      292.3397000413388,
+      53.94809995777905,
+      97.19190001487732,
+      60.28069998137653,
+      56.291399989277124,
+      260.1169999688864,
+      52.12539993226528,
+      63.20949993096292,
+      62.617299845442176,
+      61.445399885997176,
+      58.64139995537698,
+      55.734500056132674,
+      54.07400010153651,
+      54.007300175726414,
+      57.31009994633496,
+      47.85700002685189,
+      48.60550002194941,
+      52.62210010550916,
+      58.81850002333522,
+      48.659399850293994,
+      49.679400166496634,
+      240.74039980769157,
+      538.6316999793053
+    ],
+    "typical": [
+      78.74089991673827,
+      101.5429999679327,
+      74.01650003157556,
+      85.4856998194009,
+      72.59599980898201,
+      88.00790016539395,
+      441.6352999396622,
+      79.55130003392696,
+      92.36559993587434,
+      87.21200004220009,
+      80.75840002857149,
+      259.25830006599426,
+      297.0026999246329,
+      86.32990019395947,
+      96.49030002765357,
+      217.1000000089407,
+      83.0765999853611,
+      79.89579997956753,
+      72.26000004447997,
+      92.0756000559777,
+      82.42479991167784,
+      79.71540000289679,
+      74.9534999486059,
+      68.54600016959012,
+      68.60799994319677,
+      91.46549995057285,
+      69.58230002783239,
+      301.3027999550104,
+      64.25970001146197,
+      70.6670000217855
+    ],
+    "diverse": [
+      63.44019994139671,
+      61.50279985740781,
+      59.858699794858694,
+      52.11069993674755,
+      61.92210013978183,
+      69.88300010561943,
+      57.519800029695034,
+      55.95170008018613,
+      55.28119998052716,
+      65.07480004802346,
+      56.24449998140335,
+      54.97359996661544,
+      70.76200004667044,
+      79.47150012478232,
+      71.19669998064637,
+      63.017999986186624,
+      55.84080005064607,
+      150.3657998982817,
+      52.88089998066425,
+      48.97979996167123,
+      52.51220008358359,
+      224.88430002704263,
+      47.485999995842576,
+      46.18289996869862,
+      52.72989999502897,
+      66.07739999890327,
+      53.70739987120032,
+      209.6062998753041,
+      63.33429994992912,
+      60.50630006939173
+    ]
+  },
+  "roundsDetail": [
+    {
+      "round": 1,
+      "workloads": {
+        "hello": {
+          "nonce": "r004-7f0da080",
+          "fsharpSourceSha256": "01259cf54e30a21982998600b7124173e8ff8db6856669611886ba9cd6fb1ffd",
+          "outputSha256": "9084190110430a97b5d0bec10bc2955ddf9ab4b43177cc0ddfec0e62a064b33e",
+          "verified": true,
+          "timingsMs": {
+            "node": 86.21699991635978,
+            "python": 58.00960003398359,
+            "fsion": 53.471799939870834,
+            "dotnet-fsi": 3245.8816999569535,
+            "bun": 70.45960007235408
+          }
+        },
+        "typical": {
+          "nonce": "r004-5ac4a4b4",
+          "fsharpSourceSha256": "593b61b7ab849cf951947050f1c16308646f7f0d1b323d526c54b36657a2bf9b",
+          "outputSha256": "7ccf69965a38261764370f65ed0095a53297f1772f3b0d486cbcb58c0bc1b122",
+          "verified": true,
+          "timingsMs": {
+            "node": 94.68049998395145,
+            "python": 253.4241999965161,
+            "fsion": 78.74089991673827,
+            "dotnet-fsi": 3455.484200036153,
+            "bun": 58.09920001775026
+          }
+        },
+        "diverse": {
+          "nonce": "r004-7b23e7dc",
+          "fsharpSourceSha256": "d55e4e2fd7f4387dea9033e33874d2b53c40b756315379b8ff666416c8f0a8e8",
+          "outputSha256": "84efc1bb737d8852b2963fdaa230e146a72c23c9fce16907b22a6e5b4647b53a",
+          "verified": true,
+          "timingsMs": {
+            "node": 95.70519998669624,
+            "python": 58.1598998978734,
+            "fsion": 63.44019994139671,
+            "dotnet-fsi": 3496.5747001115233,
+            "bun": 73.20139999501407
+          }
+        }
+      }
+    },
+    {
+      "round": 2,
+      "workloads": {
+        "hello": {
+          "nonce": "r005-994435a8",
+          "fsharpSourceSha256": "9ae19d46faf0a42737a36b19a9d178b823f3b983bd19e5851d158aaf963bd28e",
+          "outputSha256": "0dc84e887bc8719112057b28c53e96ee3577459ca96c78edc7fc1be7486298b6",
+          "verified": true,
+          "timingsMs": {
+            "python": 61.126000015065074,
+            "fsion": 61.77090015262365,
+            "dotnet-fsi": 3616.819600109011,
+            "bun": 77.38199993036687,
+            "node": 109.61799998767674
+          }
+        },
+        "typical": {
+          "nonce": "r005-f9eb0599",
+          "fsharpSourceSha256": "a3ec29f032caf5671cd605efbbc5b89f39408cff36e09bdb5a3358aaa78790bf",
+          "outputSha256": "e0dee36888b1e8e52f603fbb261d9cce0e69e6926a5d843c9e73755b63632a1f",
+          "verified": true,
+          "timingsMs": {
+            "python": 110.28310004621744,
+            "fsion": 101.5429999679327,
+            "dotnet-fsi": 4190.980800194666,
+            "bun": 55.35509996116161,
+            "node": 82.2350000962615
+          }
+        },
+        "diverse": {
+          "nonce": "r005-edd8c471",
+          "fsharpSourceSha256": "0a4986b5157e071c2e9d92c2d46ff80097938c7fb080d7456e22bdbf93190b0c",
+          "outputSha256": "7067cd6f68e8b6bcbed4b81237629b19c90f727886e78714439655271f74861c",
+          "verified": true,
+          "timingsMs": {
+            "python": 52.7535998262465,
+            "fsion": 61.50279985740781,
+            "dotnet-fsi": 3467.9489000700414,
+            "bun": 60.61689998023212,
+            "node": 313.07319994084537
+          }
+        }
+      }
+    },
+    {
+      "round": 3,
+      "workloads": {
+        "hello": {
+          "nonce": "r006-d2f8f366",
+          "fsharpSourceSha256": "f63563f44926a077ae00212d67d27260348d3f01390aaf2bd1f6f86afd759ffa",
+          "outputSha256": "90b5d58b7df1a4e7bcde3213968e9d799382183e343d94d6b1e3585db3fd5c35",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 57.547499891370535,
+            "dotnet-fsi": 3167.397400131449,
+            "bun": 58.46279999241233,
+            "node": 82.72529998794198,
+            "python": 57.377600111067295
+          }
+        },
+        "typical": {
+          "nonce": "r006-7551300b",
+          "fsharpSourceSha256": "d6e4967824cf49d698250b7f6960a8b2a67e873a058ea0e0aa14853a5071f700",
+          "outputSha256": "ff1d896fad17c8c827ee2270bc81bec38b3c1c4916fdabd8a1c298e2d60cbda8",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 74.01650003157556,
+            "dotnet-fsi": 3379.9103999044746,
+            "bun": 65.17340010032058,
+            "node": 90.96149983815849,
+            "python": 87.30989997275174
+          }
+        },
+        "diverse": {
+          "nonce": "r006-29799955",
+          "fsharpSourceSha256": "cbef5d8f6b0f0c816d8ca8bd33c01066da004a22adcf52cdcfdaea2773a4dcac",
+          "outputSha256": "7e859a334966cfa7ce2b435e9f56e75aba925fbc758b08977f19fc4555c09760",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 59.858699794858694,
+            "dotnet-fsi": 3642.041400074959,
+            "bun": 95.30420019291341,
+            "node": 264.5907001569867,
+            "python": 90.14529990963638
+          }
+        }
+      }
+    },
+    {
+      "round": 4,
+      "workloads": {
+        "hello": {
+          "nonce": "r007-c79ae572",
+          "fsharpSourceSha256": "4fbf272838beb82d8b1848cf2f2ad0e016857ab20c5997d3443b142a781b3ba9",
+          "outputSha256": "688af633d6ac768f539f8f895b955b9b49d3fcd70af8901955896c49503605f9",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3978.9396000560373,
+            "bun": 222.64210018329322,
+            "node": 102.59639983996749,
+            "python": 225.51939985714853,
+            "fsion": 65.53260004147887
+          }
+        },
+        "typical": {
+          "nonce": "r007-a5478719",
+          "fsharpSourceSha256": "bb838778df6e53f2973dd78924a5a59d8df9d7428d550a388590fb0d266795ce",
+          "outputSha256": "1bedc118e51e23e32be59a1220eb67e5329afc2ba8ec4f32f13acad0eeecb629",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 4078.60039989464,
+            "bun": 82.4344998691231,
+            "node": 123.47369990311563,
+            "python": 281.9787999615073,
+            "fsion": 85.4856998194009
+          }
+        },
+        "diverse": {
+          "nonce": "r007-55c59527",
+          "fsharpSourceSha256": "a5453332533f7537c93587b335ea75b9327a995402634d2c95f67ac54299c98c",
+          "outputSha256": "6d562e3b0d80b467b2125a59cda296d652130bde7eef48b95ed6201266fe9c2a",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3273.8189001102,
+            "bun": 58.618499897420406,
+            "node": 80.81230008974671,
+            "python": 55.37809990346432,
+            "fsion": 52.11069993674755
+          }
+        }
+      }
+    },
+    {
+      "round": 5,
+      "workloads": {
+        "hello": {
+          "nonce": "r008-ddb3a184",
+          "fsharpSourceSha256": "e8d8b3126695f2e44c53f92b11ebb3b192ee386cce3bcbd6669fa46c06528451",
+          "outputSha256": "c0e56eedad5fd482d8cde17585567c951959ce91f60106a1911644a3932b4a69",
+          "verified": true,
+          "timingsMs": {
+            "bun": 60.69989991374314,
+            "node": 79.95579997077584,
+            "python": 54.319400107488036,
+            "fsion": 55.58879999443889,
+            "dotnet-fsi": 3421.683399938047
+          }
+        },
+        "typical": {
+          "nonce": "r008-3e7e67aa",
+          "fsharpSourceSha256": "66a1a9997eafadff3b8fb4ac294c23923317c477da5422cf23d9bdd5caf5af43",
+          "outputSha256": "fc8d436b124ab750b28c18393e91602c3a2178571335d7dbb2559dc6c77364a7",
+          "verified": true,
+          "timingsMs": {
+            "bun": 62.755299964919686,
+            "node": 88.54479994624853,
+            "python": 278.23149994947016,
+            "fsion": 72.59599980898201,
+            "dotnet-fsi": 3591.162799857557
+          }
+        },
+        "diverse": {
+          "nonce": "r008-8077889f",
+          "fsharpSourceSha256": "2cacd372513b1e8dcc54fd1a2c0d6174dd71c8338f73cd1f81c9697ac5ee236a",
+          "outputSha256": "1c58e9c7b70619a8caebd2ae1ac136e874b22e042296a29cef0364f979fbcd6a",
+          "verified": true,
+          "timingsMs": {
+            "bun": 66.48309994488955,
+            "node": 108.24330011382699,
+            "python": 60.06480008363724,
+            "fsion": 61.92210013978183,
+            "dotnet-fsi": 3744.140900205821
+          }
+        }
+      }
+    },
+    {
+      "round": 6,
+      "workloads": {
+        "hello": {
+          "nonce": "r009-c0b249d9",
+          "fsharpSourceSha256": "75ce4b49b99d9aa06341bd27ebd6081f1efa7f7bda9efeced04f11e8c1872a19",
+          "outputSha256": "9a21ac0933263ca2838b79cb01fac6b5a77797947888b27fee71ec6259ed0b13",
+          "verified": true,
+          "timingsMs": {
+            "node": 283.16049999557436,
+            "python": 55.23160006850958,
+            "fsion": 55.96520006656647,
+            "dotnet-fsi": 3186.4335001446307,
+            "bun": 234.19760004617274
+          }
+        },
+        "typical": {
+          "nonce": "r009-04d70b65",
+          "fsharpSourceSha256": "9559d0e3bf981186e5a3deade21c26c853c1b38d04616dc0ffaede46e3c8d0f0",
+          "outputSha256": "d13f16b6bf99f019d35552d07fad00965b74564d8a072a0bfe3ee841600d7bab",
+          "verified": true,
+          "timingsMs": {
+            "node": 80.97629994153976,
+            "python": 83.01330008544028,
+            "fsion": 88.00790016539395,
+            "dotnet-fsi": 3627.0793001167476,
+            "bun": 57.335800025612116
+          }
+        },
+        "diverse": {
+          "nonce": "r009-8a2fd0ce",
+          "fsharpSourceSha256": "afc53d7570be181c0fa445a388e10e633de0f6565e201a252251616591a50356",
+          "outputSha256": "2d4a3ed78ade511d4797213d66aa279296c2ce2f85baa5a147be5b728fc5edad",
+          "verified": true,
+          "timingsMs": {
+            "node": 87.10250002332032,
+            "python": 58.19120001979172,
+            "fsion": 69.88300010561943,
+            "dotnet-fsi": 3534.135299967602,
+            "bun": 61.107899993658066
+          }
+        }
+      }
+    },
+    {
+      "round": 7,
+      "workloads": {
+        "hello": {
+          "nonce": "r010-20607b3c",
+          "fsharpSourceSha256": "6d25bb59c555d4ac0e1ce5bc3b258a8177173ea45869f01024d249b775118dd2",
+          "outputSha256": "a025cb907faae632e0f8940ffb0da20e2e2416f2d046e80c9abf144acf21712f",
+          "verified": true,
+          "timingsMs": {
+            "python": 56.02860008366406,
+            "fsion": 72.18050002120435,
+            "dotnet-fsi": 3297.767700161785,
+            "bun": 61.611299868673086,
+            "node": 89.04340001754463
+          }
+        },
+        "typical": {
+          "nonce": "r010-297f13f4",
+          "fsharpSourceSha256": "0bab8e5039b7d77cc69ead2786735e8b102a6ff7cd7858801b03075ec02a113e",
+          "outputSha256": "9bba28fda20f6f0e9ac892a936ed352f814e1ed7a34a0b9246224c67dabe4b59",
+          "verified": true,
+          "timingsMs": {
+            "python": 75.01610019244254,
+            "fsion": 441.6352999396622,
+            "dotnet-fsi": 3292.691000038758,
+            "bun": 65.54909981787205,
+            "node": 91.72859997488558
+          }
+        },
+        "diverse": {
+          "nonce": "r010-7ea8fd20",
+          "fsharpSourceSha256": "ba45b344d09331f281cf7a08d44808a4dfa316f786c843673cb88fcefd435f0d",
+          "outputSha256": "7149a680b2d53484c67ffdc8a037f3d09e14a89a5e24f94df68b0233b912854b",
+          "verified": true,
+          "timingsMs": {
+            "python": 55.63679989427328,
+            "fsion": 57.519800029695034,
+            "dotnet-fsi": 3868.9264999702573,
+            "bun": 75.86550014093518,
+            "node": 109.98880001716316
+          }
+        }
+      }
+    },
+    {
+      "round": 8,
+      "workloads": {
+        "hello": {
+          "nonce": "r011-a71f3078",
+          "fsharpSourceSha256": "1ec780df2afbe5ceecca378ac6ec194f6f975114a720740dbc0e2dc8d76657bb",
+          "outputSha256": "081dbcc621e3f23d49c1504c0e9d8fa81f61fc7ef5bf981289af518959998b12",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 292.3397000413388,
+            "dotnet-fsi": 3949.4975998532027,
+            "bun": 61.87279988080263,
+            "node": 81.07670000754297,
+            "python": 52.16620001010597
+          }
+        },
+        "typical": {
+          "nonce": "r011-a9ce3527",
+          "fsharpSourceSha256": "4bfe0d5ed50fb750110d343d1b09cd1603d71766382acb8173bd98034f9b4b2a",
+          "outputSha256": "21b5d989c0caa0daec1ffd6796689109f3c6c57835ea251e5794d557a5b75e3d",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 79.55130003392696,
+            "dotnet-fsi": 3434.657600009814,
+            "bun": 52.55199992097914,
+            "node": 85.81149997189641,
+            "python": 76.66719984263182
+          }
+        },
+        "diverse": {
+          "nonce": "r011-9b50cee9",
+          "fsharpSourceSha256": "435cb33ea5b38d7486c748fecfe48fb0280e05872d11a9d5ffe542450cba7da9",
+          "outputSha256": "8bd64e1ee435f08b3dfc49f450ca29906d358d3fa01bd3d13856dc84c0eacd73",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 55.95170008018613,
+            "dotnet-fsi": 3201.6753000207245,
+            "bun": 68.33599996753037,
+            "node": 92.34890015795827,
+            "python": 54.709000047296286
+          }
+        }
+      }
+    },
+    {
+      "round": 9,
+      "workloads": {
+        "hello": {
+          "nonce": "r012-99500477",
+          "fsharpSourceSha256": "f5188a9ff5e8489a79acf8d43a0c0d21b6633a12f36c6efb721ba959f4b489b5",
+          "outputSha256": "b8807f020c7287d7b07a7806efa11a1e744a127b2f053f8b82d80ec6d4951d10",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3230.327800149098,
+            "bun": 58.917999966070056,
+            "node": 88.40620005503297,
+            "python": 66.81369990110397,
+            "fsion": 53.94809995777905
+          }
+        },
+        "typical": {
+          "nonce": "r012-40a548b9",
+          "fsharpSourceSha256": "fa33790b9be382ee281b2d96a2c2d72bd394719d7bb85bdad699f7814b499575",
+          "outputSha256": "0e10c4a71f809f0064caacd4907786747e916c843449a9e2d97be3d6842c1e4e",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3620.0983999297023,
+            "bun": 87.2100000269711,
+            "node": 86.15390001796186,
+            "python": 87.04219991341233,
+            "fsion": 92.36559993587434
+          }
+        },
+        "diverse": {
+          "nonce": "r012-debe4cb5",
+          "fsharpSourceSha256": "a4b83129480433b579a4f6479c889c9f9462f606450dcea179ed6b2025a365fd",
+          "outputSha256": "bd85365c2b024ae063c39f698c24235c775a175b418f4c608c8adea11146e33f",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3731.003100052476,
+            "bun": 67.19259987585247,
+            "node": 91.92200005054474,
+            "python": 55.10840006172657,
+            "fsion": 55.28119998052716
+          }
+        }
+      }
+    },
+    {
+      "round": 10,
+      "workloads": {
+        "hello": {
+          "nonce": "r013-f8236393",
+          "fsharpSourceSha256": "965dc9b616c8f3c5cf7aca4cf7ed732262c5fd4c2255e6ccdea9c3942da6fb5c",
+          "outputSha256": "437af5a376c899bf80df0ece76971b7450a30f937c279c38120710951f2abe24",
+          "verified": true,
+          "timingsMs": {
+            "bun": 58.490300085395575,
+            "node": 88.87419989332557,
+            "python": 267.02099991962314,
+            "fsion": 97.19190001487732,
+            "dotnet-fsi": 3455.193000147119
+          }
+        },
+        "typical": {
+          "nonce": "r013-5de3a6db",
+          "fsharpSourceSha256": "9a4bf27255a9d731cad7439a3050bd4a8e10078b38bdc87ec30220d8920d5a90",
+          "outputSha256": "6eabe13808ba26fb6ad88971f4578f9818c84d403067d6966753707a81522587",
+          "verified": true,
+          "timingsMs": {
+            "bun": 63.99509985931218,
+            "node": 87.15689997188747,
+            "python": 92.59360004216433,
+            "fsion": 87.21200004220009,
+            "dotnet-fsi": 3490.8795999363065
+          }
+        },
+        "diverse": {
+          "nonce": "r013-b8f5a9b5",
+          "fsharpSourceSha256": "bc44467067b4f73eb61b6070aa5ffc4cf2ab1cce700c945f0685c652b4ec0b77",
+          "outputSha256": "5952560450f097fa20f6149fccff80226e88b3ccbbd1e0fd931f807b564dfcd4",
+          "verified": true,
+          "timingsMs": {
+            "bun": 64.39419998787344,
+            "node": 87.5836000777781,
+            "python": 66.39680010266602,
+            "fsion": 65.07480004802346,
+            "dotnet-fsi": 3594.4123999215662
+          }
+        }
+      }
+    },
+    {
+      "round": 11,
+      "workloads": {
+        "hello": {
+          "nonce": "r014-714547b4",
+          "fsharpSourceSha256": "9256be4b1c2ca297c282128a4d25a00ed81db20afb204dd06ca1e334cf34ae78",
+          "outputSha256": "56f6f6373c7521641c009c6e3ee7a3440d12e4e7088eb5c6752a4932e41efc29",
+          "verified": true,
+          "timingsMs": {
+            "node": 93.85439986363053,
+            "python": 203.96359986625612,
+            "fsion": 60.28069998137653,
+            "dotnet-fsi": 4724.1709001827985,
+            "bun": 62.973600113764405
+          }
+        },
+        "typical": {
+          "nonce": "r014-4aa6648b",
+          "fsharpSourceSha256": "8809a2b7f06fd130e194e3b0852aa061398278bfd21635bfa16ae05d0926a09b",
+          "outputSha256": "bdeecf88e4d640529c742d5d6f34ad9b67175d1fac1e9adbdad96629f0d4108f",
+          "verified": true,
+          "timingsMs": {
+            "node": 95.04129993729293,
+            "python": 87.29139994829893,
+            "fsion": 80.75840002857149,
+            "dotnet-fsi": 3619.8395998217165,
+            "bun": 63.044399954378605
+          }
+        },
+        "diverse": {
+          "nonce": "r014-a7ee6225",
+          "fsharpSourceSha256": "7f8078ae3060a8f2beb060605e96600408bcd133ead5347f6d4523cfb76ff814",
+          "outputSha256": "601956df0ca2599e3314c09e5369fa2d01e6832f5847d38b35715127eb874f23",
+          "verified": true,
+          "timingsMs": {
+            "node": 364.15169993415475,
+            "python": 58.87379986234009,
+            "fsion": 56.24449998140335,
+            "dotnet-fsi": 3495.2298998832703,
+            "bun": 59.55480015836656
+          }
+        }
+      }
+    },
+    {
+      "round": 12,
+      "workloads": {
+        "hello": {
+          "nonce": "r015-b434c887",
+          "fsharpSourceSha256": "97c1b9ce3f88be7a987db7010e0a7af71a872fa9d0e9ca7a05461c1f4985903c",
+          "outputSha256": "41c084abfcb87c62b561b9171609205dd35c72a9c8c9fb33e9dfcf3c98c38e63",
+          "verified": true,
+          "timingsMs": {
+            "python": 61.91739998757839,
+            "fsion": 56.291399989277124,
+            "dotnet-fsi": 3392.2639000229537,
+            "bun": 60.54920004680753,
+            "node": 94.2185998428613
+          }
+        },
+        "typical": {
+          "nonce": "r015-98836711",
+          "fsharpSourceSha256": "61e178dbbec0d3fbbfeb28e85ea1b493aff489c829eccf009cac13f8d9f35763",
+          "outputSha256": "8f747e051228f60d098aa1bfee400d5abf781b04ab2ecce195b88e57b8aeb4ec",
+          "verified": true,
+          "timingsMs": {
+            "python": 91.17410006001592,
+            "fsion": 259.25830006599426,
+            "dotnet-fsi": 3510.9043999109417,
+            "bun": 61.390699818730354,
+            "node": 98.85539999231696
+          }
+        },
+        "diverse": {
+          "nonce": "r015-c31befa5",
+          "fsharpSourceSha256": "4c53d9cb28c6054c2a68a6fb95d4c6c34dcd4333bedfaf845e5ca5652b3887c6",
+          "outputSha256": "1da306e80ec594b41f6fc35a8d8de9b381be3dc0e19310497722e6446bb78d62",
+          "verified": true,
+          "timingsMs": {
+            "python": 57.71409999579191,
+            "fsion": 54.97359996661544,
+            "dotnet-fsi": 3393.1998000480235,
+            "bun": 57.09050013683736,
+            "node": 83.35109986364841
+          }
+        }
+      }
+    },
+    {
+      "round": 13,
+      "workloads": {
+        "hello": {
+          "nonce": "r016-f0de7a1f",
+          "fsharpSourceSha256": "538caa23ba544e13933446b7129d1c0956621fec5792eecadf2a6a1ab68eb8a0",
+          "outputSha256": "25de9a78e5ef00e226d10ce4dd4c1eea6bcbe91d30ee66d2d85edb576829c6ad",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 260.1169999688864,
+            "dotnet-fsi": 3425.148299895227,
+            "bun": 118.18449990823865,
+            "node": 315.4275000561029,
+            "python": 59.41690015606582
+          }
+        },
+        "typical": {
+          "nonce": "r016-d0774525",
+          "fsharpSourceSha256": "dba1277c598f7aa557999c31370e21883ee55439e53754190f5853bd24cf4745",
+          "outputSha256": "8a3174788310159497a2e9a9c81390339f4e4771d2e433dd2fbf202b242f341d",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 297.0026999246329,
+            "dotnet-fsi": 4348.417100030929,
+            "bun": 79.90240002982318,
+            "node": 116.3937000092119,
+            "python": 109.53699983656406
+          }
+        },
+        "diverse": {
+          "nonce": "r016-699b3902",
+          "fsharpSourceSha256": "8ad7060791368f10120eb68d06a64ca166d1e76682327143fa1e3309faa700a8",
+          "outputSha256": "26de2ce5f7338d46444b3931a013fbf33f49c7398a7eac9f9a531c570863857e",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 70.76200004667044,
+            "dotnet-fsi": 4196.263500023633,
+            "bun": 59.49979997240007,
+            "node": 87.02389989048243,
+            "python": 56.84320000000298
+          }
+        }
+      }
+    },
+    {
+      "round": 14,
+      "workloads": {
+        "hello": {
+          "nonce": "r017-e9f63238",
+          "fsharpSourceSha256": "3ef7d32ce9008979a653769a03ec224d5fdcc97c328ecb1ccab865822518d872",
+          "outputSha256": "c7b782a1be8f516ae2295164e6811cd2ae55b6633efa734302d7b1fddbd1c63c",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3205.6575999595225,
+            "bun": 53.85460006073117,
+            "node": 79.61550005711615,
+            "python": 51.11909983679652,
+            "fsion": 52.12539993226528
+          }
+        },
+        "typical": {
+          "nonce": "r017-29afd0c1",
+          "fsharpSourceSha256": "cf396984fa0dbfc2c94a7d528dec1f1dfa0b61223d0476322f5ce37d76c691f2",
+          "outputSha256": "7a93b91b8e622be9f74027e0b976eee9078bf7e02d96649cfb9681536cb9eb26",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3565.4365001246333,
+            "bun": 62.08830000832677,
+            "node": 92.63659990392625,
+            "python": 85.45460016466677,
+            "fsion": 86.32990019395947
+          }
+        },
+        "diverse": {
+          "nonce": "r017-97156731",
+          "fsharpSourceSha256": "df6a530009e97071c3b1d3d4df9b8a12b91a21ff30ad4666c74604f5a4afc090",
+          "outputSha256": "c2e529a34a5d9ea1a2fdf086e5bd284e6e4c701f7aba8fea4df07c76ef818b2c",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 5498.080400051549,
+            "bun": 92.95760001987219,
+            "node": 106.21650004759431,
+            "python": 66.50399998761714,
+            "fsion": 79.47150012478232
+          }
+        }
+      }
+    },
+    {
+      "round": 15,
+      "workloads": {
+        "hello": {
+          "nonce": "r018-23e86b33",
+          "fsharpSourceSha256": "5cafd024273d17e6ed758ba70939d048e681ef7fe575c158f5d3c7d56b8aa7d8",
+          "outputSha256": "6e8f10d17aa6956e0f62be543f9e7cce64aa0e2aadeff83d4540a830d34b2f9f",
+          "verified": true,
+          "timingsMs": {
+            "bun": 71.53529999777675,
+            "node": 112.87650000303984,
+            "python": 74.6170999482274,
+            "fsion": 63.20949993096292,
+            "dotnet-fsi": 3980.68380006589
+          }
+        },
+        "typical": {
+          "nonce": "r018-56795240",
+          "fsharpSourceSha256": "a5a191abb330c396c419727acdabeca2afeb058d9872b8e175eeb1fa8cd880ab",
+          "outputSha256": "ddbf1697b89eca8d37f03d5023f0f1136763451947fc5bf5f9a412ac379fc97e",
+          "verified": true,
+          "timingsMs": {
+            "bun": 86.82570001110435,
+            "node": 107.83940018154681,
+            "python": 110.13220017775893,
+            "fsion": 96.49030002765357,
+            "dotnet-fsi": 4430.056200129911
+          }
+        },
+        "diverse": {
+          "nonce": "r018-2e5c12d7",
+          "fsharpSourceSha256": "bc901b8a5f11ff89b1cec79c24d9a14ee038969ebcbe1d57d202ddffea616770",
+          "outputSha256": "a53f6cd7396dc3c4fc1e1199da458f3ffcae5ebc6881ead79360bc191b7f80f3",
+          "verified": true,
+          "timingsMs": {
+            "bun": 78.21880001574755,
+            "node": 123.85079986415803,
+            "python": 317.10959994234145,
+            "fsion": 71.19669998064637,
+            "dotnet-fsi": 4368.571699829772
+          }
+        }
+      }
+    },
+    {
+      "round": 16,
+      "workloads": {
+        "hello": {
+          "nonce": "r019-30d7b1ff",
+          "fsharpSourceSha256": "6e444547c7e8d5e51443f16fa599c39815c840eae3a77f13cb8d7a02dd85d893",
+          "outputSha256": "a5a8af802156fa73df86cedddc53fd116811594c3887dea94ed85bb13d8d9a76",
+          "verified": true,
+          "timingsMs": {
+            "node": 102.29520010761917,
+            "python": 72.11509998887777,
+            "fsion": 62.617299845442176,
+            "dotnet-fsi": 3841.810399899259,
+            "bun": 71.23970007523894
+          }
+        },
+        "typical": {
+          "nonce": "r019-48bcde2b",
+          "fsharpSourceSha256": "abc224387d2571edfe7de75c2185cd5644bb5913230201414603b46564b04d43",
+          "outputSha256": "fc9f8acb3cdd44dd814fa1049036371f467627450f616ca19b60f6d66cf4f208",
+          "verified": true,
+          "timingsMs": {
+            "node": 99.202899960801,
+            "python": 95.64769989810884,
+            "fsion": 217.1000000089407,
+            "dotnet-fsi": 4352.983899880201,
+            "bun": 77.48430012725294
+          }
+        },
+        "diverse": {
+          "nonce": "r019-272cd40e",
+          "fsharpSourceSha256": "1b19c3701cc0366c48720460b5d2c7f81d6fd04c093257f4d1a638fb8fc77030",
+          "outputSha256": "10e6ed5a68b692c0b6901234adc49830fa33b0fce4db437f8643302b6aa081df",
+          "verified": true,
+          "timingsMs": {
+            "node": 111.17759998887777,
+            "python": 84.2212000861764,
+            "fsion": 63.017999986186624,
+            "dotnet-fsi": 4384.807400172576,
+            "bun": 69.00590006262064
+          }
+        }
+      }
+    },
+    {
+      "round": 17,
+      "workloads": {
+        "hello": {
+          "nonce": "r020-6410341d",
+          "fsharpSourceSha256": "9c940f793f578d5ee798d9e3a38283426a410d4ae329683adef961ea8b3064c8",
+          "outputSha256": "1e4351f7f6cf261a5cd960e7de4a1f88c89350a26eb145a5458d0534bf12b7bc",
+          "verified": true,
+          "timingsMs": {
+            "python": 72.33290001749992,
+            "fsion": 61.445399885997176,
+            "dotnet-fsi": 3586.116600083187,
+            "bun": 60.47670007683337,
+            "node": 87.68190001137555
+          }
+        },
+        "typical": {
+          "nonce": "r020-c14bfba5",
+          "fsharpSourceSha256": "f6791c6ffc29330509132d5c7a09ca39e7068242f83f2a3ef154e32fbbd5ed5b",
+          "outputSha256": "256a31460a8140003ab75964864cf80260e6adf9fd12b81de8c65e7533bef0a8",
+          "verified": true,
+          "timingsMs": {
+            "python": 92.91159990243614,
+            "fsion": 83.0765999853611,
+            "dotnet-fsi": 4727.407300146297,
+            "bun": 285.58699996210635,
+            "node": 113.72070014476776
+          }
+        },
+        "diverse": {
+          "nonce": "r020-ebfc7697",
+          "fsharpSourceSha256": "d7cc402a84555ccf2ca95018eb4b32127d6428af8cf0e733c96fb3e9b92d4277",
+          "outputSha256": "ff0d5664ebf41978f767980018b4417fcfd0fb90fc8736f3b6f3bb3058f39f20",
+          "verified": true,
+          "timingsMs": {
+            "python": 62.55230004899204,
+            "fsion": 55.84080005064607,
+            "dotnet-fsi": 3796.127200126648,
+            "bun": 60.65319990739226,
+            "node": 293.77619992010295
+          }
+        }
+      }
+    },
+    {
+      "round": 18,
+      "workloads": {
+        "hello": {
+          "nonce": "r021-3d98907f",
+          "fsharpSourceSha256": "64eac52c03458aab6d1bd0fc4a608903acb04abb7cd2afe3811bb7343f9f5dd9",
+          "outputSha256": "4eecd5220a502b342507805edc2b8563735fd77627960ce20b93e9cd77534842",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 58.64139995537698,
+            "dotnet-fsi": 3313.714599935338,
+            "bun": 307.97030008397996,
+            "node": 90.17550013959408,
+            "python": 58.39779996313155
+          }
+        },
+        "typical": {
+          "nonce": "r021-80bccde9",
+          "fsharpSourceSha256": "495b3bf0ace8aff8369375c1bc1a2389d2f4e6a7b061a073528dbb96aad0f1b6",
+          "outputSha256": "2df3511c119f06bffcd25ee841b8341c83cec1b7f00242a0c97597c27e5b4fde",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 79.89579997956753,
+            "dotnet-fsi": 4821.353300008923,
+            "bun": 87.68179989419878,
+            "node": 120.00830005854368,
+            "python": 117.64849978499115
+          }
+        },
+        "diverse": {
+          "nonce": "r021-519bcd31",
+          "fsharpSourceSha256": "0153fce6186e1b239338606afe2d23aa7b4482a813b263c2cac61ca99f4d88a9",
+          "outputSha256": "7d0f15ccc8ecc97cc2e8063a5f3fade9ace363b7c2760a867ed8f5a923b27c5c",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 150.3657998982817,
+            "dotnet-fsi": 4665.727500105277,
+            "bun": 87.80959993600845,
+            "node": 104.8256999347359,
+            "python": 70.08429989218712
+          }
+        }
+      }
+    },
+    {
+      "round": 19,
+      "workloads": {
+        "hello": {
+          "nonce": "r022-a38a9896",
+          "fsharpSourceSha256": "9d7dc02a097d5f1d20124f42b5cc0e97d58e92c5b78167142f8273c75fa41268",
+          "outputSha256": "0f559dedfb886f35ad7923fd3a945449eecf0dc215be484946b6dea688d28f51",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3938.6849999427795,
+            "bun": 68.04719986394048,
+            "node": 91.98309993371367,
+            "python": 57.888400042429566,
+            "fsion": 55.734500056132674
+          }
+        },
+        "typical": {
+          "nonce": "r022-2363a09b",
+          "fsharpSourceSha256": "4a19c06b8e00eb68d9b5568e4dac97e4625dc0262b335dc750316d45f3bc8a5a",
+          "outputSha256": "a54c170971e7e3f67b6adc64736366ad4471bc01ce374278f0b6555fad9ff11d",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3850.7298999466,
+            "bun": 61.626699985936284,
+            "node": 85.26060008443892,
+            "python": 83.47370009869337,
+            "fsion": 72.26000004447997
+          }
+        },
+        "diverse": {
+          "nonce": "r022-eca926f9",
+          "fsharpSourceSha256": "e021a8e5498bb2dee0dbf42cea80dbe2d24251bdf09c4c9a5acea819cddb8944",
+          "outputSha256": "38ac796e5e49bf0bd0b10a15b1a83fd92a0e5a3fc6aed0c794025a219bf3c149",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3691.56329985708,
+            "bun": 64.31680009700358,
+            "node": 100.9541000239551,
+            "python": 59.80449984781444,
+            "fsion": 52.88089998066425
+          }
+        }
+      }
+    },
+    {
+      "round": 20,
+      "workloads": {
+        "hello": {
+          "nonce": "r023-2b59d336",
+          "fsharpSourceSha256": "f73650fd77cb728c481e13f99642abdae755c6353373d882e669d9b352cfd8ae",
+          "outputSha256": "ba2a2d9c7aed25b27cb4f6a72f9892fbca7d903fa37b81e4695b69148c941981",
+          "verified": true,
+          "timingsMs": {
+            "bun": 61.42750009894371,
+            "node": 93.85360009036958,
+            "python": 62.79909983277321,
+            "fsion": 54.07400010153651,
+            "dotnet-fsi": 3729.9734000116587
+          }
+        },
+        "typical": {
+          "nonce": "r023-0b8c24bc",
+          "fsharpSourceSha256": "d543fb14dd8e655e8493c82cb26fa8f1133583ee251039da58df7267a65ed791",
+          "outputSha256": "99c2fe8ba8ba8b863c57f8ddad5628fa1575a275e80b4b6b573616f7e31e493a",
+          "verified": true,
+          "timingsMs": {
+            "bun": 64.97980002313852,
+            "node": 90.11079999618232,
+            "python": 89.31049983948469,
+            "fsion": 92.0756000559777,
+            "dotnet-fsi": 3475.151800084859
+          }
+        },
+        "diverse": {
+          "nonce": "r023-ee959bc9",
+          "fsharpSourceSha256": "9d2ebf18c3181c8a15a00cb0bd48d7e5d24e96c522e5d8781ba3aefd3d95fdb0",
+          "outputSha256": "2fcf2b0ab27438ea2676acaeecbd70fb80ed100aa88595d46ec2c0283b375bfc",
+          "verified": true,
+          "timingsMs": {
+            "bun": 56.05599982663989,
+            "node": 75.97770006395876,
+            "python": 50.94380001537502,
+            "fsion": 48.97979996167123,
+            "dotnet-fsi": 3118.060600012541
+          }
+        }
+      }
+    },
+    {
+      "round": 21,
+      "workloads": {
+        "hello": {
+          "nonce": "r024-5818c70c",
+          "fsharpSourceSha256": "c5a4de2c0ff9ba8f8c9c5a3f9cbb44266362d48cbbddcace98e9dc0099777074",
+          "outputSha256": "39311f49c04674f890cec7943644f956b09e1c25982ff89fed6908059c9e268b",
+          "verified": true,
+          "timingsMs": {
+            "node": 83.27289996668696,
+            "python": 53.121300181373954,
+            "fsion": 54.007300175726414,
+            "dotnet-fsi": 4547.233199933544,
+            "bun": 54.17719995602965
+          }
+        },
+        "typical": {
+          "nonce": "r024-1eaa811d",
+          "fsharpSourceSha256": "9aaa65bc4dd75d5f6748cc32cb62540c141884c2a6b4b9760cc22b8aeaa33a62",
+          "outputSha256": "2364e20a522bf6ddd5e17b0ffb5fdeaef57971dff0b15df891a9a58b7756c994",
+          "verified": true,
+          "timingsMs": {
+            "node": 75.789799913764,
+            "python": 85.03369987010956,
+            "fsion": 82.42479991167784,
+            "dotnet-fsi": 3427.018800051883,
+            "bun": 62.73250002413988
+          }
+        },
+        "diverse": {
+          "nonce": "r024-bd16ec89",
+          "fsharpSourceSha256": "f47988effc88a1f3480a40ba597fcef0530cc0239b0b7d3610990a3910fc8c33",
+          "outputSha256": "b55501539ab86d88c6b63cff0c48fb86bb57d49b5e199bc6b6edb3c9c74f67d9",
+          "verified": true,
+          "timingsMs": {
+            "node": 77.22379988990724,
+            "python": 55.660200072452426,
+            "fsion": 52.51220008358359,
+            "dotnet-fsi": 3710.885100066662,
+            "bun": 58.86349990032613
+          }
+        }
+      }
+    },
+    {
+      "round": 22,
+      "workloads": {
+        "hello": {
+          "nonce": "r025-5d90c6ac",
+          "fsharpSourceSha256": "2a9a74416d631dcc06c43280313e372fddd30ee9e0118d3138afa2b3e5ac73a6",
+          "outputSha256": "df5dc75531e4aba801bde30ae6e1985d47997ce4e9ede90fcb74fa3b3339ac66",
+          "verified": true,
+          "timingsMs": {
+            "python": 61.869800090789795,
+            "fsion": 57.31009994633496,
+            "dotnet-fsi": 5069.174000062048,
+            "bun": 65.46179996803403,
+            "node": 79.24049999564886
+          }
+        },
+        "typical": {
+          "nonce": "r025-4c4f2829",
+          "fsharpSourceSha256": "7f84d35ae02e367c14961961bf58f0e3394a1dbe72fa38f193d635e26bbe529a",
+          "outputSha256": "68cfc4ae22892a06246a51a89d27b0dce77929d4a7945ab298485512d1aceae1",
+          "verified": true,
+          "timingsMs": {
+            "python": 78.42150004580617,
+            "fsion": 79.71540000289679,
+            "dotnet-fsi": 3330.1560999825597,
+            "bun": 51.36790010146797,
+            "node": 91.31460008211434
+          }
+        },
+        "diverse": {
+          "nonce": "r025-e308ee4b",
+          "fsharpSourceSha256": "4122855d506fa7e8cb6a40e5d7c499fcd0642f39a65655c6f54042a376682b97",
+          "outputSha256": "cf9980a4f5cd801a4f30e543f71f9a30f89087e5e9de428f2727e0061c19395b",
+          "verified": true,
+          "timingsMs": {
+            "python": 63.55759990401566,
+            "fsion": 224.88430002704263,
+            "dotnet-fsi": 3492.157500004396,
+            "bun": 70.50079992040992,
+            "node": 82.49919977970421
+          }
+        }
+      }
+    },
+    {
+      "round": 23,
+      "workloads": {
+        "hello": {
+          "nonce": "r026-747c5058",
+          "fsharpSourceSha256": "4ae325554f931ff7137ee2bd7c49c4dfed49d9be599b3b6109f103478f882637",
+          "outputSha256": "890ec69dbf9da217f55028321156514f5177822f9396aafc55a29d662e328bce",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 47.85700002685189,
+            "dotnet-fsi": 3156.217700103298,
+            "bun": 54.38179988414049,
+            "node": 79.43879999220371,
+            "python": 50.23719999007881
+          }
+        },
+        "typical": {
+          "nonce": "r026-d395bc88",
+          "fsharpSourceSha256": "710496d1cce61e4d28d988c16a88d45c87151b2eeec5dd92b58aeb46ece97f7c",
+          "outputSha256": "d5eafbbecb3da5af38eaaf3a647dbc81b47d3eaa028545642ed6221c0be58086",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 74.9534999486059,
+            "dotnet-fsi": 3365.285700187087,
+            "bun": 57.51310009509325,
+            "node": 77.3543999530375,
+            "python": 78.10460007749498
+          }
+        },
+        "diverse": {
+          "nonce": "r026-7cbb34a4",
+          "fsharpSourceSha256": "e8151e39cc7b58c4f14e2b404b5fa32f1fdc59f95b61bff3d4e018c6bf127deb",
+          "outputSha256": "2d25df634b4b4b0bcfdc449d68ba73315af76f26b33501882db02bc878aa6d72",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 47.485999995842576,
+            "dotnet-fsi": 3197.571699973196,
+            "bun": 52.89390007965267,
+            "node": 72.53889995627105,
+            "python": 54.38280012458563
+          }
+        }
+      }
+    },
+    {
+      "round": 24,
+      "workloads": {
+        "hello": {
+          "nonce": "r027-c89a078b",
+          "fsharpSourceSha256": "d798229c705eae3911bfc9d25b37fa4a1be8ae743bc9cbacb1289874f3446b52",
+          "outputSha256": "7520a0fe116d6209de70d789c1a21eaf7f1ba8f57a5b241065380f787494769d",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3018.558699870482,
+            "bun": 55.81960012204945,
+            "node": 72.27670005522668,
+            "python": 51.06800002977252,
+            "fsion": 48.60550002194941
+          }
+        },
+        "typical": {
+          "nonce": "r027-4646a842",
+          "fsharpSourceSha256": "055d0d3f76d3fb073cca212e53a237d9b36e4b0f8c354d8b1b6cdf596242c85d",
+          "outputSha256": "371c735adbdafcaa1a4e2f976974653f16205ad3fa921afdd56b11ee3b64d7c9",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3305.1974000409245,
+            "bun": 59.98979997821152,
+            "node": 74.81470005586743,
+            "python": 73.38070007972419,
+            "fsion": 68.54600016959012
+          }
+        },
+        "diverse": {
+          "nonce": "r027-03484a14",
+          "fsharpSourceSha256": "a5eaa8a4e994f86927830d6f497d7f78a6a75dcb61553d8c2bcb325bc8eecaba",
+          "outputSha256": "e5268c9a53892d990bd59fcac62540ebd8e26c2597cc8a44ed636ae8fbcbb220",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3274.7941999696195,
+            "bun": 56.102000176906586,
+            "node": 73.69240000844002,
+            "python": 51.82490008883178,
+            "fsion": 46.18289996869862
+          }
+        }
+      }
+    },
+    {
+      "round": 25,
+      "workloads": {
+        "hello": {
+          "nonce": "r028-a2f1b822",
+          "fsharpSourceSha256": "c7e7ef94eb503d13a32368fcfed75857ea0ebdbbc0863c117dfa4cce74f7ce96",
+          "outputSha256": "09a8c8f65ced7df45d32a45c8bb5b56e4e60190d649f2a350f653563a1166c73",
+          "verified": true,
+          "timingsMs": {
+            "bun": 58.12499998137355,
+            "node": 84.78579996153712,
+            "python": 59.57150016911328,
+            "fsion": 52.62210010550916,
+            "dotnet-fsi": 3144.471899839118
+          }
+        },
+        "typical": {
+          "nonce": "r028-05d3b845",
+          "fsharpSourceSha256": "738e49827b6ea90163a8d686c624eef098cccbe66a21a894d39480680f641d1f",
+          "outputSha256": "244c083d6b16aefd47b5be5a0fa3e38fdd922f4aacaba2a5a5cbe1d6ea0cd436",
+          "verified": true,
+          "timingsMs": {
+            "bun": 57.03650019131601,
+            "node": 82.98170007765293,
+            "python": 80.56359994225204,
+            "fsion": 68.60799994319677,
+            "dotnet-fsi": 3426.650600042194
+          }
+        },
+        "diverse": {
+          "nonce": "r028-af4cc849",
+          "fsharpSourceSha256": "0902881c970c9125007399912cf3b2ab39c9ec46e9304b128439cdc090d444d4",
+          "outputSha256": "d1893d8e944d8edbd134d5d2d9a4dfe99e0fd444350e7fd592baa1526c2d7592",
+          "verified": true,
+          "timingsMs": {
+            "bun": 257.96890002675354,
+            "node": 75.25030011311173,
+            "python": 54.217300144955516,
+            "fsion": 52.72989999502897,
+            "dotnet-fsi": 3547.454599989578
+          }
+        }
+      }
+    },
+    {
+      "round": 26,
+      "workloads": {
+        "hello": {
+          "nonce": "r029-f9b4625a",
+          "fsharpSourceSha256": "4ef3631d494fce40541c6fe32e88889342fd9c1f33a19bb82f40e1672581f2c2",
+          "outputSha256": "60081a79285068e71924fc4b60a9793eb029e8a4558f1046a8f0e98908a15224",
+          "verified": true,
+          "timingsMs": {
+            "node": 89.50040000490844,
+            "python": 63.28779994510114,
+            "fsion": 58.81850002333522,
+            "dotnet-fsi": 3815.23450021632,
+            "bun": 77.05110008828342
+          }
+        },
+        "typical": {
+          "nonce": "r029-4f684977",
+          "fsharpSourceSha256": "abe7e8cae15bf5e27f84320a3428aece4c6e6a69b8257367bf05ee7eef3cbeb4",
+          "outputSha256": "0cb84e2d4a69376088d7e2faa514e35c6c26c4ea177a582e74d3dfac065e7b1d",
+          "verified": true,
+          "timingsMs": {
+            "node": 106.00799997337162,
+            "python": 100.3198001999408,
+            "fsion": 91.46549995057285,
+            "dotnet-fsi": 3751.7096002120525,
+            "bun": 60.07999996654689
+          }
+        },
+        "diverse": {
+          "nonce": "r029-ba0b0ec4",
+          "fsharpSourceSha256": "421ce978b98ab9c1cc43f3db32d34c7cfae688470f6994b9d8d9d9c23743d5e2",
+          "outputSha256": "87411d3187f49b908e481d4167e8bc6991a463ef9425e27246673c49b5e7f002",
+          "verified": true,
+          "timingsMs": {
+            "node": 262.71619996987283,
+            "python": 57.52570019103587,
+            "fsion": 66.07739999890327,
+            "dotnet-fsi": 3339.246300049126,
+            "bun": 53.18540008738637
+          }
+        }
+      }
+    },
+    {
+      "round": 27,
+      "workloads": {
+        "hello": {
+          "nonce": "r030-e2fcf7ca",
+          "fsharpSourceSha256": "dead2d7981e2ff384b8c552f86d6439cf7ad9d512eb0ff99765163dcb9e79eb4",
+          "outputSha256": "e9f1d032ab62c868b4beb93bde004cf5f5fb6e4d7682ad1a5eda77015c88cef5",
+          "verified": true,
+          "timingsMs": {
+            "python": 236.64360004477203,
+            "fsion": 48.659399850293994,
+            "dotnet-fsi": 3377.5464000646025,
+            "bun": 57.938999962061644,
+            "node": 76.39600010588765
+          }
+        },
+        "typical": {
+          "nonce": "r030-39a172eb",
+          "fsharpSourceSha256": "b4e86dd36a04a383dab278e9b6b6d11f7b082b1fd284981daa73cac4c07f6a52",
+          "outputSha256": "19b35eb1494ac0aa5fef99fe3c9b2b6137f47478a2a08b50ee92db45a29a7beb",
+          "verified": true,
+          "timingsMs": {
+            "python": 273.62359990365803,
+            "fsion": 69.58230002783239,
+            "dotnet-fsi": 3546.959900064394,
+            "bun": 58.74900007620454,
+            "node": 79.76410002447665
+          }
+        },
+        "diverse": {
+          "nonce": "r030-2fc59f09",
+          "fsharpSourceSha256": "2db42df2a7b1c032b6239c963118c2d8d2da03f66567a4a7e6e1b6a7a37b74c5",
+          "outputSha256": "1747d8a7370abcc87f87e4a0632f8b5547db874172eff1a9da381ce34d460865",
+          "verified": true,
+          "timingsMs": {
+            "python": 53.97080001421273,
+            "fsion": 53.70739987120032,
+            "dotnet-fsi": 3309.041299857199,
+            "bun": 64.87040012143552,
+            "node": 81.78150001913309
+          }
+        }
+      }
+    },
+    {
+      "round": 28,
+      "workloads": {
+        "hello": {
+          "nonce": "r031-e440e00e",
+          "fsharpSourceSha256": "30f06ae25e61737b2ba419cbbbc35de416ea1a1afd5520599dbc6ce70d8fc599",
+          "outputSha256": "e4e0be2d3359566fd4fb650d99f0c7c98b11ebfb77326315ebfffde2c4f6703f",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 49.679400166496634,
+            "dotnet-fsi": 3392.99020008184,
+            "bun": 89.75829998962581,
+            "node": 109.52850012108684,
+            "python": 75.19240002147853
+          }
+        },
+        "typical": {
+          "nonce": "r031-da2efe35",
+          "fsharpSourceSha256": "d7605a286df96391dfc3b4be241d495d2981600bdaef54dc00c570031a0cb8e8",
+          "outputSha256": "ce42ad783cd06b46570aed19011261275738e3c95bba0827199f26761b23079b",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 301.3027999550104,
+            "dotnet-fsi": 4406.718400074169,
+            "bun": 100.84139998070896,
+            "node": 116.22139997780323,
+            "python": 110.11650017462671
+          }
+        },
+        "diverse": {
+          "nonce": "r031-ff824123",
+          "fsharpSourceSha256": "a83f7fc4441a8999e5078712963adc781a730b68c8b4cfa3eccd26b78e9bf3ee",
+          "outputSha256": "79cd4ce81b883df68062a873b30a12053101cf4d907a9c43ca4c580729990dd4",
+          "verified": true,
+          "timingsMs": {
+            "fsion": 209.6062998753041,
+            "dotnet-fsi": 4015.8460999373347,
+            "bun": 61.45539996214211,
+            "node": 76.95619994774461,
+            "python": 54.26459992304444
+          }
+        }
+      }
+    },
+    {
+      "round": 29,
+      "workloads": {
+        "hello": {
+          "nonce": "r032-89f6e99c",
+          "fsharpSourceSha256": "127a36c24e656e3156dc7876c2167e42ac43904753fbf4ba54d35c7b3e03175d",
+          "outputSha256": "502e0091404ea86c95b63c7a710906f5fe573d91667afa5175e28c4c5415034c",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3691.986999940127,
+            "bun": 72.49940000474453,
+            "node": 80.80490003339946,
+            "python": 53.50380018353462,
+            "fsion": 240.74039980769157
+          }
+        },
+        "typical": {
+          "nonce": "r032-9ae8264a",
+          "fsharpSourceSha256": "e30754767ad4811c05befad7334c042c97c4a104f413e04c829f3a38ad4254fd",
+          "outputSha256": "8bd8a446dc70d3a5ca06d04b35f257391a2fc53908d1d002eae0e3e84b4bdbf9",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3608.739399816841,
+            "bun": 61.44690001383424,
+            "node": 79.41920007579029,
+            "python": 73.13369982875884,
+            "fsion": 64.25970001146197
+          }
+        },
+        "diverse": {
+          "nonce": "r032-839ea7ca",
+          "fsharpSourceSha256": "91ba592855ceca4e8cb05432a4b0fc351f64a83784263684f828000b3f295cce",
+          "outputSha256": "8d55a706f508038ba993917e86f4a04b9031e229af21055cd7c1ddab645536aa",
+          "verified": true,
+          "timingsMs": {
+            "dotnet-fsi": 3449.805600102991,
+            "bun": 69.3701000418514,
+            "node": 95.35509999841452,
+            "python": 70.0128001626581,
+            "fsion": 63.33429994992912
+          }
+        }
+      }
+    },
+    {
+      "round": 30,
+      "workloads": {
+        "hello": {
+          "nonce": "r033-d1a68958",
+          "fsharpSourceSha256": "45a0fcd9fbab04f04425d0472d5a3fc6cfd9c53bf695ab88c28365bec6fff87e",
+          "outputSha256": "4438c28936eeb1f06456583f8abd97dc257aa21be00b812b6ab16e4109b30bb5",
+          "verified": true,
+          "timingsMs": {
+            "bun": 57.574399979785085,
+            "node": 245.2455998864025,
+            "python": 60.17720000818372,
+            "fsion": 538.6316999793053,
+            "dotnet-fsi": 3454.0409999899566
+          }
+        },
+        "typical": {
+          "nonce": "r033-a02c39f4",
+          "fsharpSourceSha256": "726c488333484a59d132e583c4112cf3e6fe06913d8470f333650e5179779dd3",
+          "outputSha256": "ee25272f76ed8c50aad2673845a12b0d9fe3a22f7a4c9a3cfbdd92070f92124b",
+          "verified": true,
+          "timingsMs": {
+            "bun": 61.411699978634715,
+            "node": 92.42200013250113,
+            "python": 87.02960005030036,
+            "fsion": 70.6670000217855,
+            "dotnet-fsi": 3447.906200075522
+          }
+        },
+        "diverse": {
+          "nonce": "r033-6029f1e6",
+          "fsharpSourceSha256": "b4e1bf07381f4504315bf8370e252aab7bf2f071f111e089f46b9212f534521d",
+          "outputSha256": "e60b201f03eb53bf00c39db9cea2014b5f2b2e00da8df88f42a1c2cf19ebdb0e",
+          "verified": true,
+          "timingsMs": {
+            "bun": 53.65380016155541,
+            "node": 78.59879988245666,
+            "python": 56.80329981260002,
+            "fsion": 60.50630006939173,
+            "dotnet-fsi": 3508.232499938458
+          }
+        }
+      }
+    }
+  ],
+  "ac07": {
+    "minSpeedupOverFsi": 20.0,
+    "maxRatioToBun": 1.0,
+    "verdicts": [
+      {
+        "label": "fsion >= 20x median speedup over dotnet fsi (typical)",
+        "detail": "43.24x (fsion 82.8 ms vs fsi 3578.3 ms)",
+        "pass": true
+      },
+      {
+        "label": "fsion reaches bun-class latency (typical)",
+        "detail": "fsion is 1.326x bun's median (fsion 82.8 ms vs bun 62.4 ms)",
+        "pass": false
+      }
+    ]
+  },
+  "resultsPath": "Q:\\repos\\fsion\\docs\\evidence\\0006-benchmark-results.json"
+}

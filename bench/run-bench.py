@@ -457,6 +457,16 @@ def _measure_phases(runner: Runner, data: dict, directory: Path, env: dict, time
                 raise SystemExit(f"phase parity failed: {nonce} {result['stderr']!r}")
             details.append({"nonce": nonce, "wallMs": result["ms"]})
             _read_metrics(env["FSION_PIPE"], env, timeout)
+            # Server logs `executed` immediately after `sendResponse` (so stderr/log backpressure
+            # never stalls client response delivery); wait briefly for this sequential sample's
+            # `executed` line to land before starting the next sample so log entries stay 1:1 ordered.
+            deadline = time.perf_counter() + 2.0
+            while time.perf_counter() < deadline:
+                if log.exists():
+                    trace_so_far = log.read_text(encoding="utf-8", errors="replace")
+                    if len(re.findall(r"executed exit=0 .* daemonMs=([\d.]+)", trace_so_far)) >= index:
+                        break
+                time.sleep(0.01)
     finally:
         _run_command(command + ["daemon", "stop"], directory, env, timeout)
     trace = log.read_text(encoding="utf-8")

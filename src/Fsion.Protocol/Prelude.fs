@@ -31,9 +31,7 @@ let private mapValue (environment: (string * string)[]) (name: string) =
         else
             None)
 
-let private cachedWindowsApplicationData =
-    lazy (Environment.GetFolderPath Environment.SpecialFolder.ApplicationData)
-
+let mutable private cachedWindowsApplicationData = ""
 let private posixAccountHomeDirectory () =
     let savedHome = Environment.GetEnvironmentVariable "HOME"
     try
@@ -61,10 +59,26 @@ let private cachedMacApplicationSupportDirectory =
             "")
 let initializeProcessCaches () =
     if OperatingSystem.IsWindows() then
-        cachedWindowsApplicationData.Value |> ignore
+        let resolved = Environment.GetFolderPath Environment.SpecialFolder.ApplicationData
+        if not (String.IsNullOrEmpty resolved) then
+            cachedWindowsApplicationData <- resolved
     else
         cachedPosixPasswdConfigDirectory.Value |> ignore
         cachedMacApplicationSupportDirectory.Value |> ignore
+
+let private resolveWindowsApplicationData () =
+    let cached = cachedWindowsApplicationData
+    if cached.Length > 0 then
+        cached
+    else
+        // Do not permanently cache an empty result (e.g. a fresh profile where Roaming AppData
+        // was created after the daemon started); re-query until non-empty.
+        let resolved = Environment.GetFolderPath Environment.SpecialFolder.ApplicationData
+        if not (String.IsNullOrEmpty resolved) then
+            cachedWindowsApplicationData <- resolved
+            resolved
+        else
+            ""
 
 let userPreludePathFrom
     (includeConfiguredConfigDir: bool)
@@ -77,8 +91,9 @@ let userPreludePathFrom
             if includeConfiguredConfigDir then Some directory else None
         | None ->
             if OperatingSystem.IsWindows() then
-                if cachedWindowsApplicationData.Value.Length > 0 then
-                    Some(Path.Combine(cachedWindowsApplicationData.Value, "fsion"))
+                let appData = resolveWindowsApplicationData ()
+                if appData.Length > 0 then
+                    Some(Path.Combine(appData, "fsion"))
                 else
                     None
             else

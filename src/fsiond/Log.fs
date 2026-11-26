@@ -24,8 +24,9 @@ let private openAppendStream (fullPath: string) : FileStream option =
         // Fast path: open existing path with `O_WRONLY | O_APPEND | O_NONBLOCK | O_CLOEXEC` (2 fixed args)
         // so a readerless POSIX FIFO fails immediately with ENXIO instead of blocking `open(2)`.
         // Creation path: only when `openExisting` fails with ENOENT (2) (missing file or dangling symlink),
-        // use .NET's `FileStream(FileMode.CreateNew)` which calls `open(O_CREAT | O_EXCL, 0666)` via
-        // CoreCLR's C PAL (ABI-safe on Apple arm64, atomic, non-truncating, never blocks on an existing FIFO).
+        // resolve any symlink chain (`ResolveLinkTarget(..., returnFinalTarget = true)`) so a dangling symlink's
+        // target path is created via .NET's `FileStream(FileMode.CreateNew)` (`open(O_CREAT | O_EXCL, 0666)` via
+        // CoreCLR's C PAL — ABI-safe on Apple arm64, atomic, non-truncating, never blocks on an existing FIFO).
         // Seek to End explicitly because .NET `FileStream(SafeFileHandle, ...)` starts at offset 0 and uses
         // `pwrite(2)`, which ignores `O_APPEND` on macOS.
         let oWrOnly = 0x0001
@@ -35,8 +36,15 @@ let private openAppendStream (fullPath: string) : FileStream option =
         let flags = oWrOnly ||| oAppend ||| oNonBlock ||| oCloExec
         let mutable fd = PosixLogOpen.openExisting(fullPath, flags)
         if fd < 0 && Marshal.GetLastPInvokeError() = 2 then // ENOENT on both Linux and macOS
+            let createTarget =
+                try
+                    match File.ResolveLinkTarget(fullPath, true) with
+                    | null -> fullPath
+                    | info -> info.FullName
+                with _ ->
+                    fullPath
             try
-                use _created = new FileStream(fullPath, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite ||| FileShare.Delete)
+                use _created = new FileStream(createTarget, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite ||| FileShare.Delete)
                 ()
             with :? IOException ->
                 // Another process created the file concurrently (EEXIST); retry openExisting below.

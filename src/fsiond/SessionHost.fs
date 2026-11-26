@@ -2078,8 +2078,7 @@ type SessionHost(options: SessionHostOptions) =
                     let snapshot =
                         lock poolGate (fun () ->
                             [| for candidate in pools do
-                                   if (quietIdle || candidate.WarmupWaiters > 0)
-                                      && (candidate.Warm.Count < targetPoolSize || candidate.Failure.IsSome || candidate.WarmupWaiters > 0) then
+                                   if quietIdle || candidate.WarmupWaiters > 0 then
                                        yield candidate |])
                     let tags = [| for candidate in snapshot -> candidate, tagOfSpec candidate.Spec |]
                     lock poolGate (fun () ->

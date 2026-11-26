@@ -795,13 +795,15 @@ type IsolationTests(output: ITestOutputHelper) =
                 // creation under `--pool-size 0` doesn't trigger natural Gen-2 collections on every cold compile.
                 let hasZeroGen2Step (counts: int[]) =
                     [ 0 .. counts.Length - 2 ] |> List.exists (fun i -> counts.[i + 1] = counts.[i])
-                let xmlLoadRes = context.Run([ "-e"; "let d = System.Xml.XmlDocument()\nd.LoadXml(\"<a/>\")\nSystem.Console.Write(d.DocumentElement.Name)" ], timeoutMs = 60000)
+                use warmCtx = new FsionContext(p0WorkDir)
+                assertRun (warmCtx.Run([ "--pool-size"; "4"; "warmup" ], timeoutMs = 120000))
+                let xmlLoadRes = warmCtx.Run([ "-e"; "let d = System.Xml.XmlDocument()\nd.LoadXml(\"<a/>\")\nSystem.Console.Write(d.DocumentElement.Name)" ], timeoutMs = 60000)
                 assertRun xmlLoadRes
                 Assert.Equal("a", xmlLoadRes.Stdout)
-                assertRun (context.Run([ "warmup" ], timeoutMs = 120000))
+                assertRun (warmCtx.Run([ "warmup" ], timeoutMs = 120000))
                 let gen2Counts =
                     [| for _ in 1 .. 4 ->
-                        let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
+                        let r = warmCtx.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
                 Assert.True(hasZeroGen2Step gen2Counts, sprintf "forced per-run Gen-2 after Xml load: %A" gen2Counts)
@@ -813,19 +815,19 @@ type IsolationTests(output: ITestOutputHelper) =
                           "let path = System.IO.Path.Combine(dir, \"System.Xml.XPath.XDocument.dll\")"
                           "use stream = System.IO.File.OpenRead path"
                           "System.Runtime.Loader.AssemblyLoadContext.Default.LoadFromAssemblyPath(path) |> ignore" ]
-                assertRun (context.Run([ "-e"; concurrentLoadCode ], timeoutMs = 60000))
-                assertRun (context.Run([ "warmup" ], timeoutMs = 120000))
+                assertRun (warmCtx.Run([ "-e"; concurrentLoadCode ], timeoutMs = 60000))
+                assertRun (warmCtx.Run([ "warmup" ], timeoutMs = 120000))
                 let afterLoadCounts =
                     [| for _ in 1 .. 4 ->
-                        let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
+                        let r = warmCtx.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
                 Assert.True(hasZeroGen2Step afterLoadCounts, sprintf "forced per-run Gen-2 after concurrent load: %A" afterLoadCounts)
             if OperatingSystem.IsLinux() then
                 // On Linux `/proc/self/fd`, enumerating the directory produces a vanished self-FD (`ENOENT`)
-                // With `System.GC.ConserveMemory = 9`, cold session creation (when pool depletes) may trigger
-                // natural Gen-2 collections, so assert that consecutive warm runs include zero-Gen-2 steps
-                // (proving per-run Gen-2 is NOT forced on every turn).
+                // and CoreCLR runtime FDs (e.g. CLR/DLL files), neither of which may force Gen-2 on stateless runs.
+                // Use a dedicated `--pool-size 4` daemon with `warmup` so all 4 turns hit warm sessions without
+                // cold session creation triggering `ConserveMemory=9` Gen-2 collections.
                 let linuxConcurrentLoadCode =
                     String.concat "\n"
                         [ "let dir = System.IO.Path.GetDirectoryName(typeof<obj>.Assembly.Location)"
@@ -834,17 +836,19 @@ type IsolationTests(output: ITestOutputHelper) =
                           "System.Runtime.Loader.AssemblyLoadContext.Default.LoadFromAssemblyPath(path) |> ignore" ]
                 let hasZeroGen2Step (counts: int[]) =
                     [ 0 .. counts.Length - 2 ] |> List.exists (fun i -> counts.[i + 1] = counts.[i])
+                use warmLinuxCtx = new FsionContext(p0WorkDir)
+                assertRun (warmLinuxCtx.Run([ "--pool-size"; "4"; "warmup" ], timeoutMs = 120000))
                 let warmLinuxCounts =
                     [| for _ in 1 .. 4 ->
-                        let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
+                        let r = warmLinuxCtx.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
                 Assert.True(hasZeroGen2Step warmLinuxCounts, sprintf "forced per-run Gen-2 on warm Linux daemon: %A" warmLinuxCounts)
-                assertRun (context.Run([ "-e"; linuxConcurrentLoadCode ], timeoutMs = 60000))
-                assertRun (context.Run([ "warmup" ], timeoutMs = 120000))
+                assertRun (warmLinuxCtx.Run([ "-e"; linuxConcurrentLoadCode ], timeoutMs = 60000))
+                assertRun (warmLinuxCtx.Run([ "warmup" ], timeoutMs = 120000))
                 let linuxAfterLoadCounts =
                     [| for _ in 1 .. 4 ->
-                        let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
+                        let r = warmLinuxCtx.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
                 Assert.True(

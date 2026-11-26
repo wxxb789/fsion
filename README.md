@@ -14,36 +14,26 @@ bindings alive across agent turns.
 
 ## Measured performance
 
-Goal 0006 measured the Windows `win-x64` (`net10.0`) package on `CPC-lhan-XF3D0M`: 30 interleaved rounds
-per workload after three warmups (`--phase-samples 12 --require-goal0006`, salt `714ecfed`, exit `0`).
-Every round generated fresh F# / TS / JS / Python source and verified byte-identical stdout across all
-five runners (`fsion`, `dotnet-fsi`, `bun`, `node`, `python`), followed by a 12-script zero-gap burst.
+Latest Windows `win-x64` (`net10.0`) benchmark on `CPC-lhan-XF3D0M` (post-Goal 0008, Goal 0009 harness): 30 interleaved rounds
+per workload after three warmups (`--phase-samples 12`, salt `fe94fc4a`).
+Every round generated fresh F# / TS / JS / Python / PowerShell source and verified byte-identical stdout across all
+seven runners (`fsion`, `dotnet-fsi`, `bun`, `node`, `python`, `pwsh` 7.6 `-NoProfile`, `powershell` 5.1 `-NoProfile`), followed by a 12-script zero-gap burst.
 
-| Workload | `fsion` median | `bun` median | `node` median | `python` median | `dotnet fsi` median | `fsion` vs `dotnet fsi` |
-|---|---:|---:|---:|---:|---:|---:|
-| `hello` (fresh script) | **57.4 ms** | 61.7 ms | 89.0 ms | 59.9 ms | 3439.6 ms | **59.9x faster** (faster than `bun` & `python`) |
-| `typical` (JSON filter/sort + env) | **82.8 ms** | 62.4 ms | 91.1 ms | 88.3 ms | 3578.3 ms | **43.2x faster** (faster than `node` & `python`) |
-| `diverse` (DU / pipeline / StringBuilder / try) | **60.2 ms** | 64.4 ms | 92.1 ms | 57.6 ms | 3540.8 ms | **58.8x faster** (faster than `bun` & `node`) |
-| `burst` (12 back-to-back unseen `typical` scripts) | **85.8 ms** (max 190.9 ms) | 63.9 ms (max 280.3 ms) | — | — | — | 0 cold claims, 0 leaked sessions |
+| Workload | `fsion` median | `bun` median | `node` median | `python` median | `powershell` 5.1 | `pwsh` 7.6 | `dotnet fsi` | `fsion` speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `hello` (fresh script) | **67.2 ms** | 60.0 ms | 88.2 ms | 55.0 ms | 341.1 ms | 596.4 ms | 3116.0 ms | **46.4x** vs `fsi`, **5.1x** vs PS 5.1, **8.9x** vs `pwsh` |
+| `typical` (JSON filter/sort + env) | **90.2 ms** | 60.1 ms | 80.5 ms | 77.7 ms | 650.7 ms | 685.4 ms | 3294.4 ms | **36.5x** vs `fsi`, **7.2x** vs PS 5.1, **7.6x** vs `pwsh` |
+| `diverse` (4 rotating variants) | **67.9 ms** | 62.4 ms | 80.4 ms | 52.0 ms | 349.7 ms | 528.0 ms | 3317.1 ms | **48.8x** vs `fsi`, **5.1x** vs PS 5.1, **7.8x** vs `pwsh` |
+| `burst` (12 zero-gap `typical`) | **71.2 ms** (max 87.9 ms) | 55.7 ms (max 227.6 ms) | — | — | 588.7 ms (max 736.6 ms) | 647.5 ms (max 826.3 ms) | — | **8.3x** vs PS 5.1, **9.1x** vs `pwsh`; 0 cold claims, 0 leaked sessions |
 
-All nine Goal 0006 thresholds passed (`9/9 PASS`). On the separate historical AC-07 check, `fsion`
-passes `>= 20x` over `dotnet fsi` (`43.24x`) while `typical <= 1.00x bun` remains `FAIL` (`1.326x`:
-the 12-sample phase probe attributes ~35.7 ms to Windows process spawn + named-pipe IPC, ~14.7 ms to daemon gate/release, and ~47.8 ms
-to full F# Hindley-Milner typechecking + in-memory IL emit + execution). See the
-[Goal 0006 benchmark report](docs/evidence/0006-benchmark-report.md) and
-[Goal 0006 evidence](docs/evidence/0006-evidence.md) for full distributions and package SHA-256s.
+See the [Goal 0009 benchmark report](docs/evidence/0009-benchmark-report.md) and
+[Goal 0009 evidence](docs/evidence/0009-evidence.md) for full distributions, and the
+[Goal 0006 benchmark report](docs/evidence/0006-benchmark-report.md) (`9/9 PASS`, 5-runner `hello` 57.4 ms / `typical` 82.8 ms / `diverse` 60.2 ms) for the pre-0007 baseline.
 
 After the build and test gate has finished, run `python bench/run-bench.py` from the repository
-root. It writes the [Goal 0006 report](docs/evidence/0006-benchmark-report.md) and
-[raw results](docs/evidence/0006-benchmark-results.json) without changing the historical
-Goal 0005 files. By default, exit 0 means the run completed and output parity held. Use
-`--require-goal0006` to fail on any Goal 0006 threshold; it requires `hello`, `typical`,
-`diverse`, at least 30 measured rounds, `--warmup >= 1`, `--phase-samples >= 1`, `burstRuns >= 12`, and all five runners (`fsion`,
-`dotnet-fsi`, `bun`, `node`, `python`). Use `--require-ac07` to enforce the separate historical AC-07 thresholds. See
-[Goal 0006 evidence](docs/evidence/0006-evidence.md) for the same-harness baseline and exact
-packaged command. Never run the benchmark concurrently with
+root. By default, exit 0 means the run completed and output parity held across all discovered runners
+(non-Windows hosts automatically skip Windows PowerShell 5.1). Never run the benchmark concurrently with
 the test suite.
-
 ## Architecture
 
 ```

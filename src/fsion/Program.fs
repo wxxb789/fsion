@@ -327,22 +327,59 @@ let private sendAndReceive (stream: Stream) (timeoutMs: int option) (request: Re
     if not delivered then
         NotDelivered
     else
+        let mutable stdinStream: Stream option = None
+        let readNextResponse () =
+            let rec loop () =
+                match tryReceiveFrame stream with
+                | None -> NoResponse
+                | Some payload ->
+                    match parseResponse payload with
+                    | StdinReadRequest maxBytes ->
+                        // Demand-driven pull-on-read stdin forwarding: only open and read OS stdin
+                        // when the running script actually reads Console.In / stdin.
+                        let input =
+                            match stdinStream with
+                            | Some s -> s
+                            | None ->
+                                let opened = Console.OpenStandardInput()
+                                stdinStream <- Some opened
+                                opened
+                        let count = max 1 (min (64 * 1024) maxBytes)
+                        let buffer = Array.zeroCreate<byte> count
+                        let read =
+                            try
+                                input.Read(buffer, 0, count)
+                            with _ ->
+                                0
+                        let chunk =
+                            if read <= 0 then
+                                StdinChunk([||], true)
+                            elif read = count then
+                                StdinChunk(buffer, false)
+                            else
+                                StdinChunk(buffer.[0 .. read - 1], false)
+                        try
+                            sendRequest stream chunk
+                            loop ()
+                        with _ ->
+                            NoResponse
+                    | response -> Delivered response
+            try
+                loop ()
+            finally
+                stdinStream |> Option.iter (fun s -> try s.Dispose() with _ -> ())
+
         match timeoutMs with
         | Some timeoutMs when timeoutMs > 0 ->
-            let receive = Task.Run(fun () -> tryReceiveFrame stream)
+            let receive = Task.Run(fun () -> readNextResponse ())
             // Last-resort net only: fsiond enforces --timeout after the session is acquired, so
             // cold daemon/session creation must not be charged against this client deadline.
             if receive.Wait(timeoutMs + 30000) then
-                match receive.Result with
-                | Some payload -> Delivered(parseResponse payload)
-                | None -> NoResponse
+                receive.Result
             else
                 DeadlineExpired timeoutMs
         | _ ->
-            match tryReceiveFrame stream with
-            | Some payload -> Delivered(parseResponse payload)
-            | None -> NoResponse
-
+            readNextResponse ()
 let private timeoutResult (timeoutMs: int) : ExecutionResult =
     { ExitCode = TimeoutExitCode
       StandardOut = ""

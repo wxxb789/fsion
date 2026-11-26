@@ -230,6 +230,101 @@ let private removeUnmanagedDll (handlers: Delegate[]) =
     for handler in handlers do
         unmanagedDllEvent.RemoveEventHandler(defaultLoadContext, handler)
 
+let private firstChanceField =
+    typeof<AppContext>.GetField("FirstChanceException", BindingFlags.Static ||| BindingFlags.NonPublic)
+
+let private unhandledExceptionField =
+    typeof<AppContext>.GetField("UnhandledException", BindingFlags.Static ||| BindingFlags.NonPublic)
+let private resolvingField =
+    typeof<AssemblyLoadContext>.GetField("_resolving", BindingFlags.Instance ||| BindingFlags.NonPublic)
+
+let private resolvingEvent = typeof<AssemblyLoadContext>.GetEvent "Resolving"
+
+let private unobservedTaskField =
+    typeof<TaskScheduler>.GetField("UnobservedTaskException", BindingFlags.Static ||| BindingFlags.NonPublic)
+
+let private snapshotFieldDelegate (field: FieldInfo) (target: obj) : Delegate[] =
+    if isNull field then [||]
+    else
+        try
+            match field.GetValue target with
+            | :? Delegate as d -> invocationList d
+            | _ -> [||]
+        with _ -> [||]
+
+let private removeFieldDelegates (field: FieldInfo) (target: obj) (added: Delegate[]) =
+    if not (isNull field) && added.Length > 0 then
+        try
+            let mutable current = field.GetValue target :?> Delegate
+            for h in added do
+                current <- Delegate.Remove(current, h)
+            field.SetValue(target, current)
+        with _ -> ()
+
+[<NoComparison; NoEquality>]
+type private GlobalStateSnapshot =
+    { FirstChance: Delegate[]
+      UnhandledException: Delegate[]
+      ProcessExit: Delegate[]
+      AssemblyResolve: Delegate[]
+      Resolving: Delegate[]
+      ResolvingUnmanagedDll: Delegate[]
+      UnobservedTask: Delegate[]
+      DefaultCulture: CultureInfo
+      DefaultUICulture: CultureInfo
+      CurrentCulture: CultureInfo
+      CurrentUICulture: CultureInfo
+      TraceListeners: TraceListener[] }
+
+let private captureGlobalState () : GlobalStateSnapshot =
+    let listeners =
+        try
+            let arr = Array.zeroCreate<TraceListener> Trace.Listeners.Count
+            Trace.Listeners.CopyTo(arr, 0)
+            arr
+        with _ -> [||]
+    { FirstChance = snapshotFieldDelegate firstChanceField null
+      UnhandledException = snapshotFieldDelegate unhandledExceptionField null
+      ProcessExit = processExitSnapshot ()
+      AssemblyResolve = assemblyResolveSnapshot ()
+      Resolving = snapshotFieldDelegate resolvingField defaultLoadContext
+      ResolvingUnmanagedDll = unmanagedDllSnapshot ()
+      UnobservedTask = snapshotFieldDelegate unobservedTaskField null
+      DefaultCulture = CultureInfo.DefaultThreadCurrentCulture
+      DefaultUICulture = CultureInfo.DefaultThreadCurrentUICulture
+      CurrentCulture = CultureInfo.CurrentCulture
+      CurrentUICulture = CultureInfo.CurrentUICulture
+      TraceListeners = listeners }
+
+let private restoreGlobalState (snap: GlobalStateSnapshot) =
+    Ambient.ensureInstalled ()
+    removeFieldDelegates firstChanceField null (addedHandlers snap.FirstChance (snapshotFieldDelegate firstChanceField null))
+    removeFieldDelegates unhandledExceptionField null (addedHandlers snap.UnhandledException (snapshotFieldDelegate unhandledExceptionField null))
+    removeProcessExit (addedHandlers snap.ProcessExit (processExitSnapshot ()))
+    removeAssemblyResolve (addedHandlers snap.AssemblyResolve (assemblyResolveSnapshot ()))
+    let addedResolving = addedHandlers snap.Resolving (snapshotFieldDelegate resolvingField defaultLoadContext)
+    if addedResolving.Length > 0 && not (isNull resolvingEvent) then
+        for h in addedResolving do
+            try resolvingEvent.RemoveEventHandler(defaultLoadContext, h) with _ -> ()
+    removeUnmanagedDll (addedHandlers snap.ResolvingUnmanagedDll (unmanagedDllSnapshot ()))
+    removeFieldDelegates unobservedTaskField null (addedHandlers snap.UnobservedTask (snapshotFieldDelegate unobservedTaskField null))
+    if not (Object.ReferenceEquals(CultureInfo.DefaultThreadCurrentCulture, snap.DefaultCulture)) then
+        CultureInfo.DefaultThreadCurrentCulture <- snap.DefaultCulture
+    if not (Object.ReferenceEquals(CultureInfo.DefaultThreadCurrentUICulture, snap.DefaultUICulture)) then
+        CultureInfo.DefaultThreadCurrentUICulture <- snap.DefaultUICulture
+    if not (Object.ReferenceEquals(CultureInfo.CurrentCulture, snap.CurrentCulture)) then
+        CultureInfo.CurrentCulture <- snap.CurrentCulture
+    if not (Object.ReferenceEquals(CultureInfo.CurrentUICulture, snap.CurrentUICulture)) then
+        CultureInfo.CurrentUICulture <- snap.CurrentUICulture
+    try
+        if Trace.Listeners.Count <> snap.TraceListeners.Length then
+            let keep = HashSet<TraceListener>(snap.TraceListeners)
+            for i = Trace.Listeners.Count - 1 downto 0 do
+                let listener = Trace.Listeners.[i]
+                if not (keep.Contains listener) then
+                    Trace.Listeners.RemoveAt i
+    with _ -> ()
+
 let private checkerField =
     typeof<FsiEvaluationSession>.GetField("checker", BindingFlags.Instance ||| BindingFlags.NonPublic)
 
@@ -1126,9 +1221,13 @@ let private prelude (exitMarker: string) =
           "let fsi = fsionFsiState\n"
           "exception FsionExit of int\n"
           "let exit (code: int) : 'T =\n"
-          "    fsionFsiState.Exited <- true\n"
-          "    fsionFsiState.ExitCode <- code\n"
-          "    System.Console.Error.Write(\""
+          "    if not fsionFsiState.Exited then\n"
+          "        fsionFsiState.Exited <- true\n"
+          "        fsionFsiState.ExitCode <- code\n"
+          "        System.Console.Out.Write(\""
+          exitMarker
+          "\")\n"
+          "        System.Console.Error.Write(\""
           exitMarker
           "\")\n"
           "    raise (FsionExit code)\n" ]
@@ -2160,19 +2259,29 @@ type SessionHost(options: SessionHostOptions) =
 
                     diagnostics |> Array.map scriptDiagnostic
 
+        let applyExitIfTriggered () =
+            if claimed.ExitedProperty.Value.GetValue state :?> bool then
+                let outText = outWriter.SafeText()
+                let outIdx = outText.IndexOf(claimed.ExitMarker, StringComparison.Ordinal)
+                if outIdx >= 0 then
+                    outWriter.TruncateAt outIdx
+                let errText = errWriter.SafeText()
+                let errIdx = errText.IndexOf(claimed.ExitMarker, StringComparison.Ordinal)
+                if errIdx >= 0 then
+                    errWriter.TruncateAt errIdx
+                Some(claimed.ExitCodeProperty.Value.GetValue state :?> int, [||])
+            else
+                None
+
         try
             run ()
-            0, [||]
+            match applyExitIfTriggered () with
+            | Some res -> res
+            | None -> 0, [||]
         with :? FsiCompilationException ->
-            if claimed.ExitedProperty.Value.GetValue state :?> bool then
-                let text = errWriter.SafeText()
-                let markerIndex = text.IndexOf(claimed.ExitMarker, StringComparison.Ordinal)
-
-                if markerIndex >= 0 then
-                    errWriter.TruncateAt markerIndex
-
-                claimed.ExitCodeProperty.Value.GetValue state :?> int, [||]
-            else
+            match applyExitIfTriggered () with
+            | Some res -> res
+            | None ->
                 // A failed compilation emits no CLR types for the failing interaction (and `#load`
                 // interactions pre-checked clean set `typesBeforeCurrentEval = Int32.MinValue`), so
                 // `emittedTypeCount () > typesBeforeCurrentEval` proves user IL ran without sniffing text.
@@ -2622,7 +2731,8 @@ type SessionHost(options: SessionHostOptions) =
 
     member _.ExecutedCount = executed.Value
 
-    member _.Execute(request: ExecuteRequest, disconnectToken: CancellationToken) : ExecutionReport =
+    member _.Execute(request: ExecuteRequest, disconnectToken: CancellationToken, ?stdinReader: TextReader) : ExecutionReport =
+        let runStdin = defaultArg stdinReader TextReader.Null
         let timeoutMs = request.TimeoutMs
         use runCts = new CancellationTokenSource()
         let timeoutFired = ref 0
@@ -2695,7 +2805,8 @@ type SessionHost(options: SessionHostOptions) =
                 else
                         entered <- true
                         try
-                            Ambient.set { Out = outWriter; Error = errWriter; In = TextReader.Null }
+                            let globalStateBefore = captureGlobalState ()
+                            Ambient.set { Out = outWriter; Error = errWriter; In = runStdin }
 
                             try
                                 match claimed.CancellationTokenProperty, claimed.State with
@@ -2749,6 +2860,7 @@ type SessionHost(options: SessionHostOptions) =
                                     | _ -> ()
                             finally
                                 Ambient.clear ()
+                                restoreGlobalState globalStateBefore
                         finally
                             if entered then
                                 processState.Exit ()

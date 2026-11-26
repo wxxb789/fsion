@@ -4,6 +4,7 @@ open System
 open System.Diagnostics
 open System.Globalization
 open System.IO
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open Fsion.Ipc
@@ -23,12 +24,62 @@ type Options =
       Prelude: Prelude.Spec }
 type [<NoEquality; NoComparison>] private Hooks =
     { EnsureWarm: Prelude.Spec -> unit
-      Execute: ExecuteRequest -> CancellationToken -> ExecutionReport
+      Execute: ExecuteRequest -> CancellationToken -> TextReader -> ExecutionReport
       Status: unit -> StatusInfo
       Metrics: unit -> MetricsInfo
       Retire: unit -> unit
       Respawn: unit -> unit
       Stop: unit -> unit }
+
+// Pull-on-read Stream backed by IPC StdinReadRequest / StdinChunk frames.
+// Reads zero bytes from the connection until a script actually calls Console.In / stdin.
+type private PullStdinStream
+    (
+        connection: Stream,
+        sendGate: obj,
+        readChunk: unit -> (byte[] * bool) option
+    ) =
+    inherit Stream()
+
+    let mutable eof = false
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+    override _.Position
+        with get () = raise (NotSupportedException())
+        and set _ = raise (NotSupportedException())
+    override _.Flush() = ()
+    override _.Seek(_, _) = raise (NotSupportedException())
+    override _.SetLength _ = raise (NotSupportedException())
+    override _.Write(_, _, _) = raise (NotSupportedException())
+
+    override _.Read(buffer: byte[], offset: int, count: int) : int =
+        if eof || count <= 0 then
+            0
+        else
+            let requested = min (64 * 1024) count
+            try
+                lock sendGate (fun () -> sendResponse connection (StdinReadRequest requested))
+            with _ ->
+                eof <- true
+                ()
+            if eof then
+                0
+            else
+                match readChunk () with
+                | None ->
+                    eof <- true
+                    0
+                | Some (data, isEof) ->
+                    if isEof || data.Length = 0 then
+                        eof <- true
+                        0
+                    else
+                        let toCopy = min count data.Length
+                        Buffer.BlockCopy(data, 0, buffer, offset, toCopy)
+                        toCopy
 
 let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) =
     use connection = stream
@@ -43,24 +94,49 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
             requestVersion <- reqVer
             match req with
             | Execute request ->
-                use monitorCancellation = new CancellationTokenSource()
                 use disconnects = new CancellationTokenSource()
-                let monitorBuffer: byte[] = Array.zeroCreate 1
-                let monitorRead = connection.ReadAsync(monitorBuffer, 0, 1, monitorCancellation.Token)
+                let sendGate = obj ()
+                let stdinChunks = new System.Collections.Concurrent.BlockingCollection<(byte[] * bool) option>()
+                // Single reader loop on the connection: delivers StdinChunk frames to the PullStdinStream
+                // when the script reads stdin, and signals disconnects on EOF.
+                let readerTask =
+                    Task.Run(fun () ->
+                        try
+                            let rec loop () =
+                                match tryReceiveFrame connection with
+                                | None ->
+                                    try disconnects.Cancel() with _ -> ()
+                                    stdinChunks.Add None
+                                | Some frame ->
+                                    match parseRequest frame with
+                                    | StdinChunk (data, isEof) ->
+                                        stdinChunks.Add(Some(data, isEof))
+                                        loop ()
+                                    | _ ->
+                                        loop ()
+                            loop ()
+                        with _ ->
+                            try disconnects.Cancel() with _ -> ()
+                            try stdinChunks.Add None with _ -> ())
 
-                monitorRead.ContinueWith(
-                    (fun (completed: Task<int>) ->
-                        if completed.IsCompletedSuccessfully && completed.Result = 0 then
-                            try
-                                disconnects.Cancel()
-                            with _ ->
-                                ()),
-                    TaskScheduler.Default
-                )
-                |> ignore
+                let stdinReader: TextReader =
+                    if request.Mode = "stdin" then
+                        TextReader.Null
+                    else
+                        let pullStream =
+                            new PullStdinStream(
+                                connection,
+                                sendGate,
+                                fun () ->
+                                    try
+                                        stdinChunks.Take(disconnects.Token)
+                                    with _ ->
+                                        None
+                            )
+                        new StreamReader(pullStream, UTF8Encoding(false), detectEncodingFromByteOrderMarks = true, bufferSize = 4096) :> TextReader
 
                 let started = Stopwatch.GetTimestamp()
-                let report = hooks.Execute request disconnects.Token
+                let report = hooks.Execute request disconnects.Token stdinReader
                 let daemonMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
 
                 let logExecuted () =
@@ -82,16 +158,18 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
                     hooks.Retire ()
 
                 try
-                    sendResponse
-                        connection
-                        (Executed
-                            { ExitCode = report.Outcome.ExitCode
-                              StandardOut = report.Outcome.StandardOut
-                              StandardError = report.Outcome.StandardError
-                              Diagnostics = report.Outcome.Diagnostics
-                              TimedOut = report.Outcome.TimedOut })
+                    lock sendGate (fun () ->
+                        sendResponse
+                            connection
+                            (Executed
+                                { ExitCode = report.Outcome.ExitCode
+                                  StandardOut = report.Outcome.StandardOut
+                                  StandardError = report.Outcome.StandardError
+                                  Diagnostics = report.Outcome.Diagnostics
+                                  TimedOut = report.Outcome.TimedOut }))
                 finally
-                    monitorCancellation.Cancel ()
+                    try stdinChunks.CompleteAdding() with _ -> ()
+                    ignore readerTask
 
                     if report.Wedged then
                         hooks.Respawn ()
@@ -108,6 +186,7 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
             | Shutdown ->
                 sendResponseWithVersion requestVersion connection ShuttingDown
                 hooks.Stop ()
+            | StdinChunk _ -> ()
     with ex ->
         Log.error options.LogPath ("connection error: " + ex.ToString())
         try
@@ -206,8 +285,8 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
                 session.EnsureWarm spec
                 touchActivity ()
           Execute =
-            fun request disconnectToken ->
-                let report = session.Execute(request, disconnectToken)
+            fun request disconnectToken stdinReader ->
+                let report = session.Execute(request, disconnectToken, stdinReader)
                 touchActivity ()
                 report
           Status =

@@ -74,7 +74,17 @@ let outWriter: TextWriter = new RoutingWriter(fun streams -> streams.Out)
 
 let errorWriter: TextWriter = new RoutingWriter(fun streams -> streams.Error)
 
+let inReader: TextReader = new RoutingReader()
+
 let install () =
     Console.SetOut outWriter
     Console.SetError errorWriter
-    Console.SetIn(new RoutingReader())
+    Console.SetIn inReader
+
+let ensureInstalled () =
+    if not (Object.ReferenceEquals(Console.Out, outWriter)) then
+        Console.SetOut outWriter
+    if not (Object.ReferenceEquals(Console.Error, errorWriter)) then
+        Console.SetError errorWriter
+    if not (Object.ReferenceEquals(Console.In, inReader)) then
+        Console.SetIn inReader

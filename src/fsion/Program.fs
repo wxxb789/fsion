@@ -244,9 +244,7 @@ let private resolvePrelude (includeImplicitUserPrelude: bool) (options: Options)
             else
                 match Environment.GetEnvironmentVariable PreludeConfig.ConfigDirectoryEnvironmentVariable with
                 | null | "" -> Ok None
-                | configDir ->
-                    let candidate = Path.Combine(Path.GetFullPath configDir, "prelude.fsx")
-                    if File.Exists candidate then Ok(Some candidate) else Ok None
+                | _ -> Ok(PreludeConfig.userPreludePath ())
 
 let private findDaemonBinary () =
     match Environment.GetEnvironmentVariable "FSIOND_PATH" with

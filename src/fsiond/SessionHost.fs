@@ -469,6 +469,7 @@ module private WinHandleTable =
             Marshal.FreeHGlobal buf
 
     let mutable private assemblyLoadHooked = false
+    let private pendingDefaultAsmCandidates = Dictionary<struct (uint32 * uint64), HashSet<nativeint>>()
 
     let private recordHandleBaselineForAssembly (asm: Assembly) =
         if OperatingSystem.IsWindows()
@@ -490,10 +491,13 @@ module private WinHandleTable =
                             lock baselineSync (fun () ->
                                 match baselineHandlesOpt with
                                 | ValueSome baseline ->
-                                    // Only add to baseline when there is a single matching handle (not a pre-existing
-                                    // user FileStream + CoreCLR handle) and the assembly belongs to the Default ALC.
-                                    // If a user already opened the file before loading it, multiple handles match and
-                                    // we conservatively skip adding either so HasPreExistingUserFiles stays true.
+                                    // Only add immediately when there is a single matching handle (no concurrent user
+                                    // FileStream). If multiple handles match at AssemblyLoad time (e.g. a user held a
+                                    // FileStream open while loading the DLL into Default ALC), record the exact
+                                    // `(vol, fileIdx) -> {HandleValue}` candidates captured at load time; once the user
+                                    // closes their FileStream so only one of those exact load-time handles remains,
+                                    // `snapshot()` promotes that sole CoreCLR PE handle into `baseline` and clears the
+                                    // candidate entry.
                                     let matched = ResizeArray<struct (nativeint * uint32 * uint64)>()
                                     for id in current do
                                         let struct (h, vol, _) = id
@@ -507,6 +511,18 @@ module private WinHandleTable =
                                                     matched.Add id
                                     if matched.Count = 1 && not (baseline.Contains matched.[0]) then
                                         baseline.Add matched.[0] |> ignore
+                                    elif matched.Count > 1 then
+                                        for id in matched do
+                                            let struct (h, vol, fileIdx) = id
+                                            let fileKey = struct (vol, fileIdx)
+                                            let set =
+                                                match pendingDefaultAsmCandidates.TryGetValue fileKey with
+                                                | true, existing -> existing
+                                                | false, _ ->
+                                                    let created = HashSet<nativeint>()
+                                                    pendingDefaultAsmCandidates.[fileKey] <- created
+                                                    created
+                                            set.Add h |> ignore
                                 | ValueNone -> ())
                         finally
                             Marshal.FreeHGlobal pathBuf
@@ -558,6 +574,33 @@ module private WinHandleTable =
                     match baselineHandlesOpt with
                     | ValueNone -> ValueNone
                     | ValueSome baseline ->
+                        if pendingDefaultAsmCandidates.Count > 0 then
+                            let countsByFile = Dictionary<struct (uint32 * uint64), ResizeArray<struct (nativeint * uint32 * uint64)>>()
+                            for id in current do
+                                let struct (_, vol, fileIdx) = id
+                                let fileKey = struct (vol, fileIdx)
+                                if pendingDefaultAsmCandidates.ContainsKey fileKey then
+                                    let list =
+                                        match countsByFile.TryGetValue fileKey with
+                                        | true, existing -> existing
+                                        | false, _ ->
+                                            let created = ResizeArray()
+                                            countsByFile.[fileKey] <- created
+                                            created
+                                    list.Add id
+                            let resolved = ResizeArray<struct (uint32 * uint64)>()
+                            for KeyValue(fileKey, candidateHandles) in pendingDefaultAsmCandidates do
+                                match countsByFile.TryGetValue fileKey with
+                                | true, live when live.Count = 1 ->
+                                    let struct (h, _, _) as soleId = live.[0]
+                                    if candidateHandles.Contains h then
+                                        baseline.Add soleId |> ignore
+                                        resolved.Add fileKey
+                                | false, _ ->
+                                    resolved.Add fileKey
+                                | _ -> ()
+                            for key in resolved do
+                                pendingDefaultAsmCandidates.Remove key |> ignore
                         let hs = HashSet<struct (nativeint * uint32 * uint64)>()
                         let seenFiles = HashSet<struct (uint32 * uint64)>()
                         let mutable hasUserFiles = false

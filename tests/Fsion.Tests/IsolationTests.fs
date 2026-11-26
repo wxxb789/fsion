@@ -801,6 +801,18 @@ type IsolationTests(output: ITestOutputHelper) =
                 let c2Before = Int32.Parse(gen2ProbeBefore.Stdout.Trim())
                 let c2After = Int32.Parse(gen2ProbeAfter.Stdout.Trim())
                 Assert.Equal(c2Before, c2After)
+                // Loading a Default-ALC BCL DLL while a user FileStream temporarily holds the same DLL open
+                // must promote the remaining CoreCLR PE handle once the user stream closes, avoiding per-run Gen-2.
+                let concurrentLoadCode =
+                    String.concat "\n"
+                        [ "let dir = System.IO.Path.GetDirectoryName(typeof<obj>.Assembly.Location)"
+                          "let path = System.IO.Path.Combine(dir, \"System.Xml.XPath.XDocument.dll\")"
+                          "use stream = System.IO.File.OpenRead path"
+                          "System.Runtime.Loader.AssemblyLoadContext.Default.LoadFromAssemblyPath(path) |> ignore" ]
+                assertRun (runP0 [ "-e"; concurrentLoadCode ])
+                let c2AfterLoad1 = Int32.Parse((runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]).Stdout.Trim())
+                let c2AfterLoad2 = Int32.Parse((runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]).Stdout.Trim())
+                Assert.Equal(c2AfterLoad1, c2AfterLoad2)
             if OperatingSystem.IsLinux() then
                 // On Linux `/proc/self/fd`, enumerating the directory produces a vanished self-FD (`ENOENT`)
                 // that must not force Gen-2 on stateless runs with no user files.

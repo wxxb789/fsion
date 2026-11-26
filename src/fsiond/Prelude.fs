@@ -37,9 +37,6 @@ module private PosixOpen =
     [<DllImport("libc", EntryPoint = "open", SetLastError = true)>]
     extern int openFd(string pathname, int flags)
 
-    [<DllImport("libc", EntryPoint = "close", SetLastError = true)>]
-    extern int closeFd(int fd)
-
     [<DllImport("libc", EntryPoint = "fcntl", SetLastError = true)>]
     extern int fcntl(int fd, int cmd, int arg)
 

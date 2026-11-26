@@ -1229,6 +1229,19 @@ type PreludeTests(output: ITestOutputHelper) =
                 let fcV2Warm = fcContext.Run([ "--prelude"; finalPrelude; "warmup" ], timeoutMs = 120000)
                 Assert.True(fcV2Warm.ExitCode = 0, fcV2Warm.Stderr)
                 Assert.True((readStatus ()).Warm)
+                // `--pool-size 0` warmup must also fail if the file prelude rewrites itself during probe evaluation.
+                let p0SelfMutate = Path.Combine(directory, "p0-self-mutate.fsx")
+                writeFile
+                    directory
+                    "p0-self-mutate.fsx"
+                    (sprintf "System.IO.File.WriteAllText(@\"%s\", \"failwith \\\"v2-boom\\\"\\n\")\nlet p0v = 1\n" p0SelfMutate)
+                use p0Context = new FsionContext(fcWorkDir)
+                try
+                    let p0Res = p0Context.Run([ "--pool-size"; "0"; "--prelude"; p0SelfMutate; "warmup" ], timeoutMs = 120000)
+                    Assert.Equal(1, p0Res.ExitCode)
+                    Assert.Contains("configured prelude changed during warmup", p0Res.Stderr)
+                finally
+                    p0Context.StopOwnDaemon()
             finally
                 writeFile directory "fc-release.txt" "go"
                 writeFile directory "fc-v2-release.txt" "go"

@@ -789,6 +789,18 @@ type IsolationTests(output: ITestOutputHelper) =
                 use exclusiveReadOnExe =
                     new FileStream(daemonExePath, FileMode.Open, FileAccess.Read, FileShare.None)
                 exclusiveReadOnExe.Close()
+                // Late-loaded BCL disk assembly (not in builtinPrelude.warmAssemblies) must not
+                // permanently flip HasPreExistingUserFiles = true and force Gen-2 on subsequent stateless runs.
+                let xmlLoadRes = runP0 [ "-e"; "let d = System.Xml.XmlDocument()\nd.LoadXml(\"<a/>\")\nSystem.Console.Write(d.DocumentElement.Name)" ]
+                assertRun xmlLoadRes
+                Assert.Equal("a", xmlLoadRes.Stdout)
+                let gen2ProbeBefore = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
+                assertRun gen2ProbeBefore
+                let gen2ProbeAfter = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
+                assertRun gen2ProbeAfter
+                let c2Before = Int32.Parse(gen2ProbeBefore.Stdout.Trim())
+                let c2After = Int32.Parse(gen2ProbeAfter.Stdout.Trim())
+                Assert.Equal(c2Before, c2After)
             let disposeEntered = Path.Combine(directory, "dispose-entered.txt")
             let disposeRelease = Path.Combine(directory, "dispose-release.txt")
             let slowDisposeScript = Path.Combine(directory, "slow-dispose.fsx")

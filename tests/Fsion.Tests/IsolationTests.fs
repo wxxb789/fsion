@@ -791,17 +791,20 @@ type IsolationTests(output: ITestOutputHelper) =
                 exclusiveReadOnExe.Close()
                 // Late-loaded BCL disk assembly (not in builtinPrelude.warmAssemblies) must not
                 // permanently flip HasPreExistingUserFiles = true and force Gen-2 on subsequent stateless runs.
-                let xmlLoadRes = runP0 [ "-e"; "let d = System.Xml.XmlDocument()\nd.LoadXml(\"<a/>\")\nSystem.Console.Write(d.DocumentElement.Name)" ]
+                // Run against the warm-pool daemon (`context`) so `System.GC.ConserveMemory = 9` cold session
+                // creation under `--pool-size 0` doesn't trigger natural Gen-2 collections on every cold compile.
+                let hasZeroGen2Step (counts: int[]) =
+                    [ 0 .. counts.Length - 2 ] |> List.exists (fun i -> counts.[i + 1] = counts.[i])
+                let xmlLoadRes = context.Run([ "-e"; "let d = System.Xml.XmlDocument()\nd.LoadXml(\"<a/>\")\nSystem.Console.Write(d.DocumentElement.Name)" ], timeoutMs = 60000)
                 assertRun xmlLoadRes
                 Assert.Equal("a", xmlLoadRes.Stdout)
+                assertRun (context.Run([ "warmup" ], timeoutMs = 120000))
                 let gen2Counts =
                     [| for _ in 1 .. 4 ->
-                        let r = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
+                        let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
-                // If HasPreExistingUserFiles were stuck true, every run would increment Gen-2 (+3 across 4 runs);
-                // allowing <= 1 natural background/drain Gen-2 across 4 runs proves per-run Gen-2 is not forced.
-                Assert.True(gen2Counts.[3] - gen2Counts.[0] <= 1, sprintf "unexpected per-run Gen-2 after Xml load: %A" gen2Counts)
+                Assert.True(hasZeroGen2Step gen2Counts, sprintf "forced per-run Gen-2 after Xml load: %A" gen2Counts)
                 // Loading a Default-ALC BCL DLL while a user FileStream temporarily holds the same DLL open
                 // must promote the remaining CoreCLR PE handle once the user stream closes, avoiding per-run Gen-2.
                 let concurrentLoadCode =
@@ -810,16 +813,16 @@ type IsolationTests(output: ITestOutputHelper) =
                           "let path = System.IO.Path.Combine(dir, \"System.Xml.XPath.XDocument.dll\")"
                           "use stream = System.IO.File.OpenRead path"
                           "System.Runtime.Loader.AssemblyLoadContext.Default.LoadFromAssemblyPath(path) |> ignore" ]
-                assertRun (runP0 [ "-e"; concurrentLoadCode ])
+                assertRun (context.Run([ "-e"; concurrentLoadCode ], timeoutMs = 60000))
+                assertRun (context.Run([ "warmup" ], timeoutMs = 120000))
                 let afterLoadCounts =
                     [| for _ in 1 .. 4 ->
-                        let r = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
+                        let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
-                Assert.True(afterLoadCounts.[3] - afterLoadCounts.[0] <= 1, sprintf "unexpected per-run Gen-2 after concurrent load: %A" afterLoadCounts)
+                Assert.True(hasZeroGen2Step afterLoadCounts, sprintf "forced per-run Gen-2 after concurrent load: %A" afterLoadCounts)
             if OperatingSystem.IsLinux() then
                 // On Linux `/proc/self/fd`, enumerating the directory produces a vanished self-FD (`ENOENT`)
-                // and CoreCLR runtime FDs (e.g. CLR/DLL files), neither of which may force Gen-2 on stateless runs.
                 // With `System.GC.ConserveMemory = 9`, cold session creation (when pool depletes) may trigger
                 // natural Gen-2 collections, so assert that consecutive warm runs include zero-Gen-2 steps
                 // (proving per-run Gen-2 is NOT forced on every turn).

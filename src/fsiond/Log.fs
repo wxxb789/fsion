@@ -71,7 +71,7 @@ let private append (path: string) (line: string) =
 
     let acquired =
         try
-            gate.WaitOne(2000)
+            gate.WaitOne(10000)
         with :? AbandonedMutexException ->
             true
 

@@ -144,7 +144,7 @@ let connect (endpoint: Endpoint) (timeout: TimeSpan) : Stream =
                             ".",
                             endpoint.Name,
                             PipeDirection.InOut,
-                            PipeOptions.CurrentUserOnly
+                            PipeOptions.Asynchronous ||| PipeOptions.CurrentUserOnly
                         )
                     try
                         pipe.Connect 250

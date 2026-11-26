@@ -13,10 +13,11 @@ type RunStreams =
 
 let private current = AsyncLocal<RunStreams option>()
 
+let get () = current.Value
+
 let set (streams: RunStreams) = current.Value <- Some streams
 
 let clear () = current.Value <- None
-
 type internal RoutingWriter(select: RunStreams -> TextWriter) =
     inherit TextWriter()
 
@@ -74,7 +75,26 @@ let outWriter: TextWriter = new RoutingWriter(fun streams -> streams.Out)
 
 let errorWriter: TextWriter = new RoutingWriter(fun streams -> streams.Error)
 
+let inReader: TextReader = new RoutingReader()
+
+let private consoleInField =
+    typeof<Console>.GetField("s_in", Reflection.BindingFlags.Static ||| Reflection.BindingFlags.NonPublic)
+
+let private installInReader () =
+    if not (isNull consoleInField) then
+        consoleInField.SetValue(null, inReader)
+    else
+        Console.SetIn inReader
+
 let install () =
     Console.SetOut outWriter
     Console.SetError errorWriter
-    Console.SetIn(new RoutingReader())
+    installInReader ()
+
+let ensureInstalled () =
+    if not (Object.ReferenceEquals(Console.Out, outWriter)) then
+        Console.SetOut outWriter
+    if not (Object.ReferenceEquals(Console.Error, errorWriter)) then
+        Console.SetError errorWriter
+    if not (Object.ReferenceEquals(Console.In, inReader)) then
+        installInReader ()

@@ -4,7 +4,7 @@ open System
 open System.IO
 open System.Text
 
-let [<Literal>] ProtocolVersion = 5
+let [<Literal>] ProtocolVersion = 6
 
 let [<Literal>] PipeEnvironmentVariable = "FSION_PIPE"
 
@@ -120,6 +120,7 @@ type Request =
     | GetMetrics
     | Shutdown
     | Ping of preludePath: string option * noPrelude: bool
+    | StdinChunk of data: byte[] * eof: bool
 
 type Response =
     | Executed of ExecutionResult
@@ -128,6 +129,7 @@ type Response =
     | ShuttingDown
     | Pong
     | Failure of message: string
+    | StdinReadRequest of maxBytes: int
 
 let private utf8 = UTF8Encoding(false)
 
@@ -172,6 +174,12 @@ let private writeRequestPayloadWithVersion (version: int) (writer: BinaryWriter)
         match preludePath with
         | Some path -> writer.Write path
         | None -> ()
+    | StdinChunk (data, eof) ->
+        writer.Write 6uy
+        writer.Write eof
+        writer.Write data.Length
+        if data.Length > 0 then
+            writer.Write data
 
 let private writeResponsePayloadWithVersion (version: int) (writer: BinaryWriter) (response: Response) =
     writer.Write version
@@ -223,6 +231,9 @@ let private writeResponsePayloadWithVersion (version: int) (writer: BinaryWriter
     | Failure message ->
         writer.Write 15uy
         writer.Write message
+    | StdinReadRequest maxBytes ->
+        writer.Write 17uy
+        writer.Write maxBytes
 
 let private payloadOf (write: BinaryWriter -> unit) =
     use stream = new MemoryStream()
@@ -326,6 +337,11 @@ let parseRequestWithVersion (payload: byte[]) : int * Request =
             let hasPrelude = reader.ReadBoolean()
             let preludePath = if hasPrelude then Some(reader.ReadString()) else None
             version, Ping(preludePath, noPrelude)
+        | 6uy ->
+            let eof = reader.ReadBoolean()
+            let len = reader.ReadInt32()
+            let data = if len > 0 then reader.ReadBytes len else [||]
+            version, StdinChunk(data, eof)
         | _ -> failwith ("unknown request kind " + string kind)
 
 let parseRequest (payload: byte[]) : Request = snd (parseRequestWithVersion payload)
@@ -417,4 +433,5 @@ let parseResponse (payload: byte[]) : Response =
                   AliveDisposedSessions = aliveDisposedSessions
                   NamedSessions = namedSessions }
         | 14uy -> Pong
+        | 17uy -> StdinReadRequest(reader.ReadInt32())
         | _ -> failwith ("unknown response kind " + string kind)

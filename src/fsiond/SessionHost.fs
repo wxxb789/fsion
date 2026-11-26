@@ -140,6 +140,7 @@ type private WarmSession() =
     member val ExitedProperty: PropertyInfo option = None with get, set
     member val ExitCodeProperty: PropertyInfo option = None with get, set
     member val CancellationTokenProperty: PropertyInfo option = None with get, set
+    member val ExitCallbackProperty: PropertyInfo option = None with get, set
     member val ExitMarker: string = "" with get, set
     member val Prelude: Prelude.Tag = Prelude.Tag.Builtin with get, set
     member val CompilerDirectory: string = "" with get, set
@@ -230,6 +231,95 @@ let private removeUnmanagedDll (handlers: Delegate[]) =
     for handler in handlers do
         unmanagedDllEvent.RemoveEventHandler(defaultLoadContext, handler)
 
+let private firstChanceField =
+    typeof<AppContext>.GetField("FirstChanceException", BindingFlags.Static ||| BindingFlags.NonPublic)
+
+let private unhandledExceptionField =
+    typeof<AppContext>.GetField("UnhandledException", BindingFlags.Static ||| BindingFlags.NonPublic)
+let private resolvingField =
+    typeof<AssemblyLoadContext>.GetField("_resolving", BindingFlags.Instance ||| BindingFlags.NonPublic)
+
+let private resolvingEvent = typeof<AssemblyLoadContext>.GetEvent "Resolving"
+
+let private unobservedTaskField =
+    typeof<TaskScheduler>.GetField("UnobservedTaskException", BindingFlags.Static ||| BindingFlags.NonPublic)
+
+let private snapshotFieldDelegate (field: FieldInfo) (target: obj) : Delegate[] =
+    if isNull field then [||]
+    else
+        try
+            match field.GetValue target with
+            | :? Delegate as d -> invocationList d
+            | _ -> [||]
+        with _ -> [||]
+
+let private removeFieldDelegates (field: FieldInfo) (target: obj) (added: Delegate[]) =
+    if not (isNull field) && added.Length > 0 then
+        try
+            let mutable current = field.GetValue target :?> Delegate
+            for h in added do
+                current <- Delegate.Remove(current, h)
+            field.SetValue(target, current)
+        with _ -> ()
+
+[<NoComparison; NoEquality>]
+type private GlobalStateSnapshot =
+    { FirstChance: Delegate[]
+      UnhandledException: Delegate[]
+      ProcessExit: Delegate[]
+      AssemblyResolve: Delegate[]
+      Resolving: Delegate[]
+      ResolvingUnmanagedDll: Delegate[]
+      UnobservedTask: Delegate[]
+      DefaultCulture: CultureInfo
+      DefaultUICulture: CultureInfo
+      CurrentCulture: CultureInfo
+      CurrentUICulture: CultureInfo
+      TraceListeners: TraceListener[] }
+
+let private captureGlobalState () : GlobalStateSnapshot =
+    let listeners =
+        try
+            let arr = Array.zeroCreate<TraceListener> Trace.Listeners.Count
+            Trace.Listeners.CopyTo(arr, 0)
+            arr
+        with _ -> [||]
+    { FirstChance = snapshotFieldDelegate firstChanceField null
+      UnhandledException = snapshotFieldDelegate unhandledExceptionField null
+      ProcessExit = processExitSnapshot ()
+      AssemblyResolve = assemblyResolveSnapshot ()
+      Resolving = snapshotFieldDelegate resolvingField defaultLoadContext
+      ResolvingUnmanagedDll = unmanagedDllSnapshot ()
+      UnobservedTask = snapshotFieldDelegate unobservedTaskField null
+      DefaultCulture = CultureInfo.DefaultThreadCurrentCulture
+      DefaultUICulture = CultureInfo.DefaultThreadCurrentUICulture
+      CurrentCulture = CultureInfo.CurrentCulture
+      CurrentUICulture = CultureInfo.CurrentUICulture
+      TraceListeners = listeners }
+let private restoreGlobalState (snap: GlobalStateSnapshot) =
+    Ambient.ensureInstalled ()
+    removeFieldDelegates firstChanceField null (addedHandlers snap.FirstChance (snapshotFieldDelegate firstChanceField null))
+    removeFieldDelegates unhandledExceptionField null (addedHandlers snap.UnhandledException (snapshotFieldDelegate unhandledExceptionField null))
+    removeFieldDelegates unobservedTaskField null (addedHandlers snap.UnobservedTask (snapshotFieldDelegate unobservedTaskField null))
+    if not (Object.ReferenceEquals(CultureInfo.DefaultThreadCurrentCulture, snap.DefaultCulture)) then
+        CultureInfo.DefaultThreadCurrentCulture <- snap.DefaultCulture
+    if not (Object.ReferenceEquals(CultureInfo.DefaultThreadCurrentUICulture, snap.DefaultUICulture)) then
+        CultureInfo.DefaultThreadCurrentUICulture <- snap.DefaultUICulture
+    if not (Object.ReferenceEquals(CultureInfo.CurrentCulture, snap.CurrentCulture)) then
+        CultureInfo.CurrentCulture <- snap.CurrentCulture
+    if not (Object.ReferenceEquals(CultureInfo.CurrentUICulture, snap.CurrentUICulture)) then
+        CultureInfo.CurrentUICulture <- snap.CurrentUICulture
+    try
+        let mutable changed = Trace.Listeners.Count <> snap.TraceListeners.Length
+        if not changed then
+            for i = 0 to snap.TraceListeners.Length - 1 do
+                if not (Object.ReferenceEquals(Trace.Listeners.[i], snap.TraceListeners.[i])) then
+                    changed <- true
+        if changed then
+            Trace.Listeners.Clear()
+            for listener in snap.TraceListeners do
+                Trace.Listeners.Add listener |> ignore
+    with _ -> ()
 let private checkerField =
     typeof<FsiEvaluationSession>.GetField("checker", BindingFlags.Instance ||| BindingFlags.NonPublic)
 
@@ -1115,25 +1205,24 @@ let private sessionArguments =
        "--multiemit-"
        "--targetprofile:netcore" |]
 
-let private prelude (exitMarker: string) =
+let private prelude (_exitMarker: string) =
     String.Concat(
         [ "type FsionFsiState() =\n"
           "    member val CommandLineArgs : string[] = [||] with get, set\n"
           "    member val Exited : bool = false with get, set\n"
           "    member val ExitCode : int = 0 with get, set\n"
           "    member val CancellationToken : System.Threading.CancellationToken = System.Threading.CancellationToken.None with get, set\n"
+          "    member val OnExit : System.Action = null with get, set\n"
           "let fsionFsiState = FsionFsiState()\n"
           "let fsi = fsionFsiState\n"
           "exception FsionExit of int\n"
           "let exit (code: int) : 'T =\n"
-          "    fsionFsiState.Exited <- true\n"
-          "    fsionFsiState.ExitCode <- code\n"
-          "    System.Console.Error.Write(\""
-          exitMarker
-          "\")\n"
+          "    if not fsionFsiState.Exited then\n"
+          "        fsionFsiState.Exited <- true\n"
+          "        fsionFsiState.ExitCode <- code\n"
+          "        if not (isNull fsionFsiState.OnExit) then fsionFsiState.OnExit.Invoke()\n"
           "    raise (FsionExit code)\n" ]
     )
-
 let private builtinPrelude =
     """
 module Fsion =
@@ -1446,6 +1535,7 @@ type private PreludePool(spec: Prelude.Spec, tag: Prelude.Tag) =
 exception private PreludeEvaluationFailure of attemptedTag: Prelude.Tag * inner: exn
 
 type SessionHost(options: SessionHostOptions) =
+    let daemonBaselineGlobalState = captureGlobalState ()
     let targetPoolSize = if options.Oneshot then 1 else max 0 options.PoolSize
     let poolGate = obj ()
     let pools = ResizeArray<PreludePool>()
@@ -1549,15 +1639,14 @@ type SessionHost(options: SessionHostOptions) =
                 detachSessionCallback session
                 clearCheckerCaches session
                 lock releasedGate (fun () -> releasedSessions.Enqueue(WeakReference(session)))
-
                 try
                     (session :> IDisposable).Dispose()
                 with _ ->
                     ()
+                restoreGlobalState daemonBaselineGlobalState
             | None -> ()
 
             removeHandlers work
-
         drained
 
     let completeUnloadSweep (forceSweep: bool) =
@@ -1730,6 +1819,7 @@ type SessionHost(options: SessionHostOptions) =
             warm.ExitedProperty <- Some(stateType.GetProperty "Exited")
             warm.ExitCodeProperty <- Some(stateType.GetProperty "ExitCode")
             warm.CancellationTokenProperty <- Some(stateType.GetProperty "CancellationToken")
+            warm.ExitCallbackProperty <- Some(stateType.GetProperty "OnExit")
             warm.ExitMarker <- exitMarker
             warm.Prelude <- preludeTag
             warm.CompilerDirectory <- compilerDirectory
@@ -2045,15 +2135,16 @@ type SessionHost(options: SessionHostOptions) =
 
                     if request.IncludeDiagnostics && chunk.IndexOf("#load", StringComparison.Ordinal) >= 0 then
                         let checkResults =
-                            let saved = { Out = outWriter; Error = errWriter; In = TextReader.Null }
+                            let saved = Ambient.get ()
                             Ambient.set { Out = TextWriter.Null; Error = TextWriter.Null; In = TextReader.Null }
 
                             try
                                 let _, _, check = session.ParseAndCheckInteraction chunk
                                 check
                             finally
-                                Ambient.set saved
-
+                                match saved with
+                                | Some s -> Ambient.set s
+                                | None -> Ambient.clear ()
                         let hasCompileErrors =
                             checkResults.Diagnostics
                             |> Array.exists (fun diagnostic -> diagnostic.Severity = FSharpDiagnosticSeverity.Error)
@@ -2149,30 +2240,42 @@ type SessionHost(options: SessionHostOptions) =
                     // The non-throwing APIs suppress the formatted diagnostics but still write
                     // "Stopped due to error"; route that to a discard writer so the text printed by the
                     // throwing pass stays byte-identical to 0001.
-                    let saved = { Out = outWriter; Error = errWriter; In = TextReader.Null }
+                    let saved = Ambient.get ()
                     Ambient.set { Out = TextWriter.Null; Error = TextWriter.Null; In = TextReader.Null }
 
                     let diagnostics =
                         try
                             snd (session.EvalInteractionNonThrowing(attemptedCode, attemptedScriptName))
                         finally
-                            Ambient.set saved
+                            match saved with
+                            | Some s -> Ambient.set s
+                            | None -> Ambient.clear ()
 
                     diagnostics |> Array.map scriptDiagnostic
 
+        let applyExitIfTriggered () =
+            if claimed.ExitedProperty.Value.GetValue state :?> bool then
+                let outText = outWriter.SafeText()
+                let outIdx = outText.IndexOf(claimed.ExitMarker, StringComparison.Ordinal)
+                if outIdx >= 0 then
+                    outWriter.TruncateAt outIdx
+                let errText = errWriter.SafeText()
+                let errIdx = errText.IndexOf(claimed.ExitMarker, StringComparison.Ordinal)
+                if errIdx >= 0 then
+                    errWriter.TruncateAt errIdx
+                Some(claimed.ExitCodeProperty.Value.GetValue state :?> int, [||])
+            else
+                None
+
         try
             run ()
-            0, [||]
+            match applyExitIfTriggered () with
+            | Some res -> res
+            | None -> 0, [||]
         with :? FsiCompilationException ->
-            if claimed.ExitedProperty.Value.GetValue state :?> bool then
-                let text = errWriter.SafeText()
-                let markerIndex = text.IndexOf(claimed.ExitMarker, StringComparison.Ordinal)
-
-                if markerIndex >= 0 then
-                    errWriter.TruncateAt markerIndex
-
-                claimed.ExitCodeProperty.Value.GetValue state :?> int, [||]
-            else
+            match applyExitIfTriggered () with
+            | Some res -> res
+            | None ->
                 // A failed compilation emits no CLR types for the failing interaction (and `#load`
                 // interactions pre-checked clean set `typesBeforeCurrentEval = Int32.MinValue`), so
                 // `emittedTypeCount () > typesBeforeCurrentEval` proves user IL ran without sniffing text.
@@ -2622,9 +2725,13 @@ type SessionHost(options: SessionHostOptions) =
 
     member _.ExecutedCount = executed.Value
 
-    member _.Execute(request: ExecuteRequest, disconnectToken: CancellationToken) : ExecutionReport =
+    member _.Execute(request: ExecuteRequest, disconnectToken: CancellationToken, ?createStdinReader: CancellationToken -> TextReader) : ExecutionReport =
         let timeoutMs = request.TimeoutMs
         use runCts = new CancellationTokenSource()
+        let runStdin =
+            match createStdinReader with
+            | Some factory -> factory runCts.Token
+            | None -> TextReader.Null
         let timeoutFired = ref 0
         let evaluationStarted = ref 0
 
@@ -2640,9 +2747,7 @@ type SessionHost(options: SessionHostOptions) =
 
         let outWriter = new RunTextWriter()
         let errWriter = new RunTextWriter()
-
-        // --timeout is a script execution deadline only. Session acquisition (cold creation, a busy
-        // named session's gate, the process-state transition) is not charged against it, and a
+        let mutable capturedExit: (int * string) option = None
         // queued turn whose deadline expires before evaluation aborts in place without draining.
         let gateDeadline =
             if timeoutMs > 0 then Environment.TickCount64 + int64 timeoutMs else Int64.MaxValue
@@ -2669,12 +2774,13 @@ type SessionHost(options: SessionHostOptions) =
             | None -> None
             | Some entry ->
                 match entry.Session with
-                | Some warm -> releaseSession warm
+                | Some warm ->
+                    releaseSession warm
+                    restoreGlobalState daemonBaselineGlobalState
                 | None -> ()
 
                 entry.Session <- None
                 Some entry
-
         let runInSession (claimed: WarmSession) (stateless: bool) =
             let started = Stopwatch.GetTimestamp()
             let mutable evaluateMs = 0.0
@@ -2695,13 +2801,27 @@ type SessionHost(options: SessionHostOptions) =
                 else
                         entered <- true
                         try
-                            Ambient.set { Out = outWriter; Error = errWriter; In = TextReader.Null }
+                            Ambient.set { Out = outWriter; Error = errWriter; In = runStdin }
 
                             try
                                 match claimed.CancellationTokenProperty, claimed.State with
                                 | Some property, Some state -> property.SetValue(state, box runCts.Token)
                                 | _ -> ()
-
+                                match claimed.ExitCallbackProperty, claimed.State with
+                                | Some property, Some state ->
+                                    property.SetValue(
+                                        state,
+                                        box (Action(fun () ->
+                                            let code =
+                                                match claimed.ExitCodeProperty with
+                                                | Some p -> p.GetValue state :?> int
+                                                | None -> 0
+                                            if capturedExit.IsNone then
+                                                capturedExit <- Some(code, claimed.ExitMarker)
+                                            outWriter.Write claimed.ExitMarker
+                                            errWriter.Write claimed.ExitMarker))
+                                    )
+                                | _ -> ()
                                 try
                                     let prepared = prepareExecution request
                                     disconnectToken.ThrowIfCancellationRequested()
@@ -2747,6 +2867,9 @@ type SessionHost(options: SessionHostOptions) =
                                     match claimed.CancellationTokenProperty, claimed.State with
                                     | Some property, Some state -> property.SetValue(state, box CancellationToken.None)
                                     | _ -> ()
+                                    match claimed.ExitCallbackProperty, claimed.State with
+                                    | Some property, Some state -> property.SetValue(state, null)
+                                    | _ -> ()
                             finally
                                 Ambient.clear ()
                         finally
@@ -2760,6 +2883,7 @@ type SessionHost(options: SessionHostOptions) =
                         else
                             releaseSession claimed
                 finally
+                    restoreGlobalState daemonBaselineGlobalState
                     if options.LogPath.IsSome then
                         let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs
                         logDetail (
@@ -2890,12 +3014,22 @@ type SessionHost(options: SessionHostOptions) =
             // Classify at the worker's completion point: reading the flag here, before the
             // caller observes the task, makes the timeout outcome deterministic even if the
             // deadline and the completion race.
-            if Volatile.Read(&timeoutFired.contents) = 1 then
+            match capturedExit with
+            | Some (code, marker) ->
+                let stripMarker (text: string) =
+                    let idx = text.IndexOf(marker, StringComparison.Ordinal)
+                    if idx >= 0 then text.Substring(0, idx) else text
+                { ExitCode = code
+                  StandardOut = stripMarker (outWriter.SafeText())
+                  StandardError = stripMarker (errWriter.SafeText())
+                  Diagnostics = [||]
+                  TimedOut = false }
+            | None when Volatile.Read(&timeoutFired.contents) = 1 ->
                 { outcome with
                     ExitCode = TimeoutExitCode
                     TimedOut = true
                     StandardError = appendMessage outcome.StandardError (timeoutMessage timeoutMs) }
-            else
+            | None ->
                 outcome
 
         let worker = Task.Factory.StartNew(work, TaskCreationOptions.LongRunning)
@@ -2921,16 +3055,33 @@ type SessionHost(options: SessionHostOptions) =
                     else
                         "fsion: run cancelled after the client disconnected" + Environment.NewLine
 
+                let stripCaptured (text: string) =
+                    match capturedExit with
+                    | Some (_, marker) ->
+                        let idx = text.IndexOf(marker, StringComparison.Ordinal)
+                        if idx >= 0 then text.Substring(0, idx) else text
+                    | None -> text
+
                 if Volatile.Read(&evaluationStarted.contents) = 1 then
                     // Only a run that entered evaluation can wedge a session. Acquisition waits
                     // always return here, so they never drain a healthy daemon.
-                    { Outcome =
-                        { ExitCode = TimeoutExitCode
-                          StandardOut = outWriter.SafeText()
-                          StandardError = appendMessage (errWriter.SafeText()) message
-                          Diagnostics = [||]
-                          TimedOut = timedOut }
-                      Wedged = true }
+                    match capturedExit with
+                    | Some (code, _) ->
+                        { Outcome =
+                            { ExitCode = code
+                              StandardOut = stripCaptured (outWriter.SafeText())
+                              StandardError = stripCaptured (errWriter.SafeText())
+                              Diagnostics = [||]
+                              TimedOut = false }
+                          Wedged = true }
+                    | None ->
+                        { Outcome =
+                            { ExitCode = TimeoutExitCode
+                              StandardOut = outWriter.SafeText()
+                              StandardError = appendMessage (errWriter.SafeText()) message
+                              Diagnostics = [||]
+                              TimedOut = timedOut }
+                          Wedged = true }
                 else
                     { Outcome =
                         { ExitCode = (if timedOut then TimeoutExitCode else 1)
@@ -2939,7 +3090,6 @@ type SessionHost(options: SessionHostOptions) =
                           Diagnostics = [||]
                           TimedOut = timedOut }
                       Wedged = false }
-
     member _.Metrics() : MetricsInfo =
         if not options.Oneshot && targetPoolSize > 0 then
             let slots = lock poolGate (fun () -> pools.ToArray())

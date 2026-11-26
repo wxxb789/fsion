@@ -596,8 +596,6 @@ module private WinHandleTable =
                                     if candidateHandles.Contains h then
                                         baseline.Add soleId |> ignore
                                         resolved.Add fileKey
-                                | false, _ ->
-                                    resolved.Add fileKey
                                 | _ -> ()
                             for key in resolved do
                                 pendingDefaultAsmCandidates.Remove key |> ignore

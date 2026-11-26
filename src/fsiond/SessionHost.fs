@@ -475,10 +475,26 @@ module private WinHandleTable =
         let dir = Path.GetDirectoryName(typeof<obj>.Assembly.Location)
         if String.IsNullOrEmpty dir then "" else Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + string Path.DirectorySeparatorChar
 
-    let private isUnderRuntimeTrustedRoot (fullPath: string) =
-        runtimeTrustedRoot.Length > 0
-        && fullPath.StartsWith(runtimeTrustedRoot, StringComparison.OrdinalIgnoreCase)
+    let private bundledTrustedAssemblies =
+        let appDir =
+            let dir = Path.GetDirectoryName(typeof<FsiEvaluationSession>.Assembly.Location)
+            if String.IsNullOrEmpty dir then "" else Path.GetFullPath dir
+        let names =
+            [ "FSharp.DependencyManager.Nuget.dll"
+              "FSharp.Compiler.Interactive.Settings.dll"
+              "FSharp.Compiler.Service.dll"
+              "FSharp.Core.dll"
+              "Fsion.Protocol.dll" ]
+        let set = HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        if appDir.Length > 0 then
+            for name in names do
+                set.Add(Path.Combine(appDir, name)) |> ignore
+        set
 
+    let private isTrustedRuntimeAssemblyPath (fullPath: string) =
+        (runtimeTrustedRoot.Length > 0
+         && fullPath.StartsWith(runtimeTrustedRoot, StringComparison.OrdinalIgnoreCase))
+        || bundledTrustedAssemblies.Contains fullPath
     let private recordHandleBaselineForAssembly (asm: Assembly) =
         if OperatingSystem.IsWindows()
            && not asm.IsDynamic
@@ -491,11 +507,10 @@ module private WinHandleTable =
             if not (String.IsNullOrEmpty loc) then
                 try
                     let fullLoc = Path.GetFullPath loc
-                    // Only admit assemblies from the shared .NET runtime directory (`Microsoft.NETCore.App`),
-                    // where CoreCLR maps and holds resident PE handles for framework BCL assemblies. Arbitrary
-                    // user/external assemblies (e.g. tools or user DLLs loaded via LoadFromAssemblyPath) are
-                    // never admitted so a user FileStream on them can never be misclassified as a runtime handle.
-                    if isUnderRuntimeTrustedRoot fullLoc then
+                    // Only admit assemblies from the shared .NET runtime directory (`Microsoft.NETCore.App`) or
+                    // the explicit bundled FSI/daemon dependency list (e.g. `FSharp.DependencyManager.Nuget.dll`),
+                    // where CoreCLR holds resident PE handles. Arbitrary user/external binaries are never admitted.
+                    if isTrustedRuntimeAssemblyPath fullLoc then
                         match listRegularDiskFiles () with
                         | ValueSome current ->
                             let capChars = 1024u
@@ -541,6 +556,27 @@ module private WinHandleTable =
                                 Marshal.FreeHGlobal pathBuf
                         | ValueNone -> ()
                 with _ -> ()
+    let private posixRuntimeBaseline = HashSet<string>(StringComparer.Ordinal)
+    let mutable private posixBaselineSeeded = false
+
+    let private recordPosixBaseline () =
+        if not (OperatingSystem.IsWindows()) then
+            lock baselineSync (fun () ->
+                if not posixBaselineSeeded then
+                    posixBaselineSeeded <- true
+                    if Directory.Exists "/proc/self/fd" then
+                        try
+                            for entry in Directory.GetFileSystemEntries "/proc/self/fd" do
+                                let name = Path.GetFileName entry
+                                try
+                                    match File.ResolveLinkTarget(entry, false) with
+                                    | null -> ()
+                                    | info ->
+                                        let target = info.FullName
+                                        if name <> "0" && name <> "1" && name <> "2" && target.StartsWith("/", StringComparison.Ordinal) then
+                                            posixRuntimeBaseline.Add(name + "\t" + target) |> ignore
+                                with _ -> ()
+                        with _ -> ())
 
     let initializeBaseline () =
         if OperatingSystem.IsWindows() then
@@ -575,6 +611,8 @@ module private WinHandleTable =
                                 hs.Add id |> ignore
                         baselineHandlesOpt <- ValueSome hs
                     | ValueNone -> ())
+        else
+            recordPosixBaseline ()
 
     let snapshot () : WinSnapshot voption =
         if not (OperatingSystem.IsWindows()) then
@@ -634,6 +672,7 @@ module private WinHandleTable =
         { AllFds: HashSet<string>
           HasPreExistingRegularFiles: bool }
 
+    // `posixRuntimeBaseline` is populated once on builtin warmup via `recordPosixBaseline ()` above.
     let posixFdSnapshot () : PosixSnapshot voption =
         if OperatingSystem.IsWindows() then
             ValueNone
@@ -659,9 +698,14 @@ module private WinHandleTable =
                             | info ->
                                 target <- info.FullName
                                 resolved <- true
+                                let key = name + "\t" + target
                                 if name <> "0" && name <> "1" && name <> "2" && target.StartsWith("/", StringComparison.Ordinal) then
                                     if File.Exists target && not (Directory.Exists target) then
-                                        hasReg <- true
+                                        let isBaseline =
+                                            isProcFd
+                                            && lock baselineSync (fun () -> posixRuntimeBaseline.Contains key)
+                                        if not isBaseline then
+                                            hasReg <- true
                         with
                         | :? FileNotFoundException
                         | :? DirectoryNotFoundException ->
@@ -672,8 +716,8 @@ module private WinHandleTable =
                         | _ -> ()
                         // On macOS `/dev/fd` exposes device nodes rather than symlinks (`ResolveLinkTarget = null`),
                         // so an unresolvable non-stdio fd > 2 cannot be proven non-regular; conservatively treat
-                        // any live unresolved fd > 2 on non-`/proc/self/fd` (or unexpected resolution failure) as
-                        // a possible pre-existing regular file without penalizing Linux's vanished enumeration FD.
+                        // any live unresolved fd > 2 on non-`/proc/self/fd` as a possible pre-existing regular file
+                        // without penalizing Linux's vanished enumeration FD.
                         if not resolved && not vanished && (not isProcFd) && name <> "0" && name <> "1" && name <> "2" then
                             hasReg <- true
                         if not vanished then

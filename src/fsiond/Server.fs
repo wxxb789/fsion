@@ -58,22 +58,25 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
                 let report = hooks.Execute request disconnects.Token
                 let daemonMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
 
+                let logExecuted () =
+                    Log.info
+                        options.LogPath
+                        ("executed exit="
+                         + string report.Outcome.ExitCode
+                         + " timedOut="
+                         + string report.Outcome.TimedOut
+                         + " wedged="
+                         + string report.Wedged
+                         + (if options.Oneshot then " totalExecuted=" + string (hooks.Status().Executed) else "")
+                         + " daemonMs="
+                         + daemonMs.ToString("F3", CultureInfo.InvariantCulture)
+                         + " elapsedMs="
+                         + string (int daemonMs))
+
                 if report.Wedged then
                     hooks.Retire ()
-
-                Log.info
-                    options.LogPath
-                    ("executed exit="
-                     + string report.Outcome.ExitCode
-                     + " timedOut="
-                     + string report.Outcome.TimedOut
-                     + " wedged="
-                     + string report.Wedged
-                     + (if options.Oneshot then " totalExecuted=" + string (hooks.Status().Executed) else "")
-                     + " daemonMs="
-                     + daemonMs.ToString("F3", CultureInfo.InvariantCulture)
-                     + " elapsedMs="
-                     + string (int daemonMs))
+                else
+                    logExecuted ()
 
                 try
                     sendResponse
@@ -89,6 +92,9 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
 
                     if report.Wedged then
                         hooks.Respawn ()
+
+                if report.Wedged then
+                    logExecuted ()
 
                 if options.Oneshot && not report.Wedged then
                     hooks.Stop ()

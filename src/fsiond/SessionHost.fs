@@ -509,9 +509,13 @@ module private WinHandleTable =
                                                     if raw.StartsWith(@"\\?\", StringComparison.Ordinal) then raw.Substring 4 else raw
                                                 if String.Equals(normalized, fullLoc, StringComparison.OrdinalIgnoreCase) then
                                                     matched.Add id
+                                    let distinctFiles = HashSet<struct (uint32 * uint64)>()
+                                    for id in matched do
+                                        let struct (_, vol, fileIdx) = id
+                                        distinctFiles.Add(struct (vol, fileIdx)) |> ignore
                                     if matched.Count = 1 && not (baseline.Contains matched.[0]) then
                                         baseline.Add matched.[0] |> ignore
-                                    elif matched.Count > 1 then
+                                    elif matched.Count > 1 && distinctFiles.Count = 1 then
                                         let registeredEpoch = Interlocked.Increment(&baselineEpoch)
                                         for id in matched do
                                             let struct (h, vol, fileIdx) = id

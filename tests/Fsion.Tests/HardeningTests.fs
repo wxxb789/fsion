@@ -262,12 +262,13 @@ printfn "CHILD_EXIT=%%d|ERR=%%s" p.ExitCode (stderr.Trim())
             Assert.True(seedAlpha.ExitCode = 0, seedAlpha.Stderr)
             Assert.Equal("42" + Environment.NewLine, seedAlpha.Stdout)
 
-            // Start healthy cooperative script A (~1800ms) and concurrently start wedging script B (--timeout 300).
+            // Start healthy cooperative script A (4500ms — well past B's 300ms timeout + 1500ms grace
+            // + old 3000ms main drain) and concurrently start wedging script B (--timeout 300).
             let aEntered = Path.Combine(directory, "sibling-a-entered.txt")
             let scriptA =
                 Task.Run(fun () ->
                     context.Run(
-                        [ "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"1\"); System.Threading.Thread.Sleep 1800; printfn \"SIBLING_A_OK\"" aEntered ],
+                        [ "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"1\")\nSystem.Threading.Thread.Sleep 4500\nprintfn \"SIBLING_A_OK\"" aEntered ],
                         timeoutMs = 60000
                     ))
 
@@ -288,7 +289,6 @@ printfn "CHILD_EXIT=%%d|ERR=%%s" p.ExitCode (stderr.Trim())
             let resA = scriptA.GetAwaiter().GetResult()
             Assert.True(resA.ExitCode = 0, "healthy sibling A failed: " + resA.Stderr)
             Assert.Equal("SIBLING_A_OK" + Environment.NewLine, resA.Stdout)
-
             // Retired wedged daemon terminates once sibling A finishes.
             Assert.True(processGone oldPid.Value 15000, "retired wedged fsiond did not exit after draining sibling A")
 

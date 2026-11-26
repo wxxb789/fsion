@@ -32,11 +32,16 @@ type [<NoEquality; NoComparison>] private Hooks =
 
 let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) =
     use connection = stream
+    let mutable requestVersion = ProtocolVersion
     try
         match tryReceiveFrame connection with
         | None -> ()
         | Some payload ->
-            match parseRequest payload with
+            if payload.Length >= 4 then
+                requestVersion <- BitConverter.ToInt32(payload, 0)
+            let reqVer, req = parseRequestWithVersion payload
+            requestVersion <- reqVer
+            match req with
             | Execute request ->
                 use monitorCancellation = new CancellationTokenSource()
                 use disconnects = new CancellationTokenSource()
@@ -98,18 +103,17 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
             | Ping (preludePath, noPrelude) ->
                 hooks.EnsureWarm (Prelude.specOfOptions preludePath noPrelude)
                 sendResponse connection Pong
-            | GetStatus -> sendResponse connection (Status(hooks.Status ()))
+            | GetStatus -> sendResponseWithVersion requestVersion connection (Status(hooks.Status ()))
             | GetMetrics -> sendResponse connection (Metrics(hooks.Metrics ()))
             | Shutdown ->
-                sendResponse connection ShuttingDown
+                sendResponseWithVersion requestVersion connection ShuttingDown
                 hooks.Stop ()
     with ex ->
         Log.error options.LogPath ("connection error: " + ex.ToString())
         try
-            sendResponse connection (Failure(ex.ToString()))
+            sendResponseWithVersion requestVersion connection (Failure(ex.ToString()))
         with _ ->
             ()
-
 let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit) : int =
     let generationId = Guid.NewGuid().ToString("N")
     let session =
@@ -127,7 +131,7 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
     let startedAt = DateTime.UtcNow
     let mutable lastActivityTicks = DateTime.UtcNow.Ticks
     let mutable activeRequests = 0
-    let mutable wedgedCount = 0
+    let mutable retired = 0
     let mutable stopped = 0
     let idleTtlMs = int64 (TimeSpan.FromMinutes(options.IdleTtlMinutes).TotalMilliseconds)
 
@@ -150,24 +154,23 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
     // Non-collateral wedged drain: stop accepting new connections and release endpoint ownership
     // immediately so the replacement generation serves new callers at once, but let all other
     // healthy in-flight requests finish before terminating the retiring process (bounded by a
-    // generous drain ceiling so a wedged evaluation still cannot leak forever).
+    // generous 60s drain ceiling so a wedged evaluation still cannot leak forever).
     let scheduleSelfTermination () =
-        Interlocked.Increment(&wedgedCount) |> ignore
-        Task.Factory.StartNew(
-            (fun () ->
-                let drainDeadline = Environment.TickCount64 + 60000L
-                while Volatile.Read(&activeRequests) > Volatile.Read(&wedgedCount)
-                      && Environment.TickCount64 < drainDeadline do
-                    Thread.Sleep 50
-                // Brief grace period so the final response flushes to the client pipe/socket.
-                Thread.Sleep 250
-                try
-                    Process.GetCurrentProcess().Kill()
-                with _ ->
-                    ()),
-            TaskCreationOptions.LongRunning
-        )
-        |> ignore
+        if Interlocked.Exchange(&retired, 1) = 0 then
+            Task.Factory.StartNew(
+                (fun () ->
+                    let drainDeadline = Environment.TickCount64 + 60000L
+                    while Volatile.Read(&activeRequests) > 0
+                          && Environment.TickCount64 < drainDeadline do
+                        Thread.Sleep 50
+                    Thread.Sleep 250
+                    try
+                        Process.GetCurrentProcess().Kill()
+                    with _ ->
+                        ()),
+                TaskCreationOptions.LongRunning
+            )
+            |> ignore
 
     let retire () =
         stop ()
@@ -269,7 +272,8 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
 
     Log.info options.LogPath ("listening on " + endpointDisplay options.Endpoint)
     acceptLoop.Wait ()
-    let drainDeadline = DateTime.UtcNow.AddSeconds 3.0
+    let drainSeconds = if Volatile.Read(&retired) = 1 then 60.0 else 3.0
+    let drainDeadline = DateTime.UtcNow.AddSeconds drainSeconds
     while Volatile.Read(&activeRequests) > 0 && DateTime.UtcNow < drainDeadline do
         Thread.Sleep 50
     watchdog.Wait 1000 |> ignore

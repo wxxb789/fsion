@@ -60,11 +60,16 @@ let private posixSocketDirectory () =
         | null | "" -> Path.Combine(Path.GetTempPath(), "fsion-" + uid)
         | directory -> Path.Combine(directory, "fsion-" + uid)
     if not isWindows then
+        let info = DirectoryInfo baseRoot
+        if info.Exists && not (isNull info.LinkTarget) then
+            raise (UnauthorizedAccessException("refusing symlinked POSIX socket directory: " + baseRoot))
         Directory.CreateDirectory baseRoot |> ignore
-        try
-            PosixSecurity.chmod(baseRoot, 0o700u) |> ignore
-        with _ ->
-            ()
+        if PosixSecurity.chmod(baseRoot, 0o700u) <> 0 then
+            raise (UnauthorizedAccessException("failed to set 0700 permissions on POSIX socket directory: " + baseRoot))
+        let actualMode = File.GetUnixFileMode baseRoot
+        let forbidden = UnixFileMode.GroupRead ||| UnixFileMode.GroupWrite ||| UnixFileMode.GroupExecute ||| UnixFileMode.OtherRead ||| UnixFileMode.OtherWrite ||| UnixFileMode.OtherExecute
+        if (actualMode &&& forbidden) <> UnixFileMode.None then
+            raise (UnauthorizedAccessException("POSIX socket directory has unsafe permissions: " + baseRoot))
     baseRoot
 
 let socketPath (endpoint: Endpoint) =
@@ -224,10 +229,10 @@ type private UnixListener(path: string) =
 
     do
         socket.Bind(UnixDomainSocketEndPoint path)
-        try
-            PosixSecurity.chmod(path, 0o600u) |> ignore
-        with _ ->
-            ()
+        if PosixSecurity.chmod(path, 0o600u) <> 0 then
+            socket.Dispose()
+            try File.Delete path with _ -> ()
+            raise (UnauthorizedAccessException("failed to set 0600 permissions on POSIX socket: " + path))
         socket.Listen 64
     member _.Accept() : Task<Stream> =
         task {

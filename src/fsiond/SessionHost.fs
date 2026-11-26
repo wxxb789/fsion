@@ -1229,19 +1229,31 @@ type private ProcessStateGate(endpointName: string) =
     let mutable activeRunSequence = 0L
     let waiters = LinkedList<GateWaiter>()
 
+    let isInternalTrackingKey (key: string) =
+        environmentComparer.Equals(key, ParentEndpointEnvironmentVariable)
+        || environmentComparer.Equals(key, ParentRunIdEnvironmentVariable)
+
     let matchesEnvironment (environment: (string * string)[]) =
-        currentEnvironment.Count = environment.Length
-        && (environment |> Array.forall (fun (key, value) ->
-            match currentEnvironment.TryGetValue key with
-            | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
-            | _ -> false))
+        let mutable userCount = 0
+        let mutable allMatch = true
+        for key, value in environment do
+            if not (isInternalTrackingKey key) then
+                userCount <- userCount + 1
+                if allMatch then
+                    match currentEnvironment.TryGetValue key with
+                    | true, existing when String.Equals(existing, value, StringComparison.Ordinal) -> ()
+                    | _ -> allMatch <- false
+        allMatch && userCount = currentEnvironment.Count
 
     let applyRunEnvironment (directory: string) (environment: (string * string)[]) =
         if not (String.Equals(Directory.GetCurrentDirectory(), directory, StringComparison.Ordinal)) then
             Directory.SetCurrentDirectory directory
         currentDirectory <- directory
         if not (matchesEnvironment environment) then
-            currentEnvironment <- environmentMap environment
+            let filtered =
+                environment
+                |> Array.filter (fun (k, _) -> not (isInternalTrackingKey k))
+            currentEnvironment <- environmentMap filtered
 
         // Script code can mutate process variables without updating the cached request map.
         applyEnvironment (readProcessEnvironment ()) currentEnvironment
@@ -1250,7 +1262,6 @@ type private ProcessStateGate(endpointName: string) =
         let runId = string (Interlocked.Increment(&activeRunSequence))
         Environment.SetEnvironmentVariable(ParentEndpointEnvironmentVariable, endpointName, EnvironmentVariableTarget.Process)
         Environment.SetEnvironmentVariable(ParentRunIdEnvironmentVariable, runId, EnvironmentVariableTarget.Process)
-
     let isHeadCompatible (waiter: GateWaiter) =
         if waiter.IsFilePrelude then
             activeRuns = 0 && activeFilePreludes = 0
@@ -1261,10 +1272,10 @@ type private ProcessStateGate(endpointName: string) =
     let hasConflictingWaiterAhead (node: LinkedListNode<GateWaiter>) =
         not (Object.ReferenceEquals(waiters.First, node))
 
-    member _.Enter(directory: string, environment: (string * string)[], timeoutMs: int, disconnectToken: CancellationToken) : bool =
+    member _.Enter(directory: string, environment: (string * string)[], hasTimeout: bool, remainingMs: int, disconnectToken: CancellationToken) : bool =
         let waiter = GateWaiter(directory, environment, false)
         let deadline =
-            if timeoutMs > 0 then Environment.TickCount64 + int64 timeoutMs else Int64.MaxValue
+            if hasTimeout then Environment.TickCount64 + int64 (max 0 remainingMs) else Int64.MaxValue
         use _cancelReg =
             disconnectToken.Register(fun () ->
                 lock sync (fun () ->
@@ -1279,7 +1290,7 @@ type private ProcessStateGate(endpointName: string) =
                       && not waiter.Cancelled
                       && not disconnectToken.IsCancellationRequested
                       && (hasConflictingWaiterAhead node || not (isHeadCompatible waiter)) do
-                    if timeoutMs > 0 then
+                    if hasTimeout then
                         let remaining = deadline - Environment.TickCount64
                         if remaining <= 0L then
                             timedOut <- true
@@ -1303,14 +1314,13 @@ type private ProcessStateGate(endpointName: string) =
             with _ ->
                 if not (isNull node.List) then
                     waiters.Remove node
-                    Monitor.PulseAll sync
+                Monitor.PulseAll sync
                 reraise ()
             |> fun entered ->
                 if not entered && not (isNull node.List) then
                     waiters.Remove node
                     Monitor.PulseAll sync
                 entered)
-
     member _.Exit() =
         lock sync (fun () ->
             activeRuns <- activeRuns - 1
@@ -2168,13 +2178,17 @@ type SessionHost(options: SessionHostOptions) =
     let namedSessions = Dictionary<string, NamedSessionEntry>()
 
     let tombstoneDirectory =
-        let root = Path.Combine(Path.GetTempPath(), "fsion-sessions-" + Fsion.Ipc.sanitizeName options.EndpointName)
+        let endpointIdentity = Fsion.Ipc.endpointDisplay { Name = options.EndpointName }
+        let endpointHash =
+            System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes endpointIdentity)
+            |> Convert.ToHexString
+            |> fun s -> s.Substring(0, 16).ToLowerInvariant()
+        let root = Path.Combine(Path.GetTempPath(), "fsion-sessions-" + Fsion.Ipc.sanitizeName Environment.UserName + "-" + endpointHash)
         try
             Directory.CreateDirectory root |> ignore
         with _ ->
             ()
         root
-
     let tombstonePath (sessionId: string) =
         let hash =
             System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes sessionId)
@@ -2236,6 +2250,7 @@ type SessionHost(options: SessionHostOptions) =
                                 match namedSessions.TryGetValue sessionId with
                                 | true, existing when Object.ReferenceEquals(existing, entry) ->
                                     namedSessions.Remove sessionId |> ignore
+                                    deleteSessionTombstone sessionId
                                 | _ -> ())
 
                             match entry.Session with
@@ -2243,7 +2258,6 @@ type SessionHost(options: SessionHostOptions) =
                             | None -> ()
 
                             entry.Session <- None
-                            deleteSessionTombstone sessionId
                     finally
                         entry.Gate.Release() |> ignore
             if evictedAny then
@@ -2646,25 +2660,16 @@ type SessionHost(options: SessionHostOptions) =
             let mutable posixFdsBefore = ValueNone
             let mutable entered = false
             try
-                if timeoutMs = 0 && processState.IsNestedConflict(request.WorkingDirectory, request.Environment) then
-                    { ExitCode = 1
+                let gateWaitMs = remainingGateMs ()
+                let acquiredGate =
+                    processState.Enter(request.WorkingDirectory, request.Environment, timeoutMs > 0, gateWaitMs, disconnectToken)
+                if not acquiredGate then
+                    { ExitCode = TimeoutExitCode
                       StandardOut = ""
-                      StandardError =
-                        "fsion: nested invocation targeting the same daemon endpoint with a different working directory or environment would deadlock; pass --no-daemon, a distinct --pipe, or --timeout"
-                        + Environment.NewLine
+                      StandardError = timeoutMessage timeoutMs
                       Diagnostics = [||]
-                      TimedOut = false }
+                      TimedOut = true }
                 else
-                    let gateWaitMs = remainingGateMs ()
-                    let acquiredGate =
-                        processState.Enter(request.WorkingDirectory, request.Environment, gateWaitMs, disconnectToken)
-                    if not acquiredGate then
-                        { ExitCode = TimeoutExitCode
-                          StandardOut = ""
-                          StandardError = timeoutMessage timeoutMs
-                          Diagnostics = [||]
-                          TimedOut = true }
-                    else
                         entered <- true
                         try
                             Ambient.set { Out = outWriter; Error = errWriter; In = TextReader.Null }
@@ -2755,6 +2760,15 @@ type SessionHost(options: SessionHostOptions) =
 
             let outcome =
                 try
+                    if timeoutMs = 0 && processState.IsNestedConflict(request.WorkingDirectory, request.Environment) then
+                        { ExitCode = 1
+                          StandardOut = ""
+                          StandardError =
+                            "fsion: nested invocation targeting the same daemon endpoint with a different working directory or environment would deadlock; pass --no-daemon, a distinct --pipe, or --timeout"
+                            + Environment.NewLine
+                          Diagnostics = [||]
+                          TimedOut = false }
+                    else
                     match request.SessionId with
                     | None ->
                         let claimed = claimSession targetSpec disconnectToken

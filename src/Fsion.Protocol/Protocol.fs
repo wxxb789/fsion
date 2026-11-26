@@ -41,12 +41,12 @@ let targetFrameworkMoniker =
     "net"
     #endif
 
+type private BuildMarker = class end
+
 let buildFingerprint =
-    let version =
-        match typeof<obj>.Assembly.GetName().Version with
-        | null -> "0.0.0.0"
-        | v -> $"{v.Major}.{v.Minor}"
-    $"p{ProtocolVersion}-{targetFrameworkMoniker}-{version}"
+    let asm = typeof<BuildMarker>.Assembly
+    let mvid = asm.ManifestModule.ModuleVersionId.ToString("N").Substring(0, 8)
+    $"p{ProtocolVersion}-{targetFrameworkMoniker}-{mvid}"
 let timeoutMessage (timeoutMs: int) =
     "fsion: script timed out after " + string timeoutMs + " ms" + Environment.NewLine
 
@@ -131,8 +131,8 @@ type Response =
 
 let private utf8 = UTF8Encoding(false)
 
-let private writeRequestPayload (writer: BinaryWriter) (request: Request) =
-    writer.Write ProtocolVersion
+let private writeRequestPayloadWithVersion (version: int) (writer: BinaryWriter) (request: Request) =
+    writer.Write version
     match request with
     | Execute payload ->
         writer.Write 1uy
@@ -173,8 +173,8 @@ let private writeRequestPayload (writer: BinaryWriter) (request: Request) =
         | Some path -> writer.Write path
         | None -> ()
 
-let private writeResponsePayload (writer: BinaryWriter) (response: Response) =
-    writer.Write ProtocolVersion
+let private writeResponsePayloadWithVersion (version: int) (writer: BinaryWriter) (response: Response) =
+    writer.Write version
     match response with
     | Executed result ->
         writer.Write 11uy
@@ -243,11 +243,17 @@ let private sendFramed (stream: Stream) (payload: byte[]) =
     stream.Write(frame, 0, frame.Length)
     stream.Flush()
 
+let sendRequestWithVersion (version: int) (stream: Stream) (request: Request) =
+    sendFramed stream (payloadOf (fun writer -> writeRequestPayloadWithVersion version writer request))
+
 let sendRequest (stream: Stream) (request: Request) =
-    sendFramed stream (payloadOf (fun writer -> writeRequestPayload writer request))
+    sendRequestWithVersion ProtocolVersion stream request
+
+let sendResponseWithVersion (version: int) (stream: Stream) (response: Response) =
+    sendFramed stream (payloadOf (fun writer -> writeResponsePayloadWithVersion version writer response))
 
 let sendResponse (stream: Stream) (response: Response) =
-    sendFramed stream (payloadOf (fun writer -> writeResponsePayload writer response))
+    sendResponseWithVersion ProtocolVersion stream response
 
 let private readExactly (stream: Stream) (count: int) =
     let buffer = Array.zeroCreate count
@@ -273,14 +279,14 @@ let tryReceiveFrame (stream: Stream) : byte[] option =
 // Control requests (`GetStatus` = 2uy, `Shutdown` = 3uy) and control/error responses (`Status` = 12uy,
 // `ShuttingDown` = 13uy, `Failure` = 15uy) are decoded regardless of wire `ProtocolVersion` so a newer
 // or older `fsion` CLI can always inspect and stop/restart a mismatched `fsiond` on an explicit `--pipe`.
-let parseRequest (payload: byte[]) : Request =
+let parseRequestWithVersion (payload: byte[]) : int * Request =
     use stream = new MemoryStream(payload)
     use reader = new BinaryReader(stream, utf8)
     let version = reader.ReadInt32()
     let kind = reader.ReadByte()
     match kind with
-    | 2uy -> GetStatus
-    | 3uy -> Shutdown
+    | 2uy -> version, GetStatus
+    | 3uy -> version, Shutdown
     | _ ->
         if version <> ProtocolVersion then
             failwith ("unsupported protocol version " + string version + " (expected " + string ProtocolVersion + ")")
@@ -301,6 +307,7 @@ let parseRequest (payload: byte[]) : Request =
             let noPrelude = reader.ReadBoolean()
             let hasPrelude = reader.ReadBoolean()
             let preludePath = if hasPrelude then Some(reader.ReadString()) else None
+            version,
             Execute
                 { Mode = mode
                   Source = source
@@ -313,13 +320,15 @@ let parseRequest (payload: byte[]) : Request =
                   TimeoutMs = timeoutMs
                   PreludePath = preludePath
                   NoPrelude = noPrelude }
-        | 5uy -> GetMetrics
+        | 5uy -> version, GetMetrics
         | 4uy ->
             let noPrelude = reader.ReadBoolean()
             let hasPrelude = reader.ReadBoolean()
             let preludePath = if hasPrelude then Some(reader.ReadString()) else None
-            Ping(preludePath, noPrelude)
+            version, Ping(preludePath, noPrelude)
         | _ -> failwith ("unknown request kind " + string kind)
+
+let parseRequest (payload: byte[]) : Request = snd (parseRequestWithVersion payload)
 
 let parseResponse (payload: byte[]) : Response =
     use stream = new MemoryStream(payload)

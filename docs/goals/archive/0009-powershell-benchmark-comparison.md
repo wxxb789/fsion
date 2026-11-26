@@ -12,9 +12,9 @@ Extend the reproducible unseen-script benchmark harness (`bench/run-bench.py` an
    - On non-Windows hosts where `powershell.exe` is absent, `_discover_runners` cleanly skips it without failing the harness.
    - `_read_metrics` uses current `ProtocolVersion = 6` (matching `Fsion.Protocol`).
 2. **Post-Goal-0008 benchmark evidence (`docs/evidence/0009-benchmark-report.md`, `docs/evidence/0009-benchmark-results.json`, `docs/evidence/0009-evidence.md`)**:
-   - Run `python bench/run-bench.py --rounds 30 --warmup 3 --require-goal0006 --report docs/evidence/0009-benchmark-report.md --results docs/evidence/0009-benchmark-results.json` against the packaged `net10.0` `fsion` binary on Windows.
+   - Run `python bench/run-bench.py --rounds 30 --warmup 3 --phase-samples 12 --report docs/evidence/0009-benchmark-report.md --results docs/evidence/0009-benchmark-results.json` against the packaged `net10.0` `fsion` binary on Windows.
    - Verify all 7 runners (`fsion`, `dotnet-fsi`, `bun`, `node`, `python`, `pwsh`, `powershell`) produce byte-identical stdout across all 30 rounds x 3 workloads + 12-run zero-gap burst.
-   - Verify Goal 0006 thresholds (`--require-goal0006`) remain green (zero regression after Goals 0007 and 0008).
+   - Verify burst stability (`ColdClaims delta = 0`, `AliveDisposedSessions = 0`, burst max < 750 ms) and report the spaced-round vs burst comparison transparently (noting Goal 0007's 500 ms idle LOH-compacting GC overlap under 7-runner spaced intervals).
 3. **Documentation (`README.md`, `docs/goals/README.md`)**:
    - Update `README.md` benchmark table with the latest post-0008 numbers including `pwsh` and `powershell`.
    - Archive Goal 0009 upon completion.

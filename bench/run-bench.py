@@ -419,11 +419,13 @@ def _read_metrics(endpoint: str, env: dict, timeout: float) -> dict:
     else:
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(timeout)
-            directory = Path(env.get("XDG_RUNTIME_DIR") or env.get("TMPDIR") or "/tmp")
+            base = Path(env.get("XDG_RUNTIME_DIR") or env.get("TMPDIR") or "/tmp")
+            uid = os.getuid() if hasattr(os, "getuid") else 0
+            directory = base / f"fsion-{uid}"
             path = directory / (endpoint + ".sock")
             if len(os.fsencode(path)) > 100:
                 if len(os.fsencode(directory / "fsion-0123456789abcdef.sock")) > 100:
-                    directory = Path("/tmp")
+                    directory = Path("/tmp") / f"fsion-{uid}"
                 name_hash = hashlib.sha256(endpoint.encode()).hexdigest()[:16]
                 path = directory / f"fsion-{name_hash}.sock"
             connection.connect(str(path))
@@ -729,9 +731,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--tfm", default=None, help="fsion/fsiond target framework (default net10.0)")
     parser.add_argument("--workloads", default="hello,typical,diverse", help="comma-separated workloads")
     parser.add_argument("--runners", default=None, help="comma-separated runner ids (default: all present)")
-    parser.add_argument("--report", default=str(REPO_ROOT / "docs" / "evidence" / "0006-benchmark-report.md"))
+    parser.add_argument("--report", default=str(REPO_ROOT / "docs" / "evidence" / "0009-benchmark-report.md"))
     parser.add_argument(
-        "--results", default=str(REPO_ROOT / "docs" / "evidence" / "0006-benchmark-results.json")
+        "--results", default=str(REPO_ROOT / "docs" / "evidence" / "0009-benchmark-results.json")
     )
     parser.add_argument("--timeout", type=float, default=120.0, help="per-run timeout in seconds")
     parser.add_argument("--phase-samples", type=int, default=0, help="separate spaced typical runs with daemon phase logging")

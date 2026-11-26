@@ -140,6 +140,7 @@ type private WarmSession() =
     member val ExitedProperty: PropertyInfo option = None with get, set
     member val ExitCodeProperty: PropertyInfo option = None with get, set
     member val CancellationTokenProperty: PropertyInfo option = None with get, set
+    member val ExitCallbackProperty: PropertyInfo option = None with get, set
     member val ExitMarker: string = "" with get, set
     member val Prelude: Prelude.Tag = Prelude.Tag.Builtin with get, set
     member val CompilerDirectory: string = "" with get, set
@@ -317,14 +318,16 @@ let private restoreGlobalState (snap: GlobalStateSnapshot) =
     if not (Object.ReferenceEquals(CultureInfo.CurrentUICulture, snap.CurrentUICulture)) then
         CultureInfo.CurrentUICulture <- snap.CurrentUICulture
     try
-        if Trace.Listeners.Count <> snap.TraceListeners.Length then
-            let keep = HashSet<TraceListener>(snap.TraceListeners)
-            for i = Trace.Listeners.Count - 1 downto 0 do
-                let listener = Trace.Listeners.[i]
-                if not (keep.Contains listener) then
-                    Trace.Listeners.RemoveAt i
+        let mutable changed = Trace.Listeners.Count <> snap.TraceListeners.Length
+        if not changed then
+            for i = 0 to snap.TraceListeners.Length - 1 do
+                if not (Object.ReferenceEquals(Trace.Listeners.[i], snap.TraceListeners.[i])) then
+                    changed <- true
+        if changed then
+            Trace.Listeners.Clear()
+            for listener in snap.TraceListeners do
+                Trace.Listeners.Add listener |> ignore
     with _ -> ()
-
 let private checkerField =
     typeof<FsiEvaluationSession>.GetField("checker", BindingFlags.Instance ||| BindingFlags.NonPublic)
 
@@ -1210,13 +1213,14 @@ let private sessionArguments =
        "--multiemit-"
        "--targetprofile:netcore" |]
 
-let private prelude (exitMarker: string) =
+let private prelude (_exitMarker: string) =
     String.Concat(
         [ "type FsionFsiState() =\n"
           "    member val CommandLineArgs : string[] = [||] with get, set\n"
           "    member val Exited : bool = false with get, set\n"
           "    member val ExitCode : int = 0 with get, set\n"
           "    member val CancellationToken : System.Threading.CancellationToken = System.Threading.CancellationToken.None with get, set\n"
+          "    member val OnExit : System.Action = null with get, set\n"
           "let fsionFsiState = FsionFsiState()\n"
           "let fsi = fsionFsiState\n"
           "exception FsionExit of int\n"
@@ -1224,15 +1228,9 @@ let private prelude (exitMarker: string) =
           "    if not fsionFsiState.Exited then\n"
           "        fsionFsiState.Exited <- true\n"
           "        fsionFsiState.ExitCode <- code\n"
-          "        System.Console.Out.Write(\""
-          exitMarker
-          "\")\n"
-          "        System.Console.Error.Write(\""
-          exitMarker
-          "\")\n"
+          "        if not (isNull fsionFsiState.OnExit) then fsionFsiState.OnExit.Invoke()\n"
           "    raise (FsionExit code)\n" ]
     )
-
 let private builtinPrelude =
     """
 module Fsion =
@@ -1545,6 +1543,7 @@ type private PreludePool(spec: Prelude.Spec, tag: Prelude.Tag) =
 exception private PreludeEvaluationFailure of attemptedTag: Prelude.Tag * inner: exn
 
 type SessionHost(options: SessionHostOptions) =
+    let daemonBaselineGlobalState = captureGlobalState ()
     let targetPoolSize = if options.Oneshot then 1 else max 0 options.PoolSize
     let poolGate = obj ()
     let pools = ResizeArray<PreludePool>()
@@ -1648,15 +1647,14 @@ type SessionHost(options: SessionHostOptions) =
                 detachSessionCallback session
                 clearCheckerCaches session
                 lock releasedGate (fun () -> releasedSessions.Enqueue(WeakReference(session)))
-
                 try
                     (session :> IDisposable).Dispose()
                 with _ ->
                     ()
+                restoreGlobalState daemonBaselineGlobalState
             | None -> ()
 
             removeHandlers work
-
         drained
 
     let completeUnloadSweep (forceSweep: bool) =
@@ -1829,6 +1827,7 @@ type SessionHost(options: SessionHostOptions) =
             warm.ExitedProperty <- Some(stateType.GetProperty "Exited")
             warm.ExitCodeProperty <- Some(stateType.GetProperty "ExitCode")
             warm.CancellationTokenProperty <- Some(stateType.GetProperty "CancellationToken")
+            warm.ExitCallbackProperty <- Some(stateType.GetProperty "OnExit")
             warm.ExitMarker <- exitMarker
             warm.Prelude <- preludeTag
             warm.CompilerDirectory <- compilerDirectory
@@ -2144,15 +2143,16 @@ type SessionHost(options: SessionHostOptions) =
 
                     if request.IncludeDiagnostics && chunk.IndexOf("#load", StringComparison.Ordinal) >= 0 then
                         let checkResults =
-                            let saved = { Out = outWriter; Error = errWriter; In = TextReader.Null }
+                            let saved = Ambient.get ()
                             Ambient.set { Out = TextWriter.Null; Error = TextWriter.Null; In = TextReader.Null }
 
                             try
                                 let _, _, check = session.ParseAndCheckInteraction chunk
                                 check
                             finally
-                                Ambient.set saved
-
+                                match saved with
+                                | Some s -> Ambient.set s
+                                | None -> Ambient.clear ()
                         let hasCompileErrors =
                             checkResults.Diagnostics
                             |> Array.exists (fun diagnostic -> diagnostic.Severity = FSharpDiagnosticSeverity.Error)
@@ -2248,14 +2248,16 @@ type SessionHost(options: SessionHostOptions) =
                     // The non-throwing APIs suppress the formatted diagnostics but still write
                     // "Stopped due to error"; route that to a discard writer so the text printed by the
                     // throwing pass stays byte-identical to 0001.
-                    let saved = { Out = outWriter; Error = errWriter; In = TextReader.Null }
+                    let saved = Ambient.get ()
                     Ambient.set { Out = TextWriter.Null; Error = TextWriter.Null; In = TextReader.Null }
 
                     let diagnostics =
                         try
                             snd (session.EvalInteractionNonThrowing(attemptedCode, attemptedScriptName))
                         finally
-                            Ambient.set saved
+                            match saved with
+                            | Some s -> Ambient.set s
+                            | None -> Ambient.clear ()
 
                     diagnostics |> Array.map scriptDiagnostic
 
@@ -2731,10 +2733,13 @@ type SessionHost(options: SessionHostOptions) =
 
     member _.ExecutedCount = executed.Value
 
-    member _.Execute(request: ExecuteRequest, disconnectToken: CancellationToken, ?stdinReader: TextReader) : ExecutionReport =
-        let runStdin = defaultArg stdinReader TextReader.Null
+    member _.Execute(request: ExecuteRequest, disconnectToken: CancellationToken, ?createStdinReader: CancellationToken -> TextReader) : ExecutionReport =
         let timeoutMs = request.TimeoutMs
         use runCts = new CancellationTokenSource()
+        let runStdin =
+            match createStdinReader with
+            | Some factory -> factory runCts.Token
+            | None -> TextReader.Null
         let timeoutFired = ref 0
         let evaluationStarted = ref 0
 
@@ -2805,14 +2810,21 @@ type SessionHost(options: SessionHostOptions) =
                 else
                         entered <- true
                         try
-                            let globalStateBefore = captureGlobalState ()
                             Ambient.set { Out = outWriter; Error = errWriter; In = runStdin }
 
                             try
                                 match claimed.CancellationTokenProperty, claimed.State with
                                 | Some property, Some state -> property.SetValue(state, box runCts.Token)
                                 | _ -> ()
-
+                                match claimed.ExitCallbackProperty, claimed.State with
+                                | Some property, Some state ->
+                                    property.SetValue(
+                                        state,
+                                        box (Action(fun () ->
+                                            outWriter.Write claimed.ExitMarker
+                                            errWriter.Write claimed.ExitMarker))
+                                    )
+                                | _ -> ()
                                 try
                                     let prepared = prepareExecution request
                                     disconnectToken.ThrowIfCancellationRequested()
@@ -2858,9 +2870,11 @@ type SessionHost(options: SessionHostOptions) =
                                     match claimed.CancellationTokenProperty, claimed.State with
                                     | Some property, Some state -> property.SetValue(state, box CancellationToken.None)
                                     | _ -> ()
+                                    match claimed.ExitCallbackProperty, claimed.State with
+                                    | Some property, Some state -> property.SetValue(state, null)
+                                    | _ -> ()
                             finally
                                 Ambient.clear ()
-                                restoreGlobalState globalStateBefore
                         finally
                             if entered then
                                 processState.Exit ()
@@ -2872,6 +2886,7 @@ type SessionHost(options: SessionHostOptions) =
                         else
                             releaseSession claimed
                 finally
+                    restoreGlobalState daemonBaselineGlobalState
                     if options.LogPath.IsSome then
                         let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs
                         logDetail (

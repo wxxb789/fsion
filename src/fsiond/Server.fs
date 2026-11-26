@@ -24,7 +24,7 @@ type Options =
       Prelude: Prelude.Spec }
 type [<NoEquality; NoComparison>] private Hooks =
     { EnsureWarm: Prelude.Spec -> unit
-      Execute: ExecuteRequest -> CancellationToken -> TextReader -> ExecutionReport
+      Execute: ExecuteRequest -> CancellationToken -> (CancellationToken -> TextReader) -> ExecutionReport
       Status: unit -> StatusInfo
       Metrics: unit -> MetricsInfo
       Retire: unit -> unit
@@ -42,7 +42,6 @@ type private PullStdinStream
     inherit Stream()
 
     let mutable eof = false
-
     override _.CanRead = true
     override _.CanSeek = false
     override _.CanWrite = false
@@ -119,7 +118,7 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
                             try disconnects.Cancel() with _ -> ()
                             try stdinChunks.Add None with _ -> ())
 
-                let stdinReader: TextReader =
+                let createStdinReader (runToken: CancellationToken) : TextReader =
                     if request.Mode = "stdin" then
                         TextReader.Null
                     else
@@ -129,14 +128,14 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
                                 sendGate,
                                 fun () ->
                                     try
-                                        stdinChunks.Take(disconnects.Token)
+                                        stdinChunks.Take(runToken)
                                     with _ ->
                                         None
                             )
-                        new StreamReader(pullStream, UTF8Encoding(false), detectEncodingFromByteOrderMarks = true, bufferSize = 4096) :> TextReader
+                        new StreamReader(pullStream, UTF8Encoding(false), detectEncodingFromByteOrderMarks = false, bufferSize = 4096) :> TextReader
 
                 let started = Stopwatch.GetTimestamp()
-                let report = hooks.Execute request disconnects.Token stdinReader
+                let report = hooks.Execute request disconnects.Token createStdinReader
                 let daemonMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds
 
                 let logExecuted () =
@@ -285,8 +284,8 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
                 session.EnsureWarm spec
                 touchActivity ()
           Execute =
-            fun request disconnectToken stdinReader ->
-                let report = session.Execute(request, disconnectToken, stdinReader)
+            fun request disconnectToken createStdinReader ->
+                let report = session.Execute(request, disconnectToken, createStdinReader)
                 touchActivity ()
                 report
           Status =

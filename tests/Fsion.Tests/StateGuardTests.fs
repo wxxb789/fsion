@@ -81,8 +81,7 @@ printfn "len=%d lines=%d head=%s" text.Length lines.Length (if lines.Length > 0 
             Assert.Equal(0, p1.ExitCode)
             Assert.Equal("instant-ok" + Environment.NewLine, outTask.GetAwaiter().GetResult())
             Assert.Equal("", errTask.GetAwaiter().GetResult())
-            Assert.True(sw.ElapsedMilliseconds < 2500L, $"expected fast completion without stdin read, got {sw.ElapsedMilliseconds} ms")
-
+            Assert.True(sw.ElapsedMilliseconds < 2000L, $"expected fast completion without stdin read, got {sw.ElapsedMilliseconds} ms")
             // Negative control 2: script calls Console.ReadLine(), caller writes one line and keeps stdin open.
             let psi2 = ProcessStartInfo(fsionBinary)
             psi2.WorkingDirectory <- directory
@@ -169,3 +168,97 @@ printfn "clean %.2f|%s" 1.5 (if isNull CultureInfo.DefaultThreadCurrentCulture t
 
             let metrics = context.MetricsOrFail()
             Assert.Equal(0, metrics.AliveDisposedSessions))
+
+    [<Fact>]
+    member _.``json precheck with #load comment preserves stdin, timeout on idle stdin exits promptly, and concurrent stdin readers do not block each other`` () =
+        withContext "stdin-edge-cases" (fun context directory ->
+            let prime = context.Run([ "--pool-size"; "2"; "warmup" ], timeoutMs = 120000)
+            Assert.True(prime.ExitCode = 0, prime.Stderr)
+
+            // Finding 1: --json with #load in comment must preserve stdin.
+            let rJson = context.Run([ "--json"; "-e"; "printfn \"%s\" (System.Console.ReadLine()) // #load" ], stdin = "hello-json\n", timeoutMs = 60000)
+            Assert.Equal(0, rJson.ExitCode)
+            use doc = JsonDocument.Parse rJson.Stdout
+            Assert.Equal("hello-json" + Environment.NewLine, doc.RootElement.GetProperty("stdout").GetString())
+
+            // Finding 2: --timeout 1000 while blocked on unclosed idle stdin returns 124 promptly without wedging daemon.
+            let daemonPid = context.DaemonPid()
+            let psiTimeout = ProcessStartInfo(fsionBinary)
+            psiTimeout.WorkingDirectory <- directory
+            psiTimeout.UseShellExecute <- false
+            psiTimeout.RedirectStandardInput <- true
+            psiTimeout.RedirectStandardOutput <- true
+            psiTimeout.RedirectStandardError <- true
+            psiTimeout.ArgumentList.Add "--timeout"
+            psiTimeout.ArgumentList.Add "1000"
+            psiTimeout.ArgumentList.Add "-e"
+            psiTimeout.ArgumentList.Add "System.Console.ReadLine() |> ignore"
+            for key, value in context.Environment do
+                psiTimeout.Environment.[key] <- value
+            let sw = Stopwatch.StartNew()
+            use pTimeout = Process.Start psiTimeout
+            let _ = pTimeout.StandardOutput.ReadToEndAsync()
+            let _ = pTimeout.StandardError.ReadToEndAsync()
+            let exited = pTimeout.WaitForExit 8000
+            sw.Stop()
+            if not exited then try pTimeout.Kill(true) with _ -> ()
+            Assert.True(exited, "fsion --timeout 1000 blocked on unclosed idle stdin")
+            Assert.Equal(124, pTimeout.ExitCode)
+            Assert.True(sw.ElapsedMilliseconds < 6000L, $"expected prompt timeout exit, got {sw.ElapsedMilliseconds} ms")
+            Assert.Equal(daemonPid, context.DaemonPid())
+
+            // Finding 3: concurrent stdin readers on the same daemon do not serialize on SyncTextReader.
+            let startReader () =
+                let psi = ProcessStartInfo(fsionBinary)
+                psi.WorkingDirectory <- directory
+                psi.UseShellExecute <- false
+                psi.RedirectStandardInput <- true
+                psi.RedirectStandardOutput <- true
+                psi.RedirectStandardError <- true
+                psi.ArgumentList.Add "-e"
+                psi.ArgumentList.Add "printfn \"R:%s\" (System.Console.ReadLine())"
+                for key, value in context.Environment do
+                    psi.Environment.[key] <- value
+                Process.Start psi
+            use pA = startReader ()
+            let outA = pA.StandardOutput.ReadToEndAsync()
+            let _ = pA.StandardError.ReadToEndAsync()
+            Thread.Sleep 300
+            use pB = startReader ()
+            let outB = pB.StandardOutput.ReadToEndAsync()
+            let _ = pB.StandardError.ReadToEndAsync()
+            pB.StandardInput.WriteLine "from-B"
+            pB.StandardInput.Flush()
+            let bDone = pB.WaitForExit 5000
+            if not bDone then try pB.Kill(true) with _ -> ()
+            pA.StandardInput.WriteLine "from-A"
+            pA.StandardInput.Flush()
+            let aDone = pA.WaitForExit 5000
+            if not aDone then try pA.Kill(true) with _ -> ()
+            Assert.True(bDone, "reader B was blocked by idle reader A")
+            Assert.True(aDone, "reader A did not finish after receiving input")
+            Assert.Equal("R:from-B" + Environment.NewLine, outB.GetAwaiter().GetResult())
+            Assert.Equal("R:from-A" + Environment.NewLine, outA.GetAwaiter().GetResult()))
+
+    [<Fact>]
+    member _.``exit after Console.SetOut(Null) still truncates output and Dispose poisoning is cleaned up`` () =
+        withContext "exit-dispose-edge" (fun context _ ->
+            let prime = context.Run([ "--pool-size"; "2"; "warmup" ], timeoutMs = 120000)
+            Assert.True(prime.ExitCode = 0, prime.Stderr)
+
+            // Finding 8: exit marker still truncates even if Console.Out was replaced before exit.
+            let exitCase =
+                "let saved = System.Console.Out\nSystem.Console.SetOut(System.IO.TextWriter.Null)\ntry exit 5 with _ -> System.Console.SetOut(saved); System.Console.WriteLine(\"after\")"
+            let rExit = context.Run([ "-e"; exitCase ], timeoutMs = 60000)
+            Assert.Equal(5, rExit.ExitCode)
+            Assert.Equal("", rExit.Stdout)
+
+            // Finding 5: IDisposable.Dispose poisoning Console.Out during stateless cleanup is restored.
+            let disposePoison =
+                "let d = { new System.IDisposable with member _.Dispose() = System.Console.SetOut(System.IO.TextWriter.Null) }"
+            let r1 = context.Run([ "-e"; disposePoison ], timeoutMs = 60000)
+            Assert.Equal(0, r1.ExitCode)
+            let _ = context.MetricsOrFail()
+            let r2 = context.Run([ "-e"; "System.Console.WriteLine(\"expected\")" ], timeoutMs = 60000)
+            Assert.Equal(0, r2.ExitCode)
+            Assert.Equal("expected" + Environment.NewLine, r2.Stdout))

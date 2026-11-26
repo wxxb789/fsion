@@ -791,17 +791,22 @@ type IsolationTests(output: ITestOutputHelper) =
                 exclusiveReadOnExe.Close()
                 // Late-loaded BCL disk assembly (not in builtinPrelude.warmAssemblies) must not
                 // permanently flip HasPreExistingUserFiles = true and force Gen-2 on subsequent stateless runs.
-                let xmlLoadRes = runP0 [ "-e"; "let d = System.Xml.XmlDocument()\nd.LoadXml(\"<a/>\")\nSystem.Console.Write(d.DocumentElement.Name)" ]
+                // Run against the warm-pool daemon (`context`) so `System.GC.ConserveMemory = 9` cold session
+                // creation under `--pool-size 0` doesn't trigger natural Gen-2 collections on every cold compile.
+                let hasZeroGen2Step (counts: int[]) =
+                    [ 0 .. counts.Length - 2 ] |> List.exists (fun i -> counts.[i + 1] = counts.[i])
+                use warmCtx = new FsionContext(p0WorkDir)
+                assertRun (warmCtx.Run([ "--pool-size"; "4"; "warmup" ], timeoutMs = 120000))
+                let xmlLoadRes = warmCtx.Run([ "-e"; "let d = System.Xml.XmlDocument()\nd.LoadXml(\"<a/>\")\nSystem.Console.Write(d.DocumentElement.Name)" ], timeoutMs = 60000)
                 assertRun xmlLoadRes
                 Assert.Equal("a", xmlLoadRes.Stdout)
+                assertRun (warmCtx.Run([ "warmup" ], timeoutMs = 120000))
                 let gen2Counts =
                     [| for _ in 1 .. 4 ->
-                        let r = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
+                        let r = warmCtx.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
-                // If HasPreExistingUserFiles were stuck true, every run would increment Gen-2 (+3 across 4 runs);
-                // allowing <= 1 natural background/drain Gen-2 across 4 runs proves per-run Gen-2 is not forced.
-                Assert.True(gen2Counts.[3] - gen2Counts.[0] <= 1, sprintf "unexpected per-run Gen-2 after Xml load: %A" gen2Counts)
+                Assert.True(hasZeroGen2Step gen2Counts, sprintf "forced per-run Gen-2 after Xml load: %A" gen2Counts)
                 // Loading a Default-ALC BCL DLL while a user FileStream temporarily holds the same DLL open
                 // must promote the remaining CoreCLR PE handle once the user stream closes, avoiding per-run Gen-2.
                 let concurrentLoadCode =
@@ -810,48 +815,45 @@ type IsolationTests(output: ITestOutputHelper) =
                           "let path = System.IO.Path.Combine(dir, \"System.Xml.XPath.XDocument.dll\")"
                           "use stream = System.IO.File.OpenRead path"
                           "System.Runtime.Loader.AssemblyLoadContext.Default.LoadFromAssemblyPath(path) |> ignore" ]
-                assertRun (runP0 [ "-e"; concurrentLoadCode ])
+                assertRun (warmCtx.Run([ "-e"; concurrentLoadCode ], timeoutMs = 60000))
+                assertRun (warmCtx.Run([ "warmup" ], timeoutMs = 120000))
                 let afterLoadCounts =
                     [| for _ in 1 .. 4 ->
-                        let r = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
+                        let r = warmCtx.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
-                Assert.True(afterLoadCounts.[3] - afterLoadCounts.[0] <= 1, sprintf "unexpected per-run Gen-2 after concurrent load: %A" afterLoadCounts)
+                Assert.True(hasZeroGen2Step afterLoadCounts, sprintf "forced per-run Gen-2 after concurrent load: %A" afterLoadCounts)
             if OperatingSystem.IsLinux() then
                 // On Linux `/proc/self/fd`, enumerating the directory produces a vanished self-FD (`ENOENT`)
                 // and CoreCLR runtime FDs (e.g. CLR/DLL files), neither of which may force Gen-2 on stateless runs.
-                let linuxCounts =
-                    [| for _ in 1 .. 4 ->
-                        let r = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
-                        assertRun r
-                        Int32.Parse(r.Stdout.Trim()) |]
-                Assert.True(linuxCounts.[3] - linuxCounts.[0] <= 1, sprintf "unexpected per-run Gen-2 on Linux: %A" linuxCounts)
-                // Late-loading a Default-ALC BCL DLL while a user FileStream holds the same DLL open
-                // must promote the remaining CoreCLR FD once the user stream closes, avoiding per-run Gen-2.
+                // Use a dedicated `--pool-size 4` daemon with `warmup` so all 4 turns hit warm sessions without
+                // cold session creation triggering `ConserveMemory=9` Gen-2 collections.
                 let linuxConcurrentLoadCode =
                     String.concat "\n"
                         [ "let dir = System.IO.Path.GetDirectoryName(typeof<obj>.Assembly.Location)"
                           "let path = System.IO.Path.Combine(dir, \"System.Xml.XPath.XDocument.dll\")"
                           "use stream = System.IO.File.OpenRead path"
                           "System.Runtime.Loader.AssemblyLoadContext.Default.LoadFromAssemblyPath(path) |> ignore" ]
-                assertRun (runP0 [ "-e"; linuxConcurrentLoadCode ])
-                // Use a dedicated warm-pool daemon (--pool-size 2) and wait briefly for background replenish
-                // to finish between turns so cold session creation doesn't trigger natural GC on CI runners.
+                let hasZeroGen2Step (counts: int[]) =
+                    [ 0 .. counts.Length - 2 ] |> List.exists (fun i -> counts.[i + 1] = counts.[i])
+                use warmLinuxCtx = new FsionContext(p0WorkDir)
+                assertRun (warmLinuxCtx.Run([ "--pool-size"; "4"; "warmup" ], timeoutMs = 120000))
                 let warmLinuxCounts =
                     [| for _ in 1 .. 4 ->
-                        let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
+                        let r = warmLinuxCtx.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
-                Assert.True(warmLinuxCounts.[3] - warmLinuxCounts.[0] <= 1, sprintf "unexpected per-run Gen-2 on warm Linux daemon: %A" warmLinuxCounts)
-                assertRun (context.Run([ "-e"; linuxConcurrentLoadCode ], timeoutMs = 60000))
+                Assert.True(hasZeroGen2Step warmLinuxCounts, sprintf "forced per-run Gen-2 on warm Linux daemon: %A" warmLinuxCounts)
+                assertRun (warmLinuxCtx.Run([ "-e"; linuxConcurrentLoadCode ], timeoutMs = 60000))
+                assertRun (warmLinuxCtx.Run([ "warmup" ], timeoutMs = 120000))
                 let linuxAfterLoadCounts =
                     [| for _ in 1 .. 4 ->
-                        let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
+                        let r = warmLinuxCtx.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
                 Assert.True(
-                    linuxAfterLoadCounts.[3] - linuxAfterLoadCounts.[0] <= 1,
-                    sprintf "unexpected per-run Gen-2 on Linux after concurrent load: %A" linuxAfterLoadCounts)
+                    hasZeroGen2Step linuxAfterLoadCounts,
+                    sprintf "forced per-run Gen-2 on Linux after concurrent load: %A" linuxAfterLoadCounts)
             let disposeEntered = Path.Combine(directory, "dispose-entered.txt")
             let disposeRelease = Path.Combine(directory, "dispose-release.txt")
             let slowDisposeScript = Path.Combine(directory, "slow-dispose.fsx")

@@ -16,11 +16,11 @@ type private Options =
     { Endpoint: Endpoint
       IdleTtlMinutes: float
       SessionTtlMinutes: float
+      TrimIdleMinutes: float
       Oneshot: bool
       PoolSize: int
       LogPath: string option
       Prelude: Spec }
-
 let private parse (argv: string[]) =
     let mutable endpointName = defaultEndpointName ()
     let mutable endpointSet = false
@@ -121,6 +121,13 @@ let private parse (argv: string[]) =
                     match Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture) with
                     | true, parsed when parsed > 0.0 -> parsed
                     | _ -> sessionTtlMinutes
+        let envTrimIdle =
+            match Environment.GetEnvironmentVariable TrimIdleEnvironmentVariable with
+            | null | "" -> DefaultTrimIdleMinutes
+            | value ->
+                match Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture) with
+                | true, parsed when parsed >= 0.0 -> parsed
+                | _ -> DefaultTrimIdleMinutes
         let configuredPrelude =
             if preludePath.IsSome then
                 preludePath
@@ -140,6 +147,7 @@ let private parse (argv: string[]) =
             { Endpoint = { Name = envEndpoint }
               IdleTtlMinutes = envTtl
               SessionTtlMinutes = envSessionTtl
+              TrimIdleMinutes = envTrimIdle
               Oneshot = oneshot
               PoolSize = envPoolSize
               LogPath = logPath
@@ -150,6 +158,7 @@ let private runDaemon (options: Options) (releaseOwnership: unit -> unit) =
         { Endpoint = options.Endpoint
           IdleTtlMinutes = options.IdleTtlMinutes
           SessionTtlMinutes = options.SessionTtlMinutes
+          TrimIdleMinutes = options.TrimIdleMinutes
           Oneshot = options.Oneshot
           PoolSize = options.PoolSize
           LogPath = options.LogPath
@@ -159,6 +168,7 @@ let private runDaemon (options: Options) (releaseOwnership: unit -> unit) =
 
 [<EntryPoint>]
 let main argv =
+    detachPosixSession ()
     Ambient.install ()
     initializeProcessCaches ()
     match parse argv with
@@ -194,23 +204,18 @@ let main argv =
                 finally
                     release ()
         else
-            let path = socketPath options.Endpoint
-            let ownedByOther =
-                if File.Exists path then
-                    match tryConnect options.Endpoint (TimeSpan.FromMilliseconds 400.0) with
-                    | Some stream ->
-                        stream.Dispose()
-                        true
-                    | None ->
+            match tryAcquireUnixEndpointLock options.Endpoint with
+            | None ->
+                Log.info options.LogPath "another fsiond owns this endpoint; exiting"
+                0
+            | Some releaseLock ->
+                try
+                    let path = socketPath options.Endpoint
+                    if File.Exists path then
                         try
                             File.Delete path
                         with _ ->
                             ()
-                        false
-                else
-                    false
-            if ownedByOther then
-                Log.info options.LogPath "another fsiond owns this endpoint; exiting"
-                0
-            else
-                runDaemon options ignore
+                    runDaemon options releaseLock
+                finally
+                    releaseLock ()

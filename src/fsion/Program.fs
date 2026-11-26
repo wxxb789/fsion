@@ -476,26 +476,44 @@ let private emit (options: Options) (elapsedMs: float) (response: Response) : in
     | Failure message -> emitFailure options elapsedMs message
     | _ -> emitFailure options elapsedMs "unexpected daemon response"
 
+let private sendControlWithFallback (endpoint: Endpoint) (request: Request) : Response option =
+    let tryVersion (ver: int) =
+        match tryConnect endpoint (TimeSpan.FromMilliseconds 250.0) with
+        | None -> None
+        | Some stream ->
+            use connection = stream
+            try
+                sendRequestWithVersion ver connection request
+                match tryReceiveFrame connection with
+                | Some payload -> Some(parseResponse payload)
+                | None -> None
+            with _ ->
+                None
+
+    match tryVersion ProtocolVersion with
+    | Some (Failure msg) when msg.Contains("unsupported protocol version", StringComparison.OrdinalIgnoreCase) ->
+        // Fallback to legacy protocol versions (4..1) so newer CLI can inspect/stop an older daemon on an explicit --pipe.
+        [ ProtocolVersion - 1 .. -1 .. 1 ]
+        |> List.tryPick (fun v ->
+            match tryVersion v with
+            | Some (Failure m) when m.Contains("unsupported protocol version", StringComparison.OrdinalIgnoreCase) -> None
+            | other -> other)
+    | other -> other
+
 let private fetchStatus (endpoint: Endpoint) : StatusInfo option =
-    match tryConnect endpoint (TimeSpan.FromMilliseconds 250.0) with
-    | None -> None
-    | Some stream ->
-        use connection = stream
-        match sendAndReceive connection None GetStatus with
-        | Delivered (Status status) -> Some status
-        | _ -> None
+    match sendControlWithFallback endpoint GetStatus with
+    | Some (Status status) -> Some status
+    | _ -> None
 
 let private stopDaemon (endpoint: Endpoint) : bool =
     match tryConnect endpoint (TimeSpan.FromMilliseconds 250.0) with
     | None -> true
-    | Some stream ->
+    | Some probe ->
+        probe.Dispose()
         let replied =
-            try
-                match sendAndReceive stream None Shutdown with
-                | Delivered ShuttingDown -> true
-                | _ -> false
-            finally
-                stream.Dispose()
+            match sendControlWithFallback endpoint Shutdown with
+            | Some ShuttingDown -> true
+            | _ -> false
         if not replied then
             false
         else
@@ -504,11 +522,10 @@ let private stopDaemon (endpoint: Endpoint) : bool =
             while reachable && DateTime.UtcNow < deadline do
                 match tryConnect endpoint (TimeSpan.FromMilliseconds 150.0) with
                 | None -> reachable <- false
-                | Some probe ->
-                    probe.Dispose()
+                | Some p ->
+                    p.Dispose()
                     Thread.Sleep 100
             not reachable
-
 let private readAllStdin () =
     use standardInput = Console.OpenStandardInput()
     use buffer = new MemoryStream()
@@ -517,7 +534,12 @@ let private readAllStdin () =
     if text.Length > 0 && text.[0] = '\uFEFF' then text.Substring 1 else text
 
 let private statusLine (status: StatusInfo) =
-    $"fsiond running (pid={status.Pid}, endpoint={status.Endpoint}, uptimeMs={status.UptimeMs}, idleMs={status.IdleMs}, executed={status.Executed}, warm={status.Warm})"
+    let extra =
+        if status.TargetFramework.Length > 0 then
+            $", protocol={status.ProtocolVersion}, tfm={status.TargetFramework}, build={status.BuildFingerprint}, pool={status.PoolSize}, idleTtl={status.IdleTtlMinutes.ToString(CultureInfo.InvariantCulture)}m, sessionTtl={status.SessionTtlMinutes.ToString(CultureInfo.InvariantCulture)}m"
+        else
+            ""
+    $"fsiond running (pid={status.Pid}, endpoint={status.Endpoint}, uptimeMs={status.UptimeMs}, idleMs={status.IdleMs}, executed={status.Executed}, warm={status.Warm}{extra})"
 
 let private runWarmup (options: Options) (endpoint: Endpoint) : int =
     let stream = ensureDaemon options endpoint

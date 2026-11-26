@@ -6,14 +6,13 @@ Read [Core Design](../core-design.md) for enduring architectural invariants and 
 
 ## Lifecycle Convention
 
-- **Active queue**: Goals `0007` and `0008`, in that order.
+- **Active queue**: Goal `0008`.
 - **Archive**: Once a goal's outcome is accepted, move the completed goal file unchanged into `docs/goals/archive/`. Never rewrite archived contracts.
 
 ## Active Series
 
 | Goal | Status | Prerequisite | Intended Outcome |
 |---|---|---|---|
-| [0007-protocol-security-and-fault-isolation.md](0007-protocol-security-and-fault-isolation.md) | Ready | `0006` | Build/TFM-isolated endpoints & version-tolerant control frames, `CurrentUserOnly` / `0600` IPC + detached Unix `setsid`, cancellable FIFO `ProcessStateGate` (nested deadlock fix), non-collateral wedged drain, and named-session generation loss reporting |
 | [0008-stdin-exit-parity-and-state-guards.md](0008-stdin-exit-parity-and-state-guards.md) | Ready | `0007` | Demand-driven piped `stdin` forwarding in `file`/`-e` modes without open-pipe hangs, `exit <n>` parity inside `try ... with` blocks without marker leaks, and `< 0.1 ms` post-run global state guards (`Console.SetOut`, `AppDomain` handlers, culture, `Trace`) |
 
 ## Completed and Archived
@@ -26,5 +25,6 @@ Read [Core Design](../core-design.md) for enduring architectural invariants and 
 | [0004-agent-prelude-and-cached-nuget.md](archive/0004-agent-prelude-and-cached-nuget.md) | Completed | `0002` | Built-in zero-dependency `Fsion` agent prelude, configurable pre-warmed user `prelude.fsx`, and persistent `#r "nuget: ..."` resolution cache |
 | [0005-cross-platform-packaging-and-benchmark-gate.md](archive/0005-cross-platform-packaging-and-benchmark-gate.md) | Completed | `0001`–`0004` | Interleaved unseen-script benchmark harness (30 measured rounds, byte-verified parity; `42.1x` median over `dotnet fsi` at 71.8 ms, strict `<= 1.00x bun` bar measured at 1.52x and reported `FAIL` per contract diagnostic clause), host-RID NativeAOT packaging with fresh-temp smoke test, 3-OS CI, and operator/agent documentation |
 | [0006-hot-path-and-burst-resilience.md](archive/0006-hot-path-and-burst-resilience.md) | Completed | `0005` | Default-path hot-path slimming, two retained prelude pools, deterministic handle release, and a [measured 12-script zero-gap burst](../evidence/0006-benchmark-report.md#zero-gap-burst) |
+| [0007-protocol-security-and-fault-isolation.md](archive/0007-protocol-security-and-fault-isolation.md) | Completed | `0006` | Build/TFM-isolated endpoints & version-tolerant control frames, `CurrentUserOnly` / `0700`/`0600` + `flock` + `setsid` IPC, fair FIFO cancellable `ProcessStateGate` with nested deadlock prevention, non-collateral wedged drain, named-session generation tombstones, and idle LOH compaction + Windows working-set trim |
 
-Evidence: [../evidence/0001-evidence.md](../evidence/0001-evidence.md), [../evidence/0002-evidence.md](../evidence/0002-evidence.md), [../evidence/0003-evidence.md](../evidence/0003-evidence.md), [../evidence/0004-evidence.md](../evidence/0004-evidence.md), [../evidence/0005-evidence.md](../evidence/0005-evidence.md), [../evidence/0006-evidence.md](../evidence/0006-evidence.md).
+Evidence: [../evidence/0001-evidence.md](../evidence/0001-evidence.md), [../evidence/0002-evidence.md](../evidence/0002-evidence.md), [../evidence/0003-evidence.md](../evidence/0003-evidence.md), [../evidence/0004-evidence.md](../evidence/0004-evidence.md), [../evidence/0005-evidence.md](../evidence/0005-evidence.md), [../evidence/0006-evidence.md](../evidence/0006-evidence.md), [../evidence/0007-evidence.md](../evidence/0007-evidence.md).

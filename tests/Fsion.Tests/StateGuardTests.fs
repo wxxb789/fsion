@@ -25,7 +25,7 @@ printfn "len=%d lines=%d head=%s" text.Length lines.Length (if lines.Length > 0 
 
             let payload =
                 let sb = StringBuilder()
-                sb.AppendLine("alpha-🚀-中文") |> ignore
+                sb.AppendLine("alpha-header-line") |> ignore
                 for i in 1 .. 2500 do
                     sb.Append("line-").Append(i).Append("-0123456789abcdef0123456789abcdef\n") |> ignore
                 sb.ToString()
@@ -39,11 +39,10 @@ printfn "len=%d lines=%d head=%s" text.Length lines.Length (if lines.Length > 0 
             Assert.Equal(fsiFile.Stderr, fsionFile.Stderr)
 
             let evalCode = "let line = System.Console.ReadLine()\nprintfn \"LINE:%s\" line"
-            let smallPayload = "first-line-λ\nsecond-line\n"
+            let smallPayload = "first-line-λ-中文-🚀\nsecond-line\n"
             let fsionEval = context.Run([ "-e"; evalCode ], stdin = smallPayload, timeoutMs = 60000)
             Assert.Equal(0, fsionEval.ExitCode)
-            Assert.Equal("LINE:first-line-λ" + Environment.NewLine, fsionEval.Stdout)
-
+            Assert.Equal("LINE:first-line-λ-中文-🚀" + Environment.NewLine, fsionEval.Stdout)
             let fsionJson = context.Run([ "--json"; scriptPath ], stdin = payload, timeoutMs = 60000)
             Assert.Equal(0, fsionJson.ExitCode)
             use doc = JsonDocument.Parse fsionJson.Stdout

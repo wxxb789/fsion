@@ -578,6 +578,33 @@ module private WinHandleTable =
                                 with _ -> ()
                         with _ -> ())
 
+    let private recordPosixHandleForAssembly (asm: Assembly) =
+        if OperatingSystem.IsLinux()
+           && not asm.IsDynamic
+           && Object.ReferenceEquals(AssemblyLoadContext.GetLoadContext asm, AssemblyLoadContext.Default) then
+            let loc =
+                try
+                    asm.Location
+                with _ ->
+                    ""
+            if not (String.IsNullOrEmpty loc) then
+                try
+                    let fullLoc = Path.GetFullPath loc
+                    if isTrustedRuntimeAssemblyPath fullLoc && Directory.Exists "/proc/self/fd" then
+                        let matched = ResizeArray<string>()
+                        for entry in Directory.GetFileSystemEntries "/proc/self/fd" do
+                            let name = Path.GetFileName entry
+                            try
+                                match File.ResolveLinkTarget(entry, false) with
+                                | null -> ()
+                                | info ->
+                                    if String.Equals(info.FullName, fullLoc, StringComparison.Ordinal) then
+                                        matched.Add(name + "\t" + info.FullName)
+                            with _ -> ()
+                        if matched.Count = 1 then
+                            lock baselineSync (fun () -> posixRuntimeBaseline.Add matched.[0] |> ignore)
+                with _ -> ()
+
     let initializeBaseline () =
         if OperatingSystem.IsWindows() then
             lock baselineSync (fun () ->
@@ -593,7 +620,11 @@ module private WinHandleTable =
                 if not assemblyLoadHooked then
                     assemblyLoadHooked <- true
                     AppDomain.CurrentDomain.AssemblyLoad.Add(fun args -> recordHandleBaselineForAssembly args.LoadedAssembly))
-
+        elif OperatingSystem.IsLinux() then
+            lock baselineSync (fun () ->
+                if not assemblyLoadHooked then
+                    assemblyLoadHooked <- true
+                    AppDomain.CurrentDomain.AssemblyLoad.Add(fun args -> recordPosixHandleForAssembly args.LoadedAssembly))
     let recordBuiltinWarmBaseline () =
         if OperatingSystem.IsWindows() then
             lock baselineSync (fun () ->

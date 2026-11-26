@@ -34,16 +34,15 @@ let hashText (text: string) = digest (Encoding.UTF8.GetBytes text)
 let escapeVerbatim (value: string) = value.Replace("\"", "\"\"")
 
 module private PosixOpen =
+    // 2-argument `open(pathname, flags)` without `O_CREAT` passes no variadic `mode` argument
+    // (safe on both x64 and Apple arm64). Regular files ignore `O_NONBLOCK` on read, so no
+    // variadic `fcntl(F_SETFL, ...)` call is needed after verifying `stream.CanSeek`.
     [<DllImport("libc", EntryPoint = "open", SetLastError = true)>]
     extern int openFd(string pathname, int flags)
 
-    [<DllImport("libc", EntryPoint = "fcntl", SetLastError = true)>]
-    extern int fcntl(int fd, int cmd, int arg)
-
 // On POSIX, opening a named FIFO with plain `FileStream(FileMode.Open)` blocks indefinitely inside
 // `open(2)` when no writer is attached, which could stall background prelude tag polling or `creationGate`
-// handoff. Open with `O_RDONLY | O_NONBLOCK | O_CLOEXEC`, reject non-regular files (`CanSeek = false`),
-// and clear `O_NONBLOCK` before reading regular file bytes.
+// handoff. Open with `O_RDONLY | O_NONBLOCK | O_CLOEXEC` and reject non-regular files (`CanSeek = false`).
 let private readAllBytesShared (path: string) : byte[] =
     if OperatingSystem.IsWindows() then
         use stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite ||| FileShare.Delete)
@@ -66,9 +65,6 @@ let private readAllBytesShared (path: string) : byte[] =
         use stream = new FileStream(safeHandle, FileAccess.Read)
         if not stream.CanSeek then
             raise (IOException("prelude path is not a regular seekable file: " + path))
-        let currentFlags = PosixOpen.fcntl(fd, 3, 0)
-        if currentFlags >= 0 then
-            PosixOpen.fcntl(fd, 4, currentFlags &&& ~~~oNonBlock) |> ignore
         let length = stream.Length
         if length = 0L then
             [||]

@@ -3,7 +3,11 @@
     <OutputType>Exe</OutputType>
     <AssemblyName>fsiond</AssemblyName>
     <RootNamespace>Fsiond</RootNamespace>
+    <GarbageCollectionAdaptationMode>1</GarbageCollectionAdaptationMode>
   </PropertyGroup>
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="9" />
+  </ItemGroup>
   <ItemGroup>
     <Compile Include="Log.fs" />
     <Compile Include="Ambient.fs" />

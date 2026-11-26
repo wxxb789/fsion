@@ -19,7 +19,7 @@ Read [../core-design.md](../core-design.md) and [../specs/2026-11-22-fsion-core-
 
 ## Prerequisite
 
-Accepted completion of [0007-protocol-security-and-fault-isolation.md](0007-protocol-security-and-fault-isolation.md).
+Accepted completion of [0007-protocol-security-and-fault-isolation.md](archive/0007-protocol-security-and-fault-isolation.md).
 
 ## Material Scope, Constraints, and Assumptions
 

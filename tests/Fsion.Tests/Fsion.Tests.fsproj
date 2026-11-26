@@ -14,6 +14,7 @@
     <Compile Include="JsonTests.fs" />
     <Compile Include="SessionTests.fs" />
     <Compile Include="RecoveryTests.fs" />
+    <Compile Include="HardeningTests.fs" />
     <Compile Include="PreludeTests.fs" />
     <Compile Include="NugetCacheTests.fs" />
     <Compile Include="LatencyTests.fs" />

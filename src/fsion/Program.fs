@@ -517,7 +517,12 @@ let private readAllStdin () =
     if text.Length > 0 && text.[0] = '\uFEFF' then text.Substring 1 else text
 
 let private statusLine (status: StatusInfo) =
-    $"fsiond running (pid={status.Pid}, endpoint={status.Endpoint}, uptimeMs={status.UptimeMs}, idleMs={status.IdleMs}, executed={status.Executed}, warm={status.Warm})"
+    let extra =
+        if status.TargetFramework.Length > 0 then
+            $", protocol={status.ProtocolVersion}, tfm={status.TargetFramework}, build={status.BuildFingerprint}, pool={status.PoolSize}, idleTtl={status.IdleTtlMinutes.ToString(CultureInfo.InvariantCulture)}m, sessionTtl={status.SessionTtlMinutes.ToString(CultureInfo.InvariantCulture)}m"
+        else
+            ""
+    $"fsiond running (pid={status.Pid}, endpoint={status.Endpoint}, uptimeMs={status.UptimeMs}, idleMs={status.IdleMs}, executed={status.Executed}, warm={status.Warm}{extra})"
 
 let private runWarmup (options: Options) (endpoint: Endpoint) : int =
     let stream = ensureDaemon options endpoint

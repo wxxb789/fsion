@@ -16,11 +16,11 @@ type Options =
     { Endpoint: Endpoint
       IdleTtlMinutes: float
       SessionTtlMinutes: float
+      TrimIdleMinutes: float
       Oneshot: bool
       PoolSize: int
       LogPath: string option
       Prelude: Prelude.Spec }
-
 type [<NoEquality; NoComparison>] private Hooks =
     { EnsureWarm: Prelude.Spec -> unit
       Execute: ExecuteRequest -> CancellationToken -> ExecutionReport
@@ -111,26 +111,33 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
             ()
 
 let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit) : int =
+    let generationId = Guid.NewGuid().ToString("N")
     let session =
         new SessionHost(
-            { PoolSize = options.PoolSize
+            { EndpointName = options.Endpoint.Name
+              GenerationId = generationId
+              PoolSize = options.PoolSize
               SessionTtlMinutes = options.SessionTtlMinutes
+              TrimIdleMinutes = options.TrimIdleMinutes
               Oneshot = options.Oneshot
               LogPath = options.LogPath
               Prelude = options.Prelude }
         )
 
     let startedAt = DateTime.UtcNow
-    let lastActivity = ref DateTime.UtcNow
-    let activeRequests = ref 0
-    let stopped = ref false
+    let mutable lastActivityTicks = DateTime.UtcNow.Ticks
+    let mutable activeRequests = 0
+    let mutable wedgedCount = 0
+    let mutable stopped = 0
     let idleTtlMs = int64 (TimeSpan.FromMinutes(options.IdleTtlMinutes).TotalMilliseconds)
 
     let stopToken = new CancellationTokenSource()
 
+    let touchActivity () =
+        Volatile.Write(&lastActivityTicks, DateTime.UtcNow.Ticks)
+
     let stop () =
-        if not stopped.Value then
-            stopped.Value <- true
+        if Interlocked.Exchange(&stopped, 1) = 0 then
             stopToken.Cancel()
 
             try
@@ -140,14 +147,20 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
 
             releaseOwnership ()
 
-    // The drained generation keeps no endpoint and no in-flight script can return. A hard
-    // self-kill bounds the leak even if managed shutdown handlers would block on the wedged
-    // session's process-wide FSI cleanup.
+    // Non-collateral wedged drain: stop accepting new connections and release endpoint ownership
+    // immediately so the replacement generation serves new callers at once, but let all other
+    // healthy in-flight requests finish before terminating the retiring process (bounded by a
+    // generous drain ceiling so a wedged evaluation still cannot leak forever).
     let scheduleSelfTermination () =
+        Interlocked.Increment(&wedgedCount) |> ignore
         Task.Factory.StartNew(
             (fun () ->
-                Thread.Sleep 1000
-
+                let drainDeadline = Environment.TickCount64 + 60000L
+                while Volatile.Read(&activeRequests) > Volatile.Read(&wedgedCount)
+                      && Environment.TickCount64 < drainDeadline do
+                    Thread.Sleep 50
+                // Brief grace period so the final response flushes to the client pipe/socket.
+                Thread.Sleep 250
                 try
                     Process.GetCurrentProcess().Kill()
                 with _ ->
@@ -188,20 +201,28 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
         { EnsureWarm =
             fun spec ->
                 session.EnsureWarm spec
-                lastActivity.Value <- DateTime.UtcNow
+                touchActivity ()
           Execute =
             fun request disconnectToken ->
                 let report = session.Execute(request, disconnectToken)
-                lastActivity.Value <- DateTime.UtcNow
+                touchActivity ()
                 report
           Status =
             fun () ->
+                let lastTicks = Volatile.Read(&lastActivityTicks)
                 { Pid = Environment.ProcessId
                   Endpoint = options.Endpoint.Name
                   UptimeMs = int64 (DateTime.UtcNow - startedAt).TotalMilliseconds
-                  IdleMs = int64 (DateTime.UtcNow - lastActivity.Value).TotalMilliseconds
+                  IdleMs = int64 (DateTime.UtcNow - DateTime(lastTicks, DateTimeKind.Utc)).TotalMilliseconds
                   Executed = session.ExecutedCount
-                  Warm = session.IsWarm }
+                  Warm = session.IsWarm
+                  ProtocolVersion = ProtocolVersion
+                  TargetFramework = targetFrameworkMoniker
+                  BuildFingerprint = buildFingerprint
+                  PoolSize = options.PoolSize
+                  IdleTtlMinutes = options.IdleTtlMinutes
+                  SessionTtlMinutes = options.SessionTtlMinutes
+                  GenerationId = generationId }
           Metrics = fun () -> session.Metrics ()
           Retire = retire
           Respawn = respawn
@@ -210,15 +231,15 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
     let acceptLoop =
         Task.Factory.StartNew(
             (fun () ->
-                while not stopped.Value do
+                while Volatile.Read(&stopped) = 0 do
                     try
                         let stream = listener.Accept().GetAwaiter().GetResult()
-                        activeRequests.Value <- activeRequests.Value + 1
+                        Interlocked.Increment(&activeRequests) |> ignore
                         Task.Run(fun () ->
                             try
                                 handleConnection options hooks stream
                             finally
-                                activeRequests.Value <- activeRequests.Value - 1)
+                                Interlocked.Decrement(&activeRequests) |> ignore)
                         |> ignore
                     with
                     | :? OperationCanceledException -> ()
@@ -231,15 +252,16 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
 
     let watchdog =
         Task.Run(fun () ->
-            while not stopped.Value do
+            while Volatile.Read(&stopped) = 0 do
                 stopToken.Token.WaitHandle.WaitOne 250 |> ignore
-                let idleMs = (DateTime.UtcNow - lastActivity.Value).TotalMilliseconds
+                let lastTicks = Volatile.Read(&lastActivityTicks)
+                let idleMs = (DateTime.UtcNow - DateTime(lastTicks, DateTimeKind.Utc)).TotalMilliseconds
                 let uptimeMs = (DateTime.UtcNow - startedAt).TotalMilliseconds
-                if options.Oneshot && activeRequests.Value = 0 && uptimeMs > 60000.0 then
+                if options.Oneshot && Volatile.Read(&activeRequests) = 0 && uptimeMs > 60000.0 then
                     stop ()
                 elif
                     not options.Oneshot
-                    && activeRequests.Value = 0
+                    && Volatile.Read(&activeRequests) = 0
                     && idleMs >= float idleTtlMs
                 then
                     Log.info options.LogPath ("idle ttl reached after " + string (int idleMs) + " ms")
@@ -248,7 +270,7 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
     Log.info options.LogPath ("listening on " + endpointDisplay options.Endpoint)
     acceptLoop.Wait ()
     let drainDeadline = DateTime.UtcNow.AddSeconds 3.0
-    while activeRequests.Value > 0 && DateTime.UtcNow < drainDeadline do
+    while Volatile.Read(&activeRequests) > 0 && DateTime.UtcNow < drainDeadline do
         Thread.Sleep 50
     watchdog.Wait 1000 |> ignore
     0

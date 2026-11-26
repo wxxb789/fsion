@@ -32,12 +32,14 @@ type ExecutionReport =
 
 [<NoComparison>]
 type SessionHostOptions =
-    { PoolSize: int
+    { EndpointName: string
+      GenerationId: string
+      PoolSize: int
       SessionTtlMinutes: float
+      TrimIdleMinutes: float
       Oneshot: bool
       LogPath: string option
       Prelude: Prelude.Spec }
-
 type private RunTextWriter() =
     inherit TextWriter()
 
@@ -394,8 +396,18 @@ module private WinHandleTable =
     [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
     extern uint32 GetFileAttributesW(string lpFileName)
 
-    [<DllImport("kernel32.dll", SetLastError = true)>]
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
     extern uint32 GetFinalPathNameByHandleW(nativeint hFile, nativeint lpszFilePath, uint32 cchFilePath, uint32 dwFlags)
+
+    [<DllImport("psapi.dll", SetLastError = true)>]
+    extern bool EmptyWorkingSet(nativeint hProcess)
+
+    let emptyCurrentWorkingSet () =
+        if OperatingSystem.IsWindows() then
+            try
+                EmptyWorkingSet(nativeint -1) |> ignore
+            with _ ->
+                ()
 
     let private headerSize = Marshal.SizeOf<WinProcessHandleSnapshotHeader>()
     let private entrySize = Marshal.SizeOf<WinProcessHandleTableEntryInfo>()
@@ -1198,7 +1210,14 @@ let private applyEnvironment (current: Dictionary<string, string>) (desired: Dic
         | true, existing when String.Equals(existing, value, StringComparison.Ordinal) -> ()
         | _ -> Environment.SetEnvironmentVariable(key, value, EnvironmentVariableTarget.Process)
 
-type private ProcessStateGate() =
+type private GateWaiter(directory: string, environment: (string * string)[], isFilePrelude: bool) =
+    member _.Directory = directory
+    member _.Environment = environment
+    member _.IsFilePrelude = isFilePrelude
+    member val Ready = false with get, set
+    member val Cancelled = false with get, set
+
+type private ProcessStateGate(endpointName: string) =
     let sync = obj ()
     let daemonDirectory = Directory.GetCurrentDirectory()
     let mutable activeRuns = 0
@@ -1207,6 +1226,8 @@ type private ProcessStateGate() =
     let mutable currentDirectory = daemonDirectory
     let daemonBaseline = readProcessEnvironment ()
     let mutable currentEnvironment = daemonBaseline
+    let mutable activeRunSequence = 0L
+    let waiters = LinkedList<GateWaiter>()
 
     let matchesEnvironment (environment: (string * string)[]) =
         currentEnvironment.Count = environment.Length
@@ -1215,23 +1236,80 @@ type private ProcessStateGate() =
             | true, existing -> String.Equals(existing, value, StringComparison.Ordinal)
             | _ -> false))
 
-    member _.Enter(directory: string, environment: (string * string)[]) =
+    let applyRunEnvironment (directory: string) (environment: (string * string)[]) =
+        if not (String.Equals(Directory.GetCurrentDirectory(), directory, StringComparison.Ordinal)) then
+            Directory.SetCurrentDirectory directory
+        currentDirectory <- directory
+        if not (matchesEnvironment environment) then
+            currentEnvironment <- environmentMap environment
+
+        // Script code can mutate process variables without updating the cached request map.
+        applyEnvironment (readProcessEnvironment ()) currentEnvironment
+        // Expose parent endpoint and run-id metadata so nested child `fsion` invocations targeting
+        // the same daemon with a conflicting epoch can be detected instead of deadlocking forever.
+        let runId = string (Interlocked.Increment(&activeRunSequence))
+        Environment.SetEnvironmentVariable(ParentEndpointEnvironmentVariable, endpointName, EnvironmentVariableTarget.Process)
+        Environment.SetEnvironmentVariable(ParentRunIdEnvironmentVariable, runId, EnvironmentVariableTarget.Process)
+
+    let isHeadCompatible (waiter: GateWaiter) =
+        if waiter.IsFilePrelude then
+            activeRuns = 0 && activeFilePreludes = 0
+        else
+            activeFilePreludes = 0
+            && (activeRuns = 0 || (currentDirectory = waiter.Directory && matchesEnvironment waiter.Environment))
+
+    let hasConflictingWaiterAhead (node: LinkedListNode<GateWaiter>) =
+        not (Object.ReferenceEquals(waiters.First, node))
+
+    member _.Enter(directory: string, environment: (string * string)[], timeoutMs: int, disconnectToken: CancellationToken) : bool =
+        let waiter = GateWaiter(directory, environment, false)
+        let deadline =
+            if timeoutMs > 0 then Environment.TickCount64 + int64 timeoutMs else Int64.MaxValue
+        use _cancelReg =
+            disconnectToken.Register(fun () ->
+                lock sync (fun () ->
+                    waiter.Cancelled <- true
+                    Monitor.PulseAll sync))
+
         lock sync (fun () ->
-            while activeFilePreludes > 0
-                  || (activeRuns > 0 && (currentDirectory <> directory || not (matchesEnvironment environment))) do
-                Monitor.Wait sync |> ignore
+            let node = waiters.AddLast waiter
+            try
+                let mutable timedOut = false
+                while not timedOut
+                      && not waiter.Cancelled
+                      && not disconnectToken.IsCancellationRequested
+                      && (hasConflictingWaiterAhead node || not (isHeadCompatible waiter)) do
+                    if timeoutMs > 0 then
+                        let remaining = deadline - Environment.TickCount64
+                        if remaining <= 0L then
+                            timedOut <- true
+                        else
+                            Monitor.Wait(sync, int (min (int64 Int32.MaxValue) remaining)) |> ignore
+                    else
+                        Monitor.Wait sync |> ignore
 
-            if activeRuns = 0 then
-                if not (String.Equals(Directory.GetCurrentDirectory(), directory, StringComparison.Ordinal)) then
-                    Directory.SetCurrentDirectory directory
-                currentDirectory <- directory
-                if not (matchesEnvironment environment) then
-                    currentEnvironment <- environmentMap environment
-
-                // Script code can mutate process variables without updating the cached request map.
-                applyEnvironment (readProcessEnvironment ()) currentEnvironment
-
-            activeRuns <- activeRuns + 1)
+                if waiter.Cancelled || disconnectToken.IsCancellationRequested then
+                    raise (OperationCanceledException disconnectToken)
+                elif timedOut then
+                    false
+                else
+                    waiters.Remove node
+                    if activeRuns = 0 then
+                        applyRunEnvironment directory environment
+                    activeRuns <- activeRuns + 1
+                    // Wake next queued waiter in case it shares the same epoch.
+                    Monitor.PulseAll sync
+                    true
+            with _ ->
+                if not (isNull node.List) then
+                    waiters.Remove node
+                    Monitor.PulseAll sync
+                reraise ()
+            |> fun entered ->
+                if not entered && not (isNull node.List) then
+                    waiters.Remove node
+                    Monitor.PulseAll sync
+                entered)
 
     member _.Exit() =
         lock sync (fun () ->
@@ -1242,24 +1320,36 @@ type private ProcessStateGate() =
                 try
                     Directory.SetCurrentDirectory daemonDirectory
                     currentDirectory <- daemonDirectory
+                    Environment.SetEnvironmentVariable(ParentEndpointEnvironmentVariable, null, EnvironmentVariableTarget.Process)
+                    Environment.SetEnvironmentVariable(ParentRunIdEnvironmentVariable, null, EnvironmentVariableTarget.Process)
                 finally
-                    Monitor.PulseAll sync)
+                    Monitor.PulseAll sync
+            else
+                Monitor.PulseAll sync)
 
     member _.EnterFilePreludeBlocking() =
+        let waiter = GateWaiter(daemonDirectory, [||], true)
         lock sync (fun () ->
-            while activeRuns > 0 || activeFilePreludes > 0 do
-                Monitor.Wait sync |> ignore
-
-            if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
-                Directory.SetCurrentDirectory daemonDirectory
-            currentDirectory <- daemonDirectory
-            applyEnvironment (readProcessEnvironment ()) daemonBaseline
-            currentEnvironment <- daemonBaseline
-            activeFilePreludes <- 1)
+            let node = waiters.AddLast waiter
+            try
+                while hasConflictingWaiterAhead node || activeRuns > 0 || activeFilePreludes > 0 do
+                    Monitor.Wait sync |> ignore
+                waiters.Remove node
+                if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
+                    Directory.SetCurrentDirectory daemonDirectory
+                currentDirectory <- daemonDirectory
+                applyEnvironment (readProcessEnvironment ()) daemonBaseline
+                currentEnvironment <- daemonBaseline
+                activeFilePreludes <- 1
+            with _ ->
+                if not (isNull node.List) then
+                    waiters.Remove node
+                    Monitor.PulseAll sync
+                reraise ())
 
     member _.TryEnterFilePrelude() =
         lock sync (fun () ->
-            if activeRuns = 0 && activeFilePreludes = 0 then
+            if waiters.Count = 0 && activeRuns = 0 && activeFilePreludes = 0 then
                 if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
                     Directory.SetCurrentDirectory daemonDirectory
                 currentDirectory <- daemonDirectory
@@ -1281,7 +1371,7 @@ type private ProcessStateGate() =
                 Monitor.PulseAll sync)
 
     member _.CanEnterFilePreludeNow() =
-        lock sync (fun () -> activeRuns = 0 && activeFilePreludes = 0)
+        lock sync (fun () -> waiters.Count = 0 && activeRuns = 0 && activeFilePreludes = 0)
 
     member _.EnsureBaselineWhenIdle(isFilePrelude: bool) =
         lock sync (fun () ->
@@ -1295,10 +1385,31 @@ type private ProcessStateGate() =
         daemonBaseline |> Seq.map (fun (KeyValue(key, value)) -> key, value) |> Seq.toArray
 
     member _.IsQuiet(quietMs: int64) =
-        lock sync (fun () -> activeRuns = 0 && activeFilePreludes = 0 && Environment.TickCount64 - lastExit >= quietMs)
+        lock sync (fun () -> waiters.Count = 0 && activeRuns = 0 && activeFilePreludes = 0 && Environment.TickCount64 - lastExit >= quietMs)
 
     member _.IsRunsQuiet(quietMs: int64) =
-        lock sync (fun () -> activeRuns = 0 && Environment.TickCount64 - lastExit >= quietMs)
+        lock sync (fun () -> waiters.Count = 0 && activeRuns = 0 && Environment.TickCount64 - lastExit >= quietMs)
+
+    member _.ActiveRuns = lock sync (fun () -> activeRuns)
+
+    member _.LastExitTick = lock sync (fun () -> lastExit)
+
+    member _.IsNestedConflict(directory: string, environment: (string * string)[]) =
+        let parentEndpoint =
+            environment
+            |> Array.tryPick (fun (k, v) ->
+                if environmentComparer.Equals(k, ParentEndpointEnvironmentVariable) then Some v else None)
+        let parentRunId =
+            environment
+            |> Array.tryPick (fun (k, v) ->
+                if environmentComparer.Equals(k, ParentRunIdEnvironmentVariable) then Some v else None)
+        match parentEndpoint, parentRunId with
+        | Some ep, Some rid when ep = endpointName && rid.Length > 0 ->
+            lock sync (fun () ->
+                activeRuns > 0 && (currentDirectory <> directory || not (matchesEnvironment environment)))
+        | _ -> false
+
+    member _.EndpointName = endpointName
 
 type private PreludePool(spec: Prelude.Spec, tag: Prelude.Tag) =
     member _.Spec = spec
@@ -1322,7 +1433,7 @@ type SessionHost(options: SessionHostOptions) =
     let replenishSignal = new SemaphoreSlim(0)
     let pendingCleanups = ConcurrentQueue<CleanupWork>()
     let releasedSessions = ConcurrentQueue<WeakReference>()
-    let processState = ProcessStateGate()
+    let processState = ProcessStateGate(options.EndpointName)
     let coldClaims = ref 0
     let executed = ref 0
     let logDetail message = options.LogPath |> Option.iter (fun _ -> Log.info options.LogPath message)
@@ -1439,13 +1550,13 @@ type SessionHost(options: SessionHostOptions) =
         let phase2 = Interlocked.Exchange(&pendingUnloadPhase2, 0)
         if phase2 > 0 then
             if isQuietNow () then
-                GC.Collect(2, GCCollectionMode.Forced, true, false)
+                System.Runtime.GCSettings.LargeObjectHeapCompactionMode <- System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce
+                GC.Collect(2, GCCollectionMode.Forced, true, true)
                 let alive = drainReleasedSessions ()
                 let cumulative = Interlocked.Add(&totalReleased, phase2)
                 logDetail ($"unload released={cumulative} alive={alive}")
             else
                 Interlocked.Add(&pendingUnloadPhase2, phase2) |> ignore
-
     let drainCleanups () =
         let mutable forceSweep = false
         if not pendingCleanups.IsEmpty then
@@ -2056,6 +2167,45 @@ type SessionHost(options: SessionHostOptions) =
     let namedGate = obj ()
     let namedSessions = Dictionary<string, NamedSessionEntry>()
 
+    let tombstoneDirectory =
+        let root = Path.Combine(Path.GetTempPath(), "fsion-sessions-" + Fsion.Ipc.sanitizeName options.EndpointName)
+        try
+            Directory.CreateDirectory root |> ignore
+        with _ ->
+            ()
+        root
+
+    let tombstonePath (sessionId: string) =
+        let hash =
+            System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes sessionId)
+            |> Convert.ToHexString
+            |> fun s -> s.ToLowerInvariant()
+        Path.Combine(tombstoneDirectory, hash + ".gen")
+
+    let readSessionTombstone (sessionId: string) : string option =
+        try
+            let p = tombstonePath sessionId
+            if File.Exists p then
+                Some(File.ReadAllText(p).Trim())
+            else
+                None
+        with _ ->
+            None
+
+    let writeSessionTombstone (sessionId: string) =
+        try
+            File.WriteAllText(tombstonePath sessionId, options.GenerationId)
+        with _ ->
+            ()
+
+    let deleteSessionTombstone (sessionId: string) =
+        try
+            let p = tombstonePath sessionId
+            if File.Exists p then
+                File.Delete p
+        with _ ->
+            ()
+
     let getOrCreateNamed (sessionId: string) =
         lock namedGate (fun () ->
             match namedSessions.TryGetValue sessionId with
@@ -2064,7 +2214,6 @@ type SessionHost(options: SessionHostOptions) =
                 let entry = NamedSessionEntry()
                 namedSessions.[sessionId] <- entry
                 entry)
-
     let rec sweepNamedSessions () =
         if sessionTtlMs > 0L then
             let snapshot =
@@ -2094,6 +2243,7 @@ type SessionHost(options: SessionHostOptions) =
                             | None -> ()
 
                             entry.Session <- None
+                            deleteSessionTombstone sessionId
                     finally
                         entry.Gate.Release() |> ignore
             if evictedAny then
@@ -2102,13 +2252,35 @@ type SessionHost(options: SessionHostOptions) =
         let mutable stale = Unchecked.defaultof<WarmSession>
         while discard.TryDequeue(&stale) do
             enqueueCleanupAndDrainIfCapped stale
+    let trimIdleMs =
+        if options.TrimIdleMinutes > 0.0 then
+            int64 (options.TrimIdleMinutes * 60000.0)
+        else
+            0L
+    let mutable lastTrimmedExitTick = -1L
+
+    let tryTrimIdleWorkingSet () =
+        if OperatingSystem.IsWindows() && trimIdleMs > 0L then
+            let exitTick = processState.LastExitTick
+            if exitTick <> lastTrimmedExitTick
+               && processState.IsQuiet trimIdleMs
+               && pendingCleanups.IsEmpty
+               && Volatile.Read(&claimWaiters) = 0 then
+                lastTrimmedExitTick <- exitTick
+                try
+                    System.Runtime.GCSettings.LargeObjectHeapCompactionMode <- System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce
+                    GC.Collect(2, GCCollectionMode.Forced, true, true)
+                    WinHandleTable.emptyCurrentWorkingSet ()
+                    logDetail "trimmed idle working set"
+                with _ ->
+                    ()
 
     let replenish () =
         while true do
             replenishSignal.Wait 125 |> ignore
             drainDiscarded ()
             drainCleanups ()
-
+            tryTrimIdleWorkingSet ()
             let mutable filling = targetPoolSize > 0
             while filling
                   && Volatile.Read(&claimWaiters) = 0
@@ -2474,66 +2646,84 @@ type SessionHost(options: SessionHostOptions) =
             let mutable posixFdsBefore = ValueNone
             let mutable entered = false
             try
-                processState.Enter(request.WorkingDirectory, request.Environment)
-                entered <- true
-                try
-                    Ambient.set { Out = outWriter; Error = errWriter; In = TextReader.Null }
-
-                    try
-                        match claimed.CancellationTokenProperty, claimed.State with
-                        | Some property, Some state -> property.SetValue(state, box runCts.Token)
-                        | _ -> ()
-
+                if timeoutMs = 0 && processState.IsNestedConflict(request.WorkingDirectory, request.Environment) then
+                    { ExitCode = 1
+                      StandardOut = ""
+                      StandardError =
+                        "fsion: nested invocation targeting the same daemon endpoint with a different working directory or environment would deadlock; pass --no-daemon, a distinct --pipe, or --timeout"
+                        + Environment.NewLine
+                      Diagnostics = [||]
+                      TimedOut = false }
+                else
+                    let gateWaitMs = remainingGateMs ()
+                    let acquiredGate =
+                        processState.Enter(request.WorkingDirectory, request.Environment, gateWaitMs, disconnectToken)
+                    if not acquiredGate then
+                        { ExitCode = TimeoutExitCode
+                          StandardOut = ""
+                          StandardError = timeoutMessage timeoutMs
+                          Diagnostics = [||]
+                          TimedOut = true }
+                    else
+                        entered <- true
                         try
-                            let prepared = prepareExecution request
-                            disconnectToken.ThrowIfCancellationRequested()
-                            Volatile.Write(&evaluationStarted.contents, 1)
+                            Ambient.set { Out = outWriter; Error = errWriter; In = TextReader.Null }
 
                             try
-                                use timeoutTimer =
-                                    if timeoutMs > 0 then
-                                        new Timer(
-                                            (fun _ ->
-                                                Volatile.Write(&timeoutFired.contents, 1)
+                                match claimed.CancellationTokenProperty, claimed.State with
+                                | Some property, Some state -> property.SetValue(state, box runCts.Token)
+                                | _ -> ()
 
-                                                try
-                                                    runCts.Cancel()
-                                                with _ ->
-                                                    ()),
-                                            null,
-                                            timeoutMs,
-                                            Timeout.Infinite
-                                        )
-                                    else
-                                        Unchecked.defaultof<Timer>
+                                try
+                                    let prepared = prepareExecution request
+                                    disconnectToken.ThrowIfCancellationRequested()
+                                    Volatile.Write(&evaluationStarted.contents, 1)
 
-                                if stateless then
-                                    winHandlesBefore <- WinHandleTable.snapshot ()
-                                    posixFdsBefore <- WinHandleTable.posixFdSnapshot ()
-                                    collectionsBefore <- ValueSome(struct (GC.CollectionCount 0, GC.CollectionCount 1))
-                                let evaluateStarted = Stopwatch.GetTimestamp()
-                                let exitCode, diagnostics =
-                                    evaluate claimed request prepared outWriter errWriter runCts.Token
+                                    try
+                                        use timeoutTimer =
+                                            if timeoutMs > 0 then
+                                                new Timer(
+                                                    (fun _ ->
+                                                        Volatile.Write(&timeoutFired.contents, 1)
 
-                                evaluateMs <- Stopwatch.GetElapsedTime(evaluateStarted).TotalMilliseconds
-                                Interlocked.Increment(&executed.contents) |> ignore
+                                                        try
+                                                            runCts.Cancel()
+                                                        with _ ->
+                                                            ()),
+                                                    null,
+                                                    timeoutMs,
+                                                    Timeout.Infinite
+                                                )
+                                            else
+                                                Unchecked.defaultof<Timer>
 
-                                { ExitCode = exitCode
-                                  StandardOut = outWriter.SafeText()
-                                  StandardError = errWriter.SafeText()
-                                  Diagnostics = diagnostics
-                                  TimedOut = false }
+                                        if stateless then
+                                            winHandlesBefore <- WinHandleTable.snapshot ()
+                                            posixFdsBefore <- WinHandleTable.posixFdSnapshot ()
+                                            collectionsBefore <- ValueSome(struct (GC.CollectionCount 0, GC.CollectionCount 1))
+                                        let evaluateStarted = Stopwatch.GetTimestamp()
+                                        let exitCode, diagnostics =
+                                            evaluate claimed request prepared outWriter errWriter runCts.Token
+
+                                        evaluateMs <- Stopwatch.GetElapsedTime(evaluateStarted).TotalMilliseconds
+                                        Interlocked.Increment(&executed.contents) |> ignore
+
+                                        { ExitCode = exitCode
+                                          StandardOut = outWriter.SafeText()
+                                          StandardError = errWriter.SafeText()
+                                          Diagnostics = diagnostics
+                                          TimedOut = false }
+                                    finally
+                                        Volatile.Write(&evaluationStarted.contents, 0)
+                                finally
+                                    match claimed.CancellationTokenProperty, claimed.State with
+                                    | Some property, Some state -> property.SetValue(state, box CancellationToken.None)
+                                    | _ -> ()
                             finally
-                                Volatile.Write(&evaluationStarted.contents, 0)
+                                Ambient.clear ()
                         finally
-                            match claimed.CancellationTokenProperty, claimed.State with
-                            | Some property, Some state -> property.SetValue(state, box CancellationToken.None)
-                            | _ -> ()
-                    finally
-                        Ambient.clear ()
-                finally
-                    if entered then
-                        processState.Exit ()
+                            if entered then
+                                processState.Exit ()
             finally
                 try
                     if stateless then
@@ -2591,29 +2781,51 @@ type SessionHost(options: SessionHostOptions) =
                               TimedOut = true }
                         | Some entry ->
                             try
-                                let _, expectedTag = activateSpec targetSpec
-                                match entry.Session with
-                                | Some warm when warm.Prelude <> expectedTag ->
-                                    releaseSession warm
-                                    entry.Session <- None
-                                | _ -> ()
+                                if request.Reset then
+                                    deleteSessionTombstone sessionId
+                                let generationLost =
+                                    if request.Reset || entry.Session.IsSome then
+                                        false
+                                    else
+                                        match readSessionTombstone sessionId with
+                                        | Some previousGen when previousGen <> options.GenerationId -> true
+                                        | _ -> false
+                                if generationLost then
+                                    { ExitCode = 1
+                                      StandardOut = ""
+                                      StandardError =
+                                        "fsion: named session '"
+                                        + sessionId
+                                        + "' was lost when fsiond restarted; pass --session "
+                                        + sessionId
+                                        + " --reset to start a fresh session"
+                                        + Environment.NewLine
+                                      Diagnostics = [||]
+                                      TimedOut = false }
+                                else
+                                    let _, expectedTag = activateSpec targetSpec
+                                    match entry.Session with
+                                    | Some warm when warm.Prelude <> expectedTag ->
+                                        releaseSession warm
+                                        entry.Session <- None
+                                    | _ -> ()
 
-                                if entry.Session.IsNone then
-                                    entry.Session <- Some(claimSession targetSpec disconnectToken)
+                                    if entry.Session.IsNone then
+                                        entry.Session <- Some(claimSession targetSpec disconnectToken)
+                                        writeSessionTombstone sessionId
 
-                                let outcome =
-                                    try
-                                        runInSession entry.Session.Value false
-                                    with :? OperationCanceledException ->
-                                        canceledOutcome ()
+                                    let outcome =
+                                        try
+                                            runInSession entry.Session.Value false
+                                        with :? OperationCanceledException ->
+                                            canceledOutcome ()
 
-                                entry.LastUsedMs <- Environment.TickCount64
-                                outcome
+                                    entry.LastUsedMs <- Environment.TickCount64
+                                    outcome
                             finally
                                 entry.Gate.Release() |> ignore
                 with :? OperationCanceledException ->
                     canceledOutcome ()
-
             // Classify at the worker's completion point: reading the flag here, before the
             // caller observes the task, makes the timeout outcome deterministic even if the
             // deadline and the completion race.

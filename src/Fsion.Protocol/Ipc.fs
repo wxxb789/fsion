@@ -25,17 +25,50 @@ let sanitizeName (name: string) =
     new String(mapped)
 
 let defaultEndpointName () =
-    "fsion-" + sanitizeName Environment.UserName
+    "fsion-" + sanitizeName Environment.UserName + "-" + sanitizeName Fsion.Protocol.buildFingerprint
 
 let validateEndpointName (name: string) =
     if name.Contains '\\' || name.Contains '/' then
         raise (ArgumentException("pipe name must not contain path separators"))
-let socketPath (endpoint: Endpoint) =
-    let baseDirectory =
-        match Environment.GetEnvironmentVariable "XDG_RUNTIME_DIR" with
-        | null | "" -> Path.GetTempPath()
-        | directory -> directory
 
+module private PosixSecurity =
+    [<DllImport("libc", EntryPoint = "chmod", SetLastError = true)>]
+    extern int chmod(string pathname, uint32 mode)
+
+    [<DllImport("libc", EntryPoint = "geteuid", SetLastError = false)>]
+    extern uint32 geteuid()
+
+    [<DllImport("libc", EntryPoint = "flock", SetLastError = true)>]
+    extern int flock(int fd, int operation)
+
+    [<DllImport("libc", EntryPoint = "setsid", SetLastError = true)>]
+    extern int setsid()
+
+    let [<Literal>] LOCK_EX = 2
+    let [<Literal>] LOCK_NB = 4
+
+let private posixSocketDirectory () =
+    let uid =
+        if isWindows then "0"
+        else
+            try
+                string (PosixSecurity.geteuid ())
+            with _ ->
+                sanitizeName Environment.UserName
+    let baseRoot =
+        match Environment.GetEnvironmentVariable "XDG_RUNTIME_DIR" with
+        | null | "" -> Path.Combine(Path.GetTempPath(), "fsion-" + uid)
+        | directory -> Path.Combine(directory, "fsion-" + uid)
+    if not isWindows then
+        Directory.CreateDirectory baseRoot |> ignore
+        try
+            PosixSecurity.chmod(baseRoot, 0o700u) |> ignore
+        with _ ->
+            ()
+    baseRoot
+
+let socketPath (endpoint: Endpoint) =
+    let baseDirectory = posixSocketDirectory ()
     let sanitized = sanitizeName endpoint.Name
     let candidate = Path.Combine(baseDirectory, sanitized + ".sock")
 
@@ -46,7 +79,18 @@ let socketPath (endpoint: Endpoint) =
             if Encoding.UTF8.GetByteCount(Path.Combine(baseDirectory, "fsion-0123456789abcdef.sock")) <= 100 then
                 baseDirectory
             else
-                "/tmp"
+                let tmpRoot =
+                    let uid =
+                        if isWindows then "0"
+                        else
+                            try string (PosixSecurity.geteuid ())
+                            with _ -> sanitizeName Environment.UserName
+                    let dir = Path.Combine("/tmp", "fsion-" + uid)
+                    if not isWindows then
+                        Directory.CreateDirectory dir |> ignore
+                        try PosixSecurity.chmod(dir, 0o700u) |> ignore with _ -> ()
+                    dir
+                tmpRoot
 
         let hash =
             SHA256.HashData(Encoding.UTF8.GetBytes sanitized)
@@ -54,9 +98,40 @@ let socketPath (endpoint: Endpoint) =
             |> fun value -> value.Substring(0, 16).ToLowerInvariant()
 
         Path.Combine(fallbackBase, "fsion-" + hash + ".sock")
+
+let tryAcquireUnixEndpointLock (endpoint: Endpoint) : (unit -> unit) option =
+    if isWindows then
+        Some ignore
+    else
+        let sock = socketPath endpoint
+        let lockPath = sock + ".lock"
+        let stream = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite)
+        try
+            PosixSecurity.chmod(lockPath, 0o600u) |> ignore
+        with _ ->
+            ()
+        let fd = int (stream.SafeFileHandle.DangerousGetHandle())
+        if PosixSecurity.flock(fd, PosixSecurity.LOCK_EX ||| PosixSecurity.LOCK_NB) <> 0 then
+            stream.Dispose()
+            None
+        else
+            let mutable released = 0
+            Some(fun () ->
+                if Interlocked.Exchange(&released, 1) = 0 then
+                    try
+                        stream.Dispose()
+                    with _ ->
+                        ())
+
+let detachPosixSession () =
+    if not isWindows then
+        try
+            PosixSecurity.setsid () |> ignore
+        with _ ->
+            ()
+
 let endpointDisplay (endpoint: Endpoint) =
     if isWindows then endpoint.Name else socketPath endpoint
-
 let connect (endpoint: Endpoint) (timeout: TimeSpan) : Stream =
     validateEndpointName endpoint.Name
     let deadline = DateTime.UtcNow + timeout
@@ -66,7 +141,12 @@ let connect (endpoint: Endpoint) (timeout: TimeSpan) : Stream =
             let candidate =
                 if isWindows then
                     let pipe =
-                        new NamedPipeClientStream(".", endpoint.Name, PipeDirection.InOut, PipeOptions.None)
+                        new NamedPipeClientStream(
+                            ".",
+                            endpoint.Name,
+                            PipeDirection.InOut,
+                            PipeOptions.CurrentUserOnly
+                        )
                     try
                         pipe.Connect 250
                         pipe :> Stream
@@ -111,7 +191,7 @@ type private WindowsListener(name: string) =
                     PipeDirection.InOut,
                     64,
                     PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous
+                    PipeOptions.Asynchronous ||| PipeOptions.CurrentUserOnly
                 )
             pending <- Some server
             try
@@ -144,8 +224,11 @@ type private UnixListener(path: string) =
 
     do
         socket.Bind(UnixDomainSocketEndPoint path)
+        try
+            PosixSecurity.chmod(path, 0o600u) |> ignore
+        with _ ->
+            ()
         socket.Listen 64
-
     member _.Accept() : Task<Stream> =
         task {
             let! client = socket.AcceptAsync cancellation.Token
@@ -293,6 +376,10 @@ let private spawnDetachedWindows (executable: string) (arguments: string list) e
         CloseHandle processInformation.Thread |> ignore
 
 let private spawnDetachedManaged (executable: string) (arguments: string list) environment =
+    // On POSIX, spawn via `nohup` or direct `Process.Start` with `/dev/null` redirection; `fsiond`
+    // itself calls `setsid()` immediately on startup (before opening IPC) so it leaves the caller's
+    // process group and survives SIGINT or harness process-group kills. Redirecting stdio to
+    // `/dev/null` via `ProcessStartInfo` ensures zero inherited caller pipes.
     let startInfo = ProcessStartInfo(executable)
     startInfo.UseShellExecute <- false
     startInfo.CreateNoWindow <- true
@@ -314,6 +401,11 @@ let private spawnDetachedManaged (executable: string) (arguments: string list) e
     if isNull child then
         raise (InvalidOperationException("failed to start " + executable))
 
+    try
+        child.StandardInput.Close()
+    with _ ->
+        ()
+
     Task.Run(fun () ->
         try
             child.StandardOutput.ReadToEnd() |> ignore
@@ -327,7 +419,6 @@ let private spawnDetachedManaged (executable: string) (arguments: string list) e
         with _ ->
             ())
     |> ignore
-
 let private spawnWithEnvironment executable arguments environment =
     if isWindows then
         spawnDetachedWindows executable arguments environment

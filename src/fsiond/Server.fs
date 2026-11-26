@@ -75,8 +75,6 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
 
                 if report.Wedged then
                     hooks.Retire ()
-                else
-                    logExecuted ()
 
                 try
                     sendResponse
@@ -93,8 +91,7 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
                     if report.Wedged then
                         hooks.Respawn ()
 
-                if report.Wedged then
-                    logExecuted ()
+                logExecuted ()
 
                 if options.Oneshot && not report.Wedged then
                     hooks.Stop ()

@@ -8,14 +8,9 @@ open System.Text
 open System.Threading
 
 module private PosixLogOpen =
-    // Use `open(pathname, flags)` (no O_CREAT/mode variadic arg) when probing an existing path,
-    // and `creat` (fixed 2-arg non-variadic POSIX function) only when the file does not yet exist,
-    // avoiding variadic P/Invoke ABI mismatches on Apple arm64 (`open(..., mode)` / `fcntl(..., arg)`).
+    // 2-argument `open(pathname, flags)` (no `O_CREAT`, no variadic `mode` argument; safe on both x64 and Apple arm64).
     [<DllImport("libc", EntryPoint = "open", SetLastError = true)>]
     extern int openExisting(string pathname, int flags)
-
-    [<DllImport("libc", EntryPoint = "creat", SetLastError = true)>]
-    extern int creatFile(string pathname, uint32 mode)
 
 let private openAppendStream (fullPath: string) : FileStream option =
     if OperatingSystem.IsWindows() then
@@ -26,21 +21,25 @@ let private openAppendStream (fullPath: string) : FileStream option =
             stream.Dispose()
             None
     else
-        // Open existing path with `O_WRONLY | O_APPEND | O_NONBLOCK | O_CLOEXEC` (2 fixed args, no mode)
+        // Fast path: open existing path with `O_WRONLY | O_APPEND | O_NONBLOCK | O_CLOEXEC` (2 fixed args)
         // so a readerless POSIX FIFO fails immediately with ENXIO instead of blocking `open(2)`.
-        // If the path does not yet exist (`File.Exists` false and open fails), create it with non-variadic
-        // `creat(path, 0o644)` and reopen. Seek to End explicitly because .NET `FileStream` over an existing
-        // `SafeFileHandle` starts at offset 0 and uses `pwrite(2)`, which ignores `O_APPEND` on macOS.
+        // Creation path: only when `openExisting` fails with ENOENT (2) (missing file or dangling symlink),
+        // use .NET's `FileStream(FileMode.CreateNew)` which calls `open(O_CREAT | O_EXCL, 0666)` via
+        // CoreCLR's C PAL (ABI-safe on Apple arm64, atomic, non-truncating, never blocks on an existing FIFO).
+        // Seek to End explicitly because .NET `FileStream(SafeFileHandle, ...)` starts at offset 0 and uses
+        // `pwrite(2)`, which ignores `O_APPEND` on macOS.
         let oWrOnly = 0x0001
         let oAppend = if OperatingSystem.IsMacOS() then 0x0008 else 0x0400
         let oNonBlock = if OperatingSystem.IsMacOS() then 0x0004 else 0x0800
         let oCloExec = if OperatingSystem.IsMacOS() then 0x01000000 else 0x00080000
         let flags = oWrOnly ||| oAppend ||| oNonBlock ||| oCloExec
         let mutable fd = PosixLogOpen.openExisting(fullPath, flags)
-        if fd < 0 && not (File.Exists fullPath) then
-            let created = PosixLogOpen.creatFile(fullPath, 0o644u)
-            if created >= 0 then
-                use _createdHandle = new Microsoft.Win32.SafeHandles.SafeFileHandle(nativeint created, ownsHandle = true)
+        if fd < 0 && Marshal.GetLastPInvokeError() = 2 then // ENOENT on both Linux and macOS
+            try
+                use _created = new FileStream(fullPath, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite ||| FileShare.Delete)
+                ()
+            with :? IOException ->
+                // Another process created the file concurrently (EEXIST); retry openExisting below.
                 ()
             fd <- PosixLogOpen.openExisting(fullPath, flags)
         if fd < 0 then

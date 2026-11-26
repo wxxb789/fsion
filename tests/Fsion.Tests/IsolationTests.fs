@@ -826,6 +826,21 @@ type IsolationTests(output: ITestOutputHelper) =
                         assertRun r
                         Int32.Parse(r.Stdout.Trim()) |]
                 Assert.True(linuxCounts.[3] - linuxCounts.[0] <= 1, sprintf "unexpected per-run Gen-2 on Linux: %A" linuxCounts)
+                // Late-loading a Default-ALC BCL DLL while a user FileStream holds the same DLL open
+                // must promote the remaining CoreCLR FD once the user stream closes, avoiding per-run Gen-2.
+                let linuxConcurrentLoadCode =
+                    String.concat "\n"
+                        [ "let dir = System.IO.Path.GetDirectoryName(typeof<obj>.Assembly.Location)"
+                          "let path = System.IO.Path.Combine(dir, \"System.Xml.XPath.XDocument.dll\")"
+                          "use stream = System.IO.File.OpenRead path"
+                          "System.Runtime.Loader.AssemblyLoadContext.Default.LoadFromAssemblyPath(path) |> ignore" ]
+                assertRun (runP0 [ "-e"; linuxConcurrentLoadCode ])
+                let linuxAfterLoadCounts =
+                    [| for _ in 1 .. 4 ->
+                        let r = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
+                        assertRun r
+                        Int32.Parse(r.Stdout.Trim()) |]
+                Assert.True(linuxAfterLoadCounts.[3] - linuxAfterLoadCounts.[0] <= 1, sprintf "unexpected per-run Gen-2 on Linux after concurrent load: %A" linuxAfterLoadCounts)
             let disposeEntered = Path.Combine(directory, "dispose-entered.txt")
             let disposeRelease = Path.Combine(directory, "dispose-release.txt")
             let slowDisposeScript = Path.Combine(directory, "slow-dispose.fsx")

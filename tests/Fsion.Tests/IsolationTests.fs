@@ -801,6 +801,16 @@ type IsolationTests(output: ITestOutputHelper) =
                 let c2Before = Int32.Parse(gen2ProbeBefore.Stdout.Trim())
                 let c2After = Int32.Parse(gen2ProbeAfter.Stdout.Trim())
                 Assert.Equal(c2Before, c2After)
+            if OperatingSystem.IsLinux() then
+                // On Linux `/proc/self/fd`, enumerating the directory produces a vanished self-FD (`ENOENT`)
+                // that must not force Gen-2 on stateless runs with no user files.
+                let linuxGen2Before = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
+                assertRun linuxGen2Before
+                let linuxGen2After = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
+                assertRun linuxGen2After
+                let lc2Before = Int32.Parse(linuxGen2Before.Stdout.Trim())
+                let lc2After = Int32.Parse(linuxGen2After.Stdout.Trim())
+                Assert.Equal(lc2Before, lc2After)
             let disposeEntered = Path.Combine(directory, "dispose-entered.txt")
             let disposeRelease = Path.Combine(directory, "dispose-release.txt")
             let slowDisposeScript = Path.Combine(directory, "slow-dispose.fsx")

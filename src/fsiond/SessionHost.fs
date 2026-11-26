@@ -471,7 +471,9 @@ module private WinHandleTable =
     let mutable private assemblyLoadHooked = false
 
     let private recordHandleBaselineForAssembly (asm: Assembly) =
-        if OperatingSystem.IsWindows() && not asm.IsDynamic then
+        if OperatingSystem.IsWindows()
+           && not asm.IsDynamic
+           && Object.ReferenceEquals(AssemblyLoadContext.GetLoadContext asm, AssemblyLoadContext.Default) then
             let loc =
                 try
                     asm.Location
@@ -488,17 +490,23 @@ module private WinHandleTable =
                             lock baselineSync (fun () ->
                                 match baselineHandlesOpt with
                                 | ValueSome baseline ->
+                                    // Only add to baseline when there is a single matching handle (not a pre-existing
+                                    // user FileStream + CoreCLR handle) and the assembly belongs to the Default ALC.
+                                    // If a user already opened the file before loading it, multiple handles match and
+                                    // we conservatively skip adding either so HasPreExistingUserFiles stays true.
+                                    let matched = ResizeArray<struct (nativeint * uint32 * uint64)>()
                                     for id in current do
-                                        if not (baseline.Contains id) then
-                                            let struct (h, vol, _) = id
-                                            if vol <> 0xFFFFFFFFu then
-                                                let len = GetFinalPathNameByHandleW(h, pathBuf, capChars, 0u)
-                                                if len > 0u && len < capChars then
-                                                    let raw = Marshal.PtrToStringUni(pathBuf, int len)
-                                                    let normalized =
-                                                        if raw.StartsWith(@"\\?\", StringComparison.Ordinal) then raw.Substring 4 else raw
-                                                    if String.Equals(normalized, fullLoc, StringComparison.OrdinalIgnoreCase) then
-                                                        baseline.Add id |> ignore
+                                        let struct (h, vol, _) = id
+                                        if vol <> 0xFFFFFFFFu then
+                                            let len = GetFinalPathNameByHandleW(h, pathBuf, capChars, 0u)
+                                            if len > 0u && len < capChars then
+                                                let raw = Marshal.PtrToStringUni(pathBuf, int len)
+                                                let normalized =
+                                                    if raw.StartsWith(@"\\?\", StringComparison.Ordinal) then raw.Substring 4 else raw
+                                                if String.Equals(normalized, fullLoc, StringComparison.OrdinalIgnoreCase) then
+                                                    matched.Add id
+                                    if matched.Count = 1 && not (baseline.Contains matched.[0]) then
+                                        baseline.Add matched.[0] |> ignore
                                 | ValueNone -> ())
                         finally
                             Marshal.FreeHGlobal pathBuf
@@ -573,18 +581,19 @@ module private WinHandleTable =
         else
             try
                 let dir =
-                    if Directory.Exists "/proc/self/fd" then Some "/proc/self/fd"
-                    elif Directory.Exists "/dev/fd" then Some "/dev/fd"
+                    if Directory.Exists "/proc/self/fd" then Some ("/proc/self/fd", true)
+                    elif Directory.Exists "/dev/fd" then Some ("/dev/fd", false)
                     else None
                 match dir with
                 | None -> ValueNone
-                | Some d ->
+                | Some (d, isProcFd) ->
                     let hs = HashSet<string>(StringComparer.Ordinal)
                     let mutable hasReg = false
                     for entry in Directory.GetFileSystemEntries d do
                         let name = Path.GetFileName entry
                         let mutable target = ""
                         let mutable resolved = false
+                        let mutable vanished = false
                         try
                             match File.ResolveLinkTarget(entry, false) with
                             | null -> ()
@@ -594,14 +603,22 @@ module private WinHandleTable =
                                 if name <> "0" && name <> "1" && name <> "2" && target.StartsWith("/", StringComparison.Ordinal) then
                                     if File.Exists target && not (Directory.Exists target) then
                                         hasReg <- true
-                        with _ ->
-                            ()
+                        with
+                        | :? FileNotFoundException
+                        | :? DirectoryNotFoundException ->
+                            // On Linux `/proc/self/fd`, `Directory.GetFileSystemEntries` includes its own
+                            // enumeration directory FD, which is already closed (`ENOENT`) by the time
+                            // `ResolveLinkTarget` inspects it.
+                            vanished <- true
+                        | _ -> ()
                         // On macOS `/dev/fd` exposes device nodes rather than symlinks (`ResolveLinkTarget = null`),
                         // so an unresolvable non-stdio fd > 2 cannot be proven non-regular; conservatively treat
-                        // any unresolved fd > 2 (such as macOS `/dev/fd/<n>`) as a possible pre-existing regular file.
-                        if not resolved && name <> "0" && name <> "1" && name <> "2" then
+                        // any live unresolved fd > 2 on non-`/proc/self/fd` (or unexpected resolution failure) as
+                        // a possible pre-existing regular file without penalizing Linux's vanished enumeration FD.
+                        if not resolved && not vanished && (not isProcFd) && name <> "0" && name <> "1" && name <> "2" then
                             hasReg <- true
-                        hs.Add(name + "\t" + target) |> ignore
+                        if not vanished then
+                            hs.Add(name + "\t" + target) |> ignore
                     ValueSome { AllFds = hs; HasPreExistingRegularFiles = hasReg }
             with _ ->
                 ValueNone

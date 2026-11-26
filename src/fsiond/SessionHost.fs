@@ -454,18 +454,20 @@ module private WinHandleTable =
                     let count = int (Marshal.ReadIntPtr(buf, 0))
                     let hs = HashSet<struct (nativeint * uint32 * uint64)>()
                     let mutable hasUserFiles = false
+                    let pointerCountOffset = sizeof<nativeint> * 2
                     for i = 0 to count - 1 do
                         let off = headerSize + i * entrySize
                         let h = Marshal.ReadIntPtr(buf, off)
-                        let access = uint32 (Marshal.ReadInt32(buf, off + 24))
+                        let pointerCount = Marshal.ReadIntPtr(buf, off + pointerCountOffset)
                         match tryRegularDiskIdentity h with
                         | ValueSome id ->
                             hs.Add id |> ignore
-                            // Loaded runtime/assembly DLL handles have GrantedAccess = 0x001200A9 (FILE_GENERIC_READ | FILE_EXECUTE).
-                            // Any other pre-existing regular file handle (for example held in a concurrent or named session) could
-                            // be closed and reopened on the same file into the same numeric handle slot without DuplicateHandle
-                            // pinning its share mode, so escalate to Gen-2 conservatively whenever HasPreExistingUserFiles is true.
-                            if access <> 0x001200A9u then
+                            // Memory-mapped PE/assembly image handles carry kernel section object references
+                            // (PointerCount >= 32766 on Windows, vs PointerCount = 1..a few for ordinary CreateFileW /
+                            // FileStream handles even when opened with GENERIC_READ | GENERIC_EXECUTE). Any pre-existing
+                            // non-section regular file handle could be closed and reopened into the same numeric slot,
+                            // so escalate to Gen-2 conservatively whenever HasPreExistingUserFiles is true.
+                            if int64 pointerCount < 16384L then
                                 hasUserFiles <- true
                         | ValueNone -> ()
                     ValueSome { AllDiskFiles = hs; HasPreExistingUserFiles = hasUserFiles }
@@ -1977,10 +1979,17 @@ type SessionHost(options: SessionHostOptions) =
                 Some("timed out waiting for warm session pool to fill within " + string timeoutMs + " ms")
             | None ->
                 match expectedTagOpt with
-                | ValueSome expected when tagOfSpec slot.Spec <> expected ->
-                    replenishSignal.Release() |> ignore
-                    Some "configured prelude changed during warmup; retry warmup"
-                | _ -> None
+                | ValueSome expected ->
+                    let currentTag = tagOfSpec slot.Spec
+                    if currentTag <> expected then
+                        lock poolGate (fun () ->
+                            if pools.Contains slot then
+                                refreshTagWith currentTag slot |> ignore)
+                        replenishSignal.Release() |> ignore
+                        Some "configured prelude changed during warmup; retry warmup"
+                    else
+                        None
+                | ValueNone -> None
     member _.DesiredSpec = lock poolGate (fun () -> desiredSpec)
 
     member _.RespawnEnvironment() = processState.RespawnEnvironment()

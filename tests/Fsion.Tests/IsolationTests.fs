@@ -708,6 +708,46 @@ type IsolationTests(output: ITestOutputHelper) =
             assertFileUnlocked sameFileReusePath
             File.Delete sameFileReusePath
 
+
+            if OperatingSystem.IsWindows() then
+                let rxSameFilePath = Path.Combine(directory, "loh-rx-same-file-reuse.bin")
+                File.WriteAllBytes(rxSameFilePath, [| 101uy; 102uy |])
+                let rxSeedCode =
+                    String.concat "\n"
+                        [ "open System"
+                          "open System.Runtime.InteropServices"
+                          "module RxNative ="
+                          "    [<DllImport(\"kernel32.dll\", SetLastError = true)>]"
+                          "    extern nativeint CreateFileW([<MarshalAs(UnmanagedType.LPWStr)>] string lpFileName, uint32 dwDesiredAccess, uint32 dwShareMode, nativeint lpSecurityAttributes, uint32 dwCreationDisposition, uint32 dwFlagsAndAttributes, nativeint hTemplateFile)"
+                          "let p = fsi.CommandLineArgs.[1]"
+                          "let handles ="
+                          "    Array.init 384 (fun _ ->"
+                          "        let h = RxNative.CreateFileW(p, 0x80000000u ||| 0x20000000u, 7u, 0n, 3u, 0x80u, 0n)"
+                          "        if h = -1n then failwith \"CreateFileW failed\""
+                          "        h)"
+                          "AppDomain.CurrentDomain.SetData(\"rx-handles\", handles)" ]
+                runP0 [ "--session"; "reuse-seed"; "-e"; rxSeedCode; rxSameFilePath ] |> assertRun
+                let rxLeakCode =
+                    String.concat "\n"
+                        [ "open System"
+                          "open System.IO"
+                          "open System.Runtime.InteropServices"
+                          "module RxClose ="
+                          "    [<DllImport(\"kernel32.dll\", SetLastError = true)>]"
+                          "    extern bool CloseHandle(nativeint hObject)"
+                          "let leakRxSameFile () ="
+                          "    let handles = AppDomain.CurrentDomain.GetData(\"rx-handles\") :?> nativeint array"
+                          "    for h in handles do RxClose.CloseHandle h |> ignore"
+                          "    AppDomain.CurrentDomain.SetData(\"rx-handles\", null)"
+                          "    let arr = Array.zeroCreate<FileStream> 32768"
+                          "    arr.[0] <- File.OpenRead(fsi.CommandLineArgs.[1])"
+                          "    Console.Write(arr.[0].ReadByte())"
+                          "leakRxSameFile ()" ]
+                let rxLeakRes = runP0 [ "-e"; rxLeakCode; rxSameFilePath ]
+                assertRun rxLeakRes
+                Assert.Equal("101", rxLeakRes.Stdout)
+                assertFileUnlocked rxSameFilePath
+                File.Delete rxSameFilePath
             let disposeEntered = Path.Combine(directory, "dispose-entered.txt")
             let disposeRelease = Path.Combine(directory, "dispose-release.txt")
             let slowDisposeScript = Path.Combine(directory, "slow-dispose.fsx")

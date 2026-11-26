@@ -751,6 +751,44 @@ type IsolationTests(output: ITestOutputHelper) =
                 Assert.Equal("101", rxLeakRes.Stdout)
                 assertFileUnlocked rxSameFilePath
                 File.Delete rxSameFilePath
+
+                // Single-handle reuse on `Environment.ProcessPath` (native host executable has no resident handle
+                // at startup, so a single pre-existing read handle closed and reopened into the same numeric slot
+                // into a local LOH array must still escalate to Gen-2 and release before `fsion` returns).
+                let singleProcSeedCode =
+                    String.concat "\n"
+                        [ "open System"
+                          "open System.IO"
+                          "let target = Environment.ProcessPath"
+                          "let fs = new FileStream(target, FileMode.Open, FileAccess.Read, FileShare.ReadWrite ||| FileShare.Delete)"
+                          "AppDomain.CurrentDomain.SetData(\"single-proc-stream\", fs)"
+                          "Console.Write target" ]
+                let seedProcRes = runP0 [ "--session"; "reuse-seed"; "-e"; singleProcSeedCode ]
+                assertRun seedProcRes
+                let daemonExePath = seedProcRes.Stdout
+                let singleProcLeakCode =
+                    String.concat "\n"
+                        [ "open System"
+                          "open System.IO"
+                          "let leakSingleProc () ="
+                          "    let oldFs = AppDomain.CurrentDomain.GetData(\"single-proc-stream\") :?> FileStream"
+                          "    let oldHandle = oldFs.SafeFileHandle.DangerousGetHandle()"
+                          "    let target = Environment.ProcessPath"
+                          "    oldFs.Dispose()"
+                          "    AppDomain.CurrentDomain.SetData(\"single-proc-stream\", null)"
+                          "    let arr = Array.zeroCreate<FileStream> 32768"
+                          "    let reopened = new FileStream(target, FileMode.Open, FileAccess.Read, FileShare.ReadWrite ||| FileShare.Delete)"
+                          "    let newHandle = reopened.SafeFileHandle.DangerousGetHandle()"
+                          "    arr.[0] <- reopened"
+                          "    let b = arr.[0].ReadByte()"
+                          "    Console.Write(sprintf \"%b:%d\" (oldHandle = newHandle) b)"
+                          "leakSingleProc ()" ]
+                let singleProcLeakRes = runP0 [ "-e"; singleProcLeakCode ]
+                assertRun singleProcLeakRes
+                Assert.StartsWith("true:", singleProcLeakRes.Stdout)
+                use exclusiveReadOnExe =
+                    new FileStream(daemonExePath, FileMode.Open, FileAccess.Read, FileShare.None)
+                exclusiveReadOnExe.Close()
             let disposeEntered = Path.Combine(directory, "dispose-entered.txt")
             let disposeRelease = Path.Combine(directory, "dispose-release.txt")
             let slowDisposeScript = Path.Combine(directory, "slow-dispose.fsx")

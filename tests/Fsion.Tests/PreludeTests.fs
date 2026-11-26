@@ -964,21 +964,30 @@ type PreludeTests(output: ITestOutputHelper) =
                         let bgEvalRelease = Path.Combine(directory, "bg-eval-release.txt")
                         let bgDispEntered = Path.Combine(directory, "bg-disp-entered.txt")
                         let bgDispRelease = Path.Combine(directory, "bg-disp-release.txt")
+                        let bgConsumeDone = Path.Combine(directory, "bg-consume-done.txt")
                         writeFile
                             directory
                             "bg-fail.fsx"
                             (sprintf
-                                "let armed = System.IO.File.Exists(@\"%s\")\nlet hold = { new System.IDisposable with member _.Dispose() = if armed then System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20 }\nif armed then\n    System.IO.File.WriteAllText(@\"%s\", \"1\")\n    while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\n    failwith \"bg-fail-boom\"\n"
+                                "let armed = System.IO.File.Exists(@\"%s\")\nlet hold = { new System.IDisposable with member _.Dispose() = if armed && System.IO.File.Exists(@\"%s\") then System.IO.File.WriteAllText(@\"%s\", \"1\"); while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20 }\nif armed then\n    System.IO.File.WriteAllText(@\"%s\", \"1\")\n    while not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\n    failwith \"bg-fail-boom\"\n"
                                 bgArmMarker
+                                bgSecondRunning
                                 bgDispEntered
                                 bgDispRelease
                                 bgSecondRunning
                                 bgEvalRelease)
                         let bgWarm = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--pool-size"; "2"; "--prelude"; bgFailPath; "warmup" ] daemonDir bgFailEnv None 120000
                         Assert.True(bgWarm.ExitCode = 0, bgWarm.Stderr)
-                        writeFile directory "bg-arm.txt" "arm"
-                        let bgConsumeOne = runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; bgFailPath; "-e"; "()" ] daemonDir bgFailEnv None 60000
+                        let bgConsumeOne =
+                            runProcess
+                                Fsion.Tests.TestInfra.fsionBinary
+                                [ "--prelude"; bgFailPath; "-e"; sprintf "System.IO.File.WriteAllText(@\"%s\", \"arm\"); System.IO.File.WriteAllText(@\"%s\", \"1\")" bgArmMarker bgConsumeDone ]
+                                daemonDir
+                                bgFailEnv
+                                None
+                                120000
                         Assert.True(bgConsumeOne.ExitCode = 0, bgConsumeOne.Stderr)
+                        Assert.True(File.Exists bgConsumeDone)
                         waitFor "replenisher entered armed bg-fail evaluation" (fun () -> File.Exists bgSecondRunning)
                         writeFile directory "bg-eval-release.txt" "boom"
                         waitFor "replenisher failed prelude Dispose entered" (fun () -> File.Exists bgDispEntered)

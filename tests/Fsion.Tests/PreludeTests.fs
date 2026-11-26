@@ -1165,13 +1165,16 @@ type PreludeTests(output: ITestOutputHelper) =
             let finalPrelude = Path.Combine(directory, "final-check.fsx")
             let fcEntered = Path.Combine(directory, "fc-entered.txt")
             let fcRelease = Path.Combine(directory, "fc-release.txt")
+            // Overwriting final-check.fsx inside v1's own final statement guarantees disk stays v1 through every
+            // 100 ms loop poll and switches to v2 <1 ms before v1 enters slot.Warm, isolating the post-loop check.
             writeFile
                 directory
                 "final-check.fsx"
                 (sprintf
-                    "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 5\nlet fcVal = 1\n"
+                    "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 5\nSystem.IO.File.WriteAllText(@\"%s\", \"let fcVal = 2\\n\")\nlet fcVal = 1\n"
                     fcEntered
-                    fcRelease)
+                    fcRelease
+                    finalPrelude)
             try
                 let fcWarmTask =
                     System.Threading.Tasks.Task.Run(fun () ->
@@ -1180,7 +1183,6 @@ type PreludeTests(output: ITestOutputHelper) =
                 while not (File.Exists fcEntered) && DateTime.UtcNow < fcDeadline do
                     System.Threading.Thread.Sleep 10
                 Assert.True(File.Exists fcEntered, "fc v1 never entered evaluation")
-                writeFile directory "final-check.fsx" "let fcVal = 2\n"
                 writeFile directory "fc-release.txt" "go"
                 let fcRes = fcWarmTask.GetAwaiter().GetResult()
                 Assert.Equal(1, fcRes.ExitCode)

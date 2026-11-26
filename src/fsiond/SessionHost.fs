@@ -400,6 +400,11 @@ module private WinHandleTable =
     let private headerSize = Marshal.SizeOf<WinProcessHandleSnapshotHeader>()
     let private entrySize = Marshal.SizeOf<WinProcessHandleTableEntryInfo>()
 
+    [<NoComparison; NoEquality>]
+    type WinSnapshot =
+        { AllDiskFiles: HashSet<struct (nativeint * uint32 * uint64)>
+          HasPreExistingUserFiles: bool }
+
     let private tryRegularDiskIdentity (hFile: nativeint) : struct (nativeint * uint32 * uint64) voption =
         if GetFileType hFile <> 1u then
             ValueNone
@@ -429,7 +434,7 @@ module private WinHandleTable =
                 finally
                     Marshal.FreeHGlobal buf
 
-    let snapshot () : HashSet<struct (nativeint * uint32 * uint64)> voption =
+    let snapshot () : WinSnapshot voption =
         if not (OperatingSystem.IsWindows()) then
             ValueNone
         else
@@ -448,16 +453,56 @@ module private WinHandleTable =
                 else
                     let count = int (Marshal.ReadIntPtr(buf, 0))
                     let hs = HashSet<struct (nativeint * uint32 * uint64)>()
+                    let mutable hasUserFiles = false
                     for i = 0 to count - 1 do
-                        let h = Marshal.ReadIntPtr(buf, headerSize + i * entrySize)
+                        let off = headerSize + i * entrySize
+                        let h = Marshal.ReadIntPtr(buf, off)
+                        let access = uint32 (Marshal.ReadInt32(buf, off + 24))
                         match tryRegularDiskIdentity h with
-                        | ValueSome id -> hs.Add id |> ignore
+                        | ValueSome id ->
+                            hs.Add id |> ignore
+                            // Loaded runtime/assembly DLL handles have GrantedAccess = 0x001200A9 (FILE_GENERIC_READ | FILE_EXECUTE).
+                            // Any other pre-existing regular file handle (for example held in a concurrent or named session) could
+                            // be closed and reopened on the same file into the same numeric handle slot without DuplicateHandle
+                            // pinning its share mode, so escalate to Gen-2 conservatively whenever HasPreExistingUserFiles is true.
+                            if access <> 0x001200A9u then
+                                hasUserFiles <- true
                         | ValueNone -> ()
-                    ValueSome hs
+                    ValueSome { AllDiskFiles = hs; HasPreExistingUserFiles = hasUserFiles }
             finally
                 Marshal.FreeHGlobal buf
 
-    let posixFdSnapshot () : HashSet<string> voption =
+    let private listRegularDiskFiles () : ResizeArray<struct (nativeint * uint32 * uint64)> voption =
+        let mutable size = 32768u
+        let mutable retLen = 0u
+        let mutable buf = Marshal.AllocHGlobal(int size)
+        try
+            let mutable status = NtQueryInformationProcess(-1n, 51, buf, size, &retLen)
+            while status = 0xC0000004 do
+                Marshal.FreeHGlobal buf
+                size <- max (size * 2u) (retLen + 4096u)
+                buf <- Marshal.AllocHGlobal(int size)
+                status <- NtQueryInformationProcess(-1n, 51, buf, size, &retLen)
+            if status <> 0 then
+                ValueNone
+            else
+                let count = int (Marshal.ReadIntPtr(buf, 0))
+                let list = ResizeArray<struct (nativeint * uint32 * uint64)>()
+                for i = 0 to count - 1 do
+                    let h = Marshal.ReadIntPtr(buf, headerSize + i * entrySize)
+                    match tryRegularDiskIdentity h with
+                    | ValueSome id -> list.Add id
+                    | ValueNone -> ()
+                ValueSome list
+        finally
+            Marshal.FreeHGlobal buf
+
+    [<NoComparison; NoEquality>]
+    type PosixSnapshot =
+        { AllFds: HashSet<string>
+          HasPreExistingRegularFiles: bool }
+
+    let posixFdSnapshot () : PosixSnapshot voption =
         if OperatingSystem.IsWindows() then
             ValueNone
         else
@@ -470,46 +515,53 @@ module private WinHandleTable =
                 | None -> ValueNone
                 | Some d ->
                     let hs = HashSet<string>(StringComparer.Ordinal)
+                    let mutable hasReg = false
                     for entry in Directory.GetFileSystemEntries d do
                         let name = Path.GetFileName entry
-                        let target =
-                            try
-                                match File.ResolveLinkTarget(entry, false) with
-                                | null -> ""
-                                | info -> info.FullName
-                            with _ ->
-                                ""
+                        let mutable target = ""
+                        try
+                            match File.ResolveLinkTarget(entry, false) with
+                            | null -> ()
+                            | info ->
+                                target <- info.FullName
+                                if name <> "0" && name <> "1" && name <> "2" && target.StartsWith("/", StringComparison.Ordinal) then
+                                    if File.Exists target && not (Directory.Exists target) then
+                                        hasReg <- true
+                        with _ ->
+                            ()
                         hs.Add(name + "\t" + target) |> ignore
-                    ValueSome hs
+                    ValueSome { AllFds = hs; HasPreExistingRegularFiles = hasReg }
             with _ ->
                 ValueNone
 
     let hasNewHandle
-        (winBeforeOpt: HashSet<struct (nativeint * uint32 * uint64)> voption)
-        (posixBeforeOpt: HashSet<string> voption)
+        (winBeforeOpt: WinSnapshot voption)
+        (posixBeforeOpt: PosixSnapshot voption)
         : bool =
         if OperatingSystem.IsWindows() then
             match winBeforeOpt with
             | ValueNone -> true
+            | ValueSome before when before.HasPreExistingUserFiles -> true
             | ValueSome before ->
-                match snapshot () with
+                match listRegularDiskFiles () with
                 | ValueNone -> true
                 | ValueSome after ->
                     let mutable found = false
                     for id in after do
-                        if not found && not (before.Contains id) then
+                        if not found && not (before.AllDiskFiles.Contains id) then
                             found <- true
                     found
         else
             match posixBeforeOpt with
             | ValueNone -> true
+            | ValueSome before when before.HasPreExistingRegularFiles -> true
             | ValueSome before ->
                 match posixFdSnapshot () with
                 | ValueNone -> true
                 | ValueSome after ->
                     let mutable found = false
-                    for fd in after do
-                        if not found && not (before.Contains fd) then
+                    for fd in after.AllFds do
+                        if not found && not (before.AllFds.Contains fd) then
                             found <- true
                     found
 
@@ -519,8 +571,8 @@ let private sweepFinalizers () =
     GC.Collect(2, GCCollectionMode.Forced, true, false)
 
 let private sweepTransientFinalizers
-    (winHandlesBefore: HashSet<struct (nativeint * uint32 * uint64)> voption)
-    (posixFdsBefore: HashSet<string> voption)
+    (winHandlesBefore: WinHandleTable.WinSnapshot voption)
+    (posixFdsBefore: WinHandleTable.PosixSnapshot voption)
     collectionsBefore
     =
     let collect generation = GC.Collect(generation, GCCollectionMode.Forced, true, false)
@@ -545,7 +597,6 @@ let private sweepTransientFinalizers
     if not collectedGen2 && WinHandleTable.hasNewHandle winHandlesBefore posixFdsBefore then
         collect 2
         GC.WaitForPendingFinalizers()
-
 let private severityText (severity: FSharpDiagnosticSeverity) =
     match severity with
     | FSharpDiagnosticSeverity.Error -> "error"
@@ -1153,7 +1204,6 @@ type SessionHost(options: SessionHostOptions) =
     let releaseSessionWith winHandlesBefore posixFdsBefore collectionsBefore (claimed: WarmSession) =
         enqueueCleanupAndDrainIfCapped claimed
         sweepTransientFinalizers winHandlesBefore posixFdsBefore collectionsBefore
-
     let releaseSession = releaseSessionWith ValueNone ValueNone ValueNone
     let createWarmSession (failedWarmOut: WarmSession option ref) (spec: Prelude.Spec) : WarmSession =
         processState.EnsureBaselineWhenIdle(match spec with Prelude.Spec.File _ -> true | _ -> false)

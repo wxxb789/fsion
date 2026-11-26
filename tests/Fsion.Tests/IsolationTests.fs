@@ -820,23 +820,14 @@ type IsolationTests(output: ITestOutputHelper) =
             if OperatingSystem.IsLinux() then
                 // On Linux `/proc/self/fd`, enumerating the directory produces a vanished self-FD (`ENOENT`)
                 // and CoreCLR runtime FDs (e.g. CLR/DLL files), neither of which may force Gen-2 on stateless runs.
-                let linuxCounts =
-                    [| for _ in 1 .. 4 ->
-                        let r = runP0 [ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ]
-                        assertRun r
-                        Int32.Parse(r.Stdout.Trim()) |]
-                Assert.True(linuxCounts.[3] - linuxCounts.[0] <= 1, sprintf "unexpected per-run Gen-2 on Linux: %A" linuxCounts)
-                // Late-loading a Default-ALC BCL DLL while a user FileStream holds the same DLL open
-                // must promote the remaining CoreCLR FD once the user stream closes, avoiding per-run Gen-2.
+                // Use the warm-pool daemon (`context`) so cold session creation under `--pool-size 0` with
+                // `System.GC.ConserveMemory = 9` doesn't trigger natural Gen-2 collections during cold compiles.
                 let linuxConcurrentLoadCode =
                     String.concat "\n"
                         [ "let dir = System.IO.Path.GetDirectoryName(typeof<obj>.Assembly.Location)"
                           "let path = System.IO.Path.Combine(dir, \"System.Xml.XPath.XDocument.dll\")"
                           "use stream = System.IO.File.OpenRead path"
                           "System.Runtime.Loader.AssemblyLoadContext.Default.LoadFromAssemblyPath(path) |> ignore" ]
-                assertRun (runP0 [ "-e"; linuxConcurrentLoadCode ])
-                // Use a dedicated warm-pool daemon (--pool-size 2) and wait briefly for background replenish
-                // to finish between turns so cold session creation doesn't trigger natural GC on CI runners.
                 let warmLinuxCounts =
                     [| for _ in 1 .. 4 ->
                         let r = context.Run([ "-e"; "System.Console.Write(System.GC.CollectionCount 2)" ], timeoutMs = 60000)

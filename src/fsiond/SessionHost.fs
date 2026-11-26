@@ -1270,8 +1270,22 @@ type private ProcessStateGate(endpointName: string) =
             && (activeRuns = 0 || (currentDirectory = waiter.Directory && matchesEnvironment waiter.Environment))
 
     let hasConflictingWaiterAhead (node: LinkedListNode<GateWaiter>) =
-        not (Object.ReferenceEquals(waiters.First, node))
-
+        let mutable cur = waiters.First
+        let mutable conflict = false
+        while not conflict && not (isNull cur) && not (Object.ReferenceEquals(cur, node)) do
+            let ahead = cur.Value
+            if ahead.IsFilePrelude then
+                // Only a non-file-prelude run that shares the already-active epoch may bypass a
+                // queued file prelude (avoiding deadlock when a same-epoch run releases the active run).
+                if node.Value.IsFilePrelude
+                   || activeRuns = 0
+                   || currentDirectory <> node.Value.Directory
+                   || not (matchesEnvironment node.Value.Environment) then
+                    conflict <- true
+            else
+                conflict <- true
+            cur <- cur.Next
+        conflict
     member _.Enter(directory: string, environment: (string * string)[], hasTimeout: bool, remainingMs: int, disconnectToken: CancellationToken) : bool =
         let waiter = GateWaiter(directory, environment, false)
         let deadline =

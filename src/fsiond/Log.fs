@@ -80,11 +80,13 @@ let private append (path: string) (line: string) =
             match openAppendStream fullPath with
             | Some stream ->
                 use _stream = stream
-                use writer = new StreamWriter(stream)
-                writer.Write line
+                let bytes = Encoding.UTF8.GetBytes line
+                stream.Write(bytes, 0, bytes.Length)
+                stream.Flush()
             | None -> ()
         finally
             gate.ReleaseMutex()
+
 let private write (logPath: string option) (level: string) (message: string) =
     let line = DateTime.UtcNow.ToString("o") + " [" + level + "] " + message + Environment.NewLine
     match logPath with

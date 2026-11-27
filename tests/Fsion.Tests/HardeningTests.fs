@@ -30,6 +30,7 @@ let private processGone (pid: int) (timeoutMs: int) =
 let private waitFor (message: string) (condition: unit -> bool) =
     Assert.True(SpinWait.SpinUntil(Func<bool>(condition), TimeSpan.FromSeconds 30.0), message)
 
+[<Collection("Serial")>]
 type HardeningTests(output: ITestOutputHelper) =
     [<Fact>]
     member _.``default endpoint incorporates TFM and build fingerprint and control commands tolerate protocol version skew`` () =

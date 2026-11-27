@@ -101,10 +101,10 @@ ordinary builds keep the standard framework-dependent daemon.
 
 ### 3-OS CI
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `windows-latest`,
-`macos-latest`, and `ubuntu-latest`, each executing the repository gate (build, NativeAOT
-publish for both TFMs, black-box tests for both TFMs, LF hygiene), the packaging smoke
-test, and uploads the distribution archive.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs one job per OS and TFM:
+Windows, macOS, and Linux each build, publish, and run correctness tests for `net10.0`
+and `net11.0` in parallel. On each OS, only the `net10.0` job smoke-tests and uploads
+the distribution bundle.
 
 ## Usage
 
@@ -196,3 +196,12 @@ The gate builds Release for `net10.0` and `net11.0`, publishes the NativeAOT `fs
 runs the black-box test suite for both TFMs, and verifies LF line endings. Product and
 test code is 100% F# with `TreatWarningsAsErrors=true`. Keep tracked text files
 LF-terminated.
+
+To run the same single-TFM correctness gate as CI:
+
+```powershell
+pwsh -NoProfile -File eng/gate.ps1 -Framework net10.0 -Filter 'Category!=Perf'
+```
+
+Omit `-Filter` to include the latency comparison, or use `-Filter 'Category=Perf'`
+to run only that comparison.

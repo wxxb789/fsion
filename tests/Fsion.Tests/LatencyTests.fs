@@ -40,8 +40,20 @@ let private generateTypicalScript (round: int) (seed: int) =
           "filtered |> Array.iter (fun (name, n) -> printfn \"%s|%s|%s|%d\" prefix value name n)"
           "" ]
 
+[<Fact>]
+let ``a fresh typical script matches dotnet fsi`` () =
+    withContext "typical-parity" (fun context directory ->
+        writeFile directory "verify.fsx" (generateTypicalScript 500 424242)
+        let expected = runFsi directory [ "verify.fsx" ] None
+        let actual = context.Run([ "verify.fsx" ], timeoutMs = 60000)
+        Assert.Equal(0, expected.ExitCode)
+        Assert.Equal(expected.ExitCode, actual.ExitCode)
+        Assert.Equal(expected.Stdout, actual.Stdout)
+        Assert.Equal(expected.Stderr, actual.Stderr))
+
+[<Collection("Serial")>]
 type LatencyTests(output: ITestOutputHelper) =
-    [<Fact>]
+    [<Fact; Trait("Category", "Perf")>]
     member _.``warm fsion median latency is far below dotnet fsi on fresh scripts`` () =
         withContext "latency" (fun context directory ->
             let warmup = context.Run([ "warmup" ], timeoutMs = 120000)
@@ -68,11 +80,6 @@ type LatencyTests(output: ITestOutputHelper) =
                 let fsiResult = runFsi directory [ fsiName ] None
                 Assert.Equal(0, fsiResult.ExitCode)
                 fsiTimes.Add fsiResult.DurationMs
-            writeFile directory "verify.fsx" (generateTypicalScript 500 424242)
-            let expected = runFsi directory [ "verify.fsx" ] None
-            let actual = context.Run([ "verify.fsx" ], timeoutMs = 60000)
-            Assert.Equal(expected.ExitCode, actual.ExitCode)
-            Assert.Equal(expected.Stdout, actual.Stdout)
 
             let fsionMedian = median fsionTimes
             let fsiMedian = median fsiTimes

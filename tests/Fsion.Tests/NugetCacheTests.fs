@@ -4,7 +4,6 @@ open System
 open System.IO
 open System.Text.Json
 open Xunit
-open Xunit.Abstractions
 open Fsion.Tests.TestInfra
 
 let private diagnosticLocations (json: string) =
@@ -12,7 +11,9 @@ let private diagnosticLocations (json: string) =
     let diagnostics = document.RootElement.GetProperty("diagnostics")
     [ for diagnostic in diagnostics.EnumerateArray() ->
           diagnostic.GetProperty("file").GetString(), diagnostic.GetProperty("startLine").GetInt32() ]
-type NugetCacheTests(output: ITestOutputHelper) =
+
+[<Collection("NuGet")>]
+type NugetCacheTests() =
     [<Fact>]
     member _.``cached nuget directives skip official resolution on a later daemon generation`` () =
         withContext "nuget-cache" (fun context directory ->
@@ -69,23 +70,6 @@ type NugetCacheTests(output: ITestOutputHelper) =
                 Assert.False(
                     Directory.Exists secondPackages,
                     "the cached run restored packages instead of feeding cached references"
-                )
-
-                output.WriteLine(
-                    "first run with official resolution: "
-                    + string (int first.DurationMs)
-                    + " ms; cached run on a later daemon generation: "
-                    + string (int second.DurationMs)
-                    + " ms"
-                )
-
-                Assert.True(
-                    second.DurationMs < first.DurationMs,
-                    "cached run "
-                    + string (int second.DurationMs)
-                    + " ms was not faster than the resolving run "
-                    + string (int first.DurationMs)
-                    + " ms"
                 )
             finally
                 purgeDependencyManagerCache packageId

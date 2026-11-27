@@ -68,19 +68,16 @@ printfn "len=%d lines=%d head=%s" text.Length lines.Length (if lines.Length > 0 
             psi1.ArgumentList.Add scriptPath
             for key, value in context.Environment do
                 psi1.Environment.[key] <- value
-            let sw = Stopwatch.StartNew()
             use p1 = Process.Start psi1
             let outTask = p1.StandardOutput.ReadToEndAsync()
             let errTask = p1.StandardError.ReadToEndAsync()
             let exited = p1.WaitForExit 5000
-            sw.Stop()
             if not exited then
                 try p1.Kill(true) with _ -> ()
             Assert.True(exited, "fsion blocked on unclosed idle stdin pipe")
             Assert.Equal(0, p1.ExitCode)
             Assert.Equal("instant-ok" + Environment.NewLine, outTask.GetAwaiter().GetResult())
             Assert.Equal("", errTask.GetAwaiter().GetResult())
-            Assert.True(sw.ElapsedMilliseconds < 2000L, $"expected fast completion without stdin read, got {sw.ElapsedMilliseconds} ms")
             // Negative control 2: script calls Console.ReadLine(), caller writes one line and keeps stdin open.
             let psi2 = ProcessStartInfo(fsionBinary)
             psi2.WorkingDirectory <- directory

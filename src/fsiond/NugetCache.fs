@@ -88,6 +88,9 @@ let private scanDirectives (source: string) : Directive list =
         else
             None
 
+    let mutable condDepth = 0
+    let mutable sawConditional = false
+
     while i < length do
         let c = source.[i]
 
@@ -118,31 +121,51 @@ let private scanDirectives (source: string) : Directive list =
                 onlyWhitespace <- false
                 state <- VerbatimString
                 i <- i + 2
-            elif
-                onlyWhitespace
-                && c = '#'
-                && i + 1 < length
-                && source.[i + 1] = 'r'
-                && (i + 2 >= length || not (Char.IsLetterOrDigit source.[i + 2] || source.[i + 2] = '_'))
-            then
-                match tryParseQuoted (i + 2) with
-                | Some (nextIndex, content) when content.StartsWith("nuget:", StringComparison.OrdinalIgnoreCase) ->
-                    let mutable lineEnd = nextIndex
-
-                    while lineEnd < length && source.[lineEnd] <> '\n' do
-                        lineEnd <- lineEnd + 1
-
-                    let original = content.Substring("nuget:".Length).Trim()
-
-                    directives.Add
-                        { LineStart = lineStart
-                          LineEnd = lineEnd
-                          Normalized = normalizePackage original
-                          Original = original }
-
+            elif onlyWhitespace && c = '#' then
+                let mutable kwEnd = i + 1
+                while kwEnd < length && (Char.IsLetterOrDigit source.[kwEnd] || source.[kwEnd] = '_') do
+                    kwEnd <- kwEnd + 1
+                let kw = source.Substring(i + 1, kwEnd - (i + 1))
+                if kw = "if" then
+                    condDepth <- condDepth + 1
+                    sawConditional <- true
                     onlyWhitespace <- false
-                    i <- nextIndex
-                | _ ->
+                    i <- kwEnd
+                elif kw = "endif" then
+                    condDepth <- max 0 (condDepth - 1)
+                    onlyWhitespace <- false
+                    i <- kwEnd
+                elif kw = "r" then
+                    match tryParseQuoted kwEnd with
+                    | Some (nextIndex, content) when content.StartsWith("nuget:", StringComparison.OrdinalIgnoreCase) ->
+                        let mutable lineEnd = nextIndex
+                        let mutable hasTrailingCode = false
+                        while lineEnd < length && source.[lineEnd] <> '\n' do
+                            let ch = source.[lineEnd]
+                            if ch = '/' && lineEnd + 1 < length && source.[lineEnd + 1] = '/' then
+                                while lineEnd < length && source.[lineEnd] <> '\n' do
+                                    lineEnd <- lineEnd + 1
+                            else
+                                if ch <> ' ' && ch <> '\t' && ch <> '\r' then
+                                    hasTrailingCode <- true
+                                lineEnd <- lineEnd + 1
+
+                        if condDepth > 0 || hasTrailingCode then
+                            sawConditional <- true
+                        else
+                            let original = content.Substring("nuget:".Length).Trim()
+                            directives.Add
+                                { LineStart = lineStart
+                                  LineEnd = lineEnd
+                                  Normalized = normalizePackage original
+                                  Original = original }
+
+                        onlyWhitespace <- false
+                        i <- nextIndex
+                    | _ ->
+                        onlyWhitespace <- false
+                        advance ()
+                else
                     onlyWhitespace <- false
                     advance ()
             else
@@ -196,7 +219,7 @@ let private scanDirectives (source: string) : Directive list =
             else
                 advance ()
 
-    directives |> Seq.toList
+    if sawConditional then [] else directives |> Seq.toList
 
 let private blankDirectives (source: string) (directives: Directive list) =
     let builder = StringBuilder()
@@ -243,6 +266,12 @@ let private configFingerprint (startDirectory: string) =
     if File.Exists userConfig then
         paths.Add userConfig
 
+    if not (OperatingSystem.IsWindows()) then
+        let homeDir = Environment.GetFolderPath Environment.SpecialFolder.UserProfile
+        if not (String.IsNullOrEmpty homeDir) then
+            let unixUserConfig = Path.Combine(homeDir, ".nuget", "NuGet", "NuGet.Config")
+            if File.Exists unixUserConfig then
+                paths.Add unixUserConfig
     let machineConfigDirectories =
         if OperatingSystem.IsWindows() then
             [ Path.Combine(Environment.GetFolderPath Environment.SpecialFolder.CommonApplicationData, "NuGet")
@@ -271,8 +300,7 @@ let private configFingerprint (startDirectory: string) =
     |> String.concat "\n"
 
 let private cacheKey (tfm: string) (rid: string) (packages: string list) (fingerprint: string) =
-    Fsiond.Prelude.hashText (String.concat "\n" ("fsion-nuget-cache-v1" :: tfm :: rid :: (packages @ [ fingerprint ])))
-
+    Fsiond.Prelude.hashText (String.concat "\n" ("fsion-nuget-cache-v2" :: tfm :: rid :: (packages @ [ fingerprint ])))
 let private tryReadEntry (cachePath: string) : (string list * string list) option =
     try
         use document = JsonDocument.Parse(File.ReadAllText cachePath)
@@ -383,7 +411,16 @@ let private resolveWithOfficialProvider
             let result = provider.Resolve(manager, ".fsx", lines, report, tfm, rid, directory, scriptName, scriptName, 120000)
 
             if result.Success then
-                Some(result.Resolutions |> Seq.toList, result.Roots |> Seq.toList)
+                let hasCustomSourceFiles =
+                    result.SourceFiles
+                    |> Seq.exists (fun path ->
+                        not (String.IsNullOrWhiteSpace path)
+                        && not (Path.GetFileName(path).EndsWith(".fsx", StringComparison.OrdinalIgnoreCase)
+                                && path.IndexOf("nuget", StringComparison.OrdinalIgnoreCase) >= 0))
+                if hasCustomSourceFiles then
+                    None
+                else
+                    Some(result.Resolutions |> Seq.toList, result.Roots |> Seq.toList)
             else
                 Log.error None ("nuget resolution failed: " + String.concat "; " (Seq.append errors result.StdError))
                 None
@@ -397,7 +434,7 @@ let prepare (source: string) (includeDirectory: string) (scriptName: string) : P
     if directives.Length = 0 then
         None
     else
-        let packages = directives |> List.map (fun directive -> directive.Normalized) |> List.distinct |> List.sort
+        let packages = directives |> List.map (fun directive -> directive.Normalized) |> List.distinct
         let originals = directives |> List.map (fun directive -> directive.Original) |> List.distinct
         let tfm = targetFramework ()
         let rid = RuntimeInformation.RuntimeIdentifier

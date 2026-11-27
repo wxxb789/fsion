@@ -155,6 +155,7 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
 
                 if report.Wedged then
                     hooks.Retire ()
+                    hooks.Respawn ()
 
                 try
                     lock sendGate (fun () ->
@@ -169,9 +170,6 @@ let private handleConnection (options: Options) (hooks: Hooks) (stream: Stream) 
                 finally
                     try stdinChunks.CompleteAdding() with _ -> ()
                     ignore readerTask
-
-                    if report.Wedged then
-                        hooks.Respawn ()
 
                 logExecuted ()
 
@@ -250,12 +248,14 @@ let run (options: Options) (listener: IListener) (releaseOwnership: unit -> unit
             )
             |> ignore
 
+    let mutable respawned = 0
     let retire () =
         // Publish retired=1 BEFORE stop() unblocks acceptLoop so main thread always observes the 60s drain window.
         scheduleSelfTermination ()
+        session.AbortWedgedWaiters ()
         stop ()
     let respawn () =
-        if not options.Oneshot then
+        if not options.Oneshot && Interlocked.Exchange(&respawned, 1) = 0 then
             match Environment.ProcessPath with
             | null -> Log.error options.LogPath "cannot spawn a replacement: Environment.ProcessPath is null"
             | daemonPath ->

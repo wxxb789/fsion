@@ -180,38 +180,57 @@ type IListener =
 
 type private WindowsListener(name: string) =
     let cancellation = new CancellationTokenSource()
+    let stopSync = obj ()
+    let mutable stopped = false
     let mutable pending: NamedPipeServerStream option = None
 
     member _.Accept() : Task<Stream> =
         task {
             let server =
-                new NamedPipeServerStream(
-                    name,
-                    PipeDirection.InOut,
-                    64,
-                    PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous ||| PipeOptions.CurrentUserOnly
-                )
-            pending <- Some server
+                lock stopSync (fun () ->
+                    if stopped then
+                        raise (OperationCanceledException cancellation.Token)
+                    let created =
+                        new NamedPipeServerStream(
+                            name,
+                            PipeDirection.InOut,
+                            64,
+                            PipeTransmissionMode.Byte,
+                            PipeOptions.Asynchronous ||| PipeOptions.CurrentUserOnly
+                        )
+                    pending <- Some created
+                    created)
             try
                 do! server.WaitForConnectionAsync cancellation.Token
-                pending <- None
+                lock stopSync (fun () ->
+                    pending <- None
+                    if stopped then
+                        server.Dispose()
+                        raise (OperationCanceledException cancellation.Token))
                 return server :> Stream
             with ex ->
-                pending <- None
-                server.Dispose()
+                lock stopSync (fun () -> pending <- None)
+                try
+                    server.Dispose()
+                with _ ->
+                    ()
                 return raise ex
         }
 
     member _.Stop() =
+        let toDispose =
+            lock stopSync (fun () ->
+                stopped <- true
+                let current = pending
+                pending <- None
+                current)
         cancellation.Cancel()
-        pending
+        toDispose
         |> Option.iter (fun server ->
             try
                 server.Dispose()
             with _ ->
                 ())
-
     interface IListener with
         member this.Accept() = this.Accept()
         member this.Stop() = this.Stop()

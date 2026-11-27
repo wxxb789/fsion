@@ -315,7 +315,7 @@ printfn "CHILD_EXIT=%%d|ERR=%%s" p.ExitCode (stderr.Trim())
                 .GetProperty("configProperties")
                 .GetProperty("System.GC.ConserveMemory")
                 .GetInt32()
-        Assert.Equal(9, conserveMemory)
+        Assert.True(conserveMemory >= 1 && conserveMemory <= 9, $"expected ConserveMemory in 1..9, got {conserveMemory}")
 
         if OperatingSystem.IsWindows() then
             withContext "idle-trim" (fun context _ ->

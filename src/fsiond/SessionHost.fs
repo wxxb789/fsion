@@ -48,6 +48,8 @@ type private RunTextWriter() =
 
     member _.SafeText() = lock gate (fun () -> inner.ToString())
 
+    member _.SafeLength() = lock gate (fun () -> inner.GetStringBuilder().Length)
+
     member _.TruncateAt(index: int) = lock gate (fun () -> inner.GetStringBuilder().Length <- index)
 
     member _.ReplaceInBuilder(oldValue: string, newValue: string) =
@@ -420,7 +422,7 @@ let private clearScriptStatics (preludeTypes: HashSet<Type>) (assemblies: Assemb
         with _ ->
             ()
 
-let private compilerAsyncLocals =
+let private compilerAsyncLocalClearers : (unit -> unit)[] =
     match typeof<FsiEvaluationSession>.Assembly.GetType "FSharp.Compiler.DiagnosticsLogger" with
     | null -> [||]
     | moduleType ->
@@ -428,14 +430,19 @@ let private compilerAsyncLocals =
         |> Array.choose (fun name ->
             match moduleType.GetProperty(name, BindingFlags.Static ||| BindingFlags.Public ||| BindingFlags.NonPublic) with
             | null -> None
-            | property -> Some(property.GetValue null))
+            | property ->
+                match property.GetValue null with
+                | null -> None
+                | local ->
+                    let valueProperty = local.GetType().GetProperty "Value"
+                    let valueType = local.GetType().GetGenericArguments().[0]
+                    let defaultVal = Activator.CreateInstance valueType
+                    let setter = valueProperty.GetSetMethod(true)
+                    Some(fun () -> setter.Invoke(local, [| defaultVal |]) |> ignore))
 
 let private clearCompilerAsyncLocals () =
-    for local in compilerAsyncLocals do
-        let valueProperty = local.GetType().GetProperty "Value"
-        let valueType = local.GetType().GetGenericArguments().[0]
-        valueProperty.SetValue(local, Activator.CreateInstance valueType)
-
+    for clear in compilerAsyncLocalClearers do
+        clear ()
 
 [<Struct; StructLayout(LayoutKind.Sequential)>]
 type private WinProcessHandleSnapshotHeader =
@@ -545,7 +552,7 @@ module private WinHandleTable =
     // rather than reopening `Assembly.Location` paths from disk. That way dynamically loaded BCL/NuGet
     // DLLs remain fast-path exempt while a user handle on a renamed/replaced DLL or `Environment.ProcessPath`
     // is never misclassified as a runtime handle.
-    let private listRegularDiskFiles () : ResizeArray<struct (nativeint * uint32 * uint64)> voption =
+    let private listRegularDiskFilesSkipping (skipHandles: HashSet<nativeint> voption) : (ResizeArray<struct (nativeint * uint32 * uint64)> * HashSet<nativeint>) voption =
         let mutable size = 32768u
         let mutable retLen = 0u
         let mutable buf = Marshal.AllocHGlobal(int size)
@@ -561,15 +568,26 @@ module private WinHandleTable =
             else
                 let count = int (Marshal.ReadIntPtr(buf, 0))
                 let list = ResizeArray<struct (nativeint * uint32 * uint64)>()
+                let liveHandles = HashSet<nativeint>(count)
                 for i = 0 to count - 1 do
                     let h = Marshal.ReadIntPtr(buf, headerSize + i * entrySize)
-                    match tryRegularDiskIdentity h with
-                    | ValueSome id -> list.Add id
-                    | ValueNone -> ()
-                ValueSome list
+                    liveHandles.Add h |> ignore
+                    let skip =
+                        match skipHandles with
+                        | ValueSome known -> known.Contains h
+                        | ValueNone -> false
+                    if not skip then
+                        match tryRegularDiskIdentity h with
+                        | ValueSome id -> list.Add id
+                        | ValueNone -> ()
+                ValueSome(list, liveHandles)
         finally
             Marshal.FreeHGlobal buf
 
+    let private listRegularDiskFiles () : ResizeArray<struct (nativeint * uint32 * uint64)> voption =
+        match listRegularDiskFilesSkipping ValueNone with
+        | ValueSome(list, _) -> ValueSome list
+        | ValueNone -> ValueNone
     let mutable private assemblyLoadHooked = false
     let mutable private baselineEpoch = 0L
     let private pendingDefaultAsmCandidates = Dictionary<struct (uint32 * uint64), int64 * HashSet<nativeint>>()
@@ -799,9 +817,55 @@ module private WinHandleTable =
             ValueNone
         else
             let snapshotEpoch = Volatile.Read(&baselineEpoch)
-            match listRegularDiskFiles () with
+            let baselineHandleValuesOpt =
+                lock baselineSync (fun () ->
+                    match baselineHandlesOpt with
+                    | ValueSome baseline when pendingDefaultAsmCandidates.Count = 0 ->
+                        let set = HashSet<nativeint>(baseline.Count)
+                        for struct (h, _, _) in baseline do
+                            set.Add h |> ignore
+                        ValueSome set
+                    | _ -> ValueNone)
+            let currentOpt =
+                match baselineHandleValuesOpt with
+                | ValueSome knownBaselineHandles ->
+                    match listRegularDiskFilesSkipping (ValueSome knownBaselineHandles) with
+                    | ValueNone -> ValueNone
+                    | ValueSome(added, liveHandles) ->
+                        let mutable allBaselineLive = true
+                        for h in knownBaselineHandles do
+                            if allBaselineLive && not (liveHandles.Contains h) then
+                                allBaselineLive <- false
+                        if allBaselineLive then
+                            lock baselineSync (fun () ->
+                                match baselineHandlesOpt with
+                                | ValueSome baseline ->
+                                    let hs = HashSet<struct (nativeint * uint32 * uint64)>(baseline)
+                                    let seenFiles = HashSet<struct (uint32 * uint64)>(baseline.Count)
+                                    let mutable hasUserFiles = false
+                                    for struct (_, vol, fileIdx) in baseline do
+                                        if not (seenFiles.Add(struct (vol, fileIdx))) then
+                                            hasUserFiles <- true
+                                    for id in added do
+                                        hs.Add id |> ignore
+                                        let struct (_, vol, fileIdx) = id
+                                        let duplicateFile = not (seenFiles.Add(struct (vol, fileIdx)))
+                                        if vol = 0xFFFFFFFFu || duplicateFile || not (baseline.Contains id) then
+                                            hasUserFiles <- true
+                                    ValueSome(Choice1Of2 { AllDiskFiles = hs; HasPreExistingUserFiles = hasUserFiles })
+                                | ValueNone -> ValueNone)
+                        else
+                            match listRegularDiskFiles () with
+                            | ValueSome list -> ValueSome(Choice2Of2 list)
+                            | ValueNone -> ValueNone
+                | ValueNone ->
+                    match listRegularDiskFiles () with
+                    | ValueSome list -> ValueSome(Choice2Of2 list)
+                    | ValueNone -> ValueNone
+            match currentOpt with
             | ValueNone -> ValueNone
-            | ValueSome current ->
+            | ValueSome(Choice1Of2 fastSnap) -> ValueSome fastSnap
+            | ValueSome(Choice2Of2 current) ->
                 lock baselineSync (fun () ->
                     match baselineHandlesOpt with
                     | ValueNone -> ValueNone
@@ -846,7 +910,6 @@ module private WinHandleTable =
                             if vol = 0xFFFFFFFFu || duplicateFile || not (baseline.Contains id) then
                                 hasUserFiles <- true
                         ValueSome { AllDiskFiles = hs; HasPreExistingUserFiles = hasUserFiles })
-
     [<NoComparison; NoEquality>]
     type PosixSnapshot =
         { AllFds: HashSet<string>
@@ -949,14 +1012,35 @@ module private WinHandleTable =
             | ValueNone -> true
             | ValueSome before when before.HasPreExistingUserFiles -> true
             | ValueSome before ->
-                match listRegularDiskFiles () with
+                // Fast incremental check: only probe handles whose HandleValue was not already
+                // in `before.AllDiskFiles` (or if any baseline handle disappeared and might be reused,
+                // fall back to full scan).
+                let beforeHandleValues = HashSet<nativeint>(before.AllDiskFiles.Count)
+                for struct (h, _, _) in before.AllDiskFiles do
+                    beforeHandleValues.Add h |> ignore
+                match listRegularDiskFilesSkipping (ValueSome beforeHandleValues) with
                 | ValueNone -> true
-                | ValueSome after ->
-                    let mutable found = false
-                    for id in after do
-                        if not found && not (before.AllDiskFiles.Contains id) then
-                            found <- true
-                    found
+                | ValueSome(addedDiskFiles, liveHandles) ->
+                    if addedDiskFiles.Count > 0 then
+                        true
+                    else
+                        // If every pre-existing baseline disk handle is still live, none could have
+                        // been closed and recycled to a different file during the run.
+                        let mutable anyClosed = false
+                        for h in beforeHandleValues do
+                            if not anyClosed && not (liveHandles.Contains h) then
+                                anyClosed <- true
+                        if not anyClosed then
+                            false
+                        else
+                            match listRegularDiskFiles () with
+                            | ValueNone -> true
+                            | ValueSome after ->
+                                let mutable found = false
+                                for id in after do
+                                    if not found && not (before.AllDiskFiles.Contains id) then
+                                        found <- true
+                                found
         else
             match posixBeforeOpt with
             | ValueNone -> true
@@ -981,28 +1065,34 @@ let private sweepTransientFinalizers
     (posixFdsBefore: WinHandleTable.PosixSnapshot voption)
     collectionsBefore
     =
-    let collect generation = GC.Collect(generation, GCCollectionMode.Forced, true, false)
-    let mutable collectedGen2 = false
-    match collectionsBefore with
-    | ValueSome(struct (gen0, gen1)) when GC.CollectionCount 1 = gen1 ->
-        let collectGen1 () =
-            collect 1
-            if GC.CollectionCount 1 <> gen1 + 1 then
-                collect 2
-                collectedGen2 <- true
+    // Fast path: if no new regular disk file handles remain open and no pre-existing user files
+    // existed before the run, skip the synchronous blocking GC on the reply hot path; collectible
+    // session unload and finalization proceed asynchronously on the background replenisher.
+    if not (WinHandleTable.hasNewHandle winHandlesBefore posixFdsBefore) then
+        ()
+    else
+        let collect generation = GC.Collect(generation, GCCollectionMode.Forced, true, false)
+        let mutable collectedGen2 = false
+        match collectionsBefore with
+        | ValueSome(struct (gen0, gen1)) when GC.CollectionCount 1 = gen1 ->
+            let collectGen1 () =
+                collect 1
+                if GC.CollectionCount 1 <> gen1 + 1 then
+                    collect 2
+                    collectedGen2 <- true
 
-        if GC.CollectionCount 0 = gen0 then
-            collect 0
-            if GC.CollectionCount 0 <> gen0 + 1 then collectGen1 ()
-        else
-            collectGen1 ()
-    | _ ->
-        collect 2
-        collectedGen2 <- true
-    GC.WaitForPendingFinalizers()
-    if not collectedGen2 && WinHandleTable.hasNewHandle winHandlesBefore posixFdsBefore then
-        collect 2
+            if GC.CollectionCount 0 = gen0 then
+                collect 0
+                if GC.CollectionCount 0 <> gen0 + 1 then collectGen1 ()
+            else
+                collectGen1 ()
+        | _ ->
+            collect 2
+            collectedGen2 <- true
         GC.WaitForPendingFinalizers()
+        if not collectedGen2 && WinHandleTable.hasNewHandle winHandlesBefore posixFdsBefore then
+            collect 2
+            GC.WaitForPendingFinalizers()
 let private severityText (severity: FSharpDiagnosticSeverity) =
     match severity with
     | FSharpDiagnosticSeverity.Error -> "error"
@@ -1316,8 +1406,8 @@ type private ProcessStateGate(endpointName: string) =
     let daemonBaseline = readProcessEnvironment ()
     let mutable currentEnvironment = daemonBaseline
     let mutable activeRunSequence = 0L
+    let mutable wedged = false
     let waiters = LinkedList<GateWaiter>()
-
     let isInternalTrackingKey (key: string) =
         environmentComparer.Equals(key, ParentEndpointEnvironmentVariable)
         || environmentComparer.Equals(key, ParentRunIdEnvironmentVariable)
@@ -1390,6 +1480,7 @@ type private ProcessStateGate(endpointName: string) =
             try
                 let mutable timedOut = false
                 while not timedOut
+                      && not wedged
                       && not waiter.Cancelled
                       && not disconnectToken.IsCancellationRequested
                       && (hasConflictingWaiterAhead node || not (isHeadCompatible waiter)) do
@@ -1402,7 +1493,9 @@ type private ProcessStateGate(endpointName: string) =
                     else
                         Monitor.Wait sync |> ignore
 
-                if waiter.Cancelled || disconnectToken.IsCancellationRequested then
+                if wedged then
+                    raise (OperationCanceledException())
+                elif waiter.Cancelled || disconnectToken.IsCancellationRequested then
                     raise (OperationCanceledException disconnectToken)
                 elif timedOut then
                     false
@@ -1445,8 +1538,10 @@ type private ProcessStateGate(endpointName: string) =
         lock sync (fun () ->
             let node = waiters.AddLast waiter
             try
-                while hasConflictingWaiterAhead node || activeRuns > 0 || activeFilePreludes > 0 do
+                while not wedged && (hasConflictingWaiterAhead node || activeRuns > 0 || activeFilePreludes > 0) do
                     Monitor.Wait sync |> ignore
+                if wedged then
+                    raise (OperationCanceledException())
                 waiters.Remove node
                 if not (String.Equals(Directory.GetCurrentDirectory(), daemonDirectory, StringComparison.Ordinal)) then
                     Directory.SetCurrentDirectory daemonDirectory
@@ -1524,6 +1619,10 @@ type private ProcessStateGate(endpointName: string) =
 
     member _.EndpointName = endpointName
 
+    member _.AbortWedged() =
+        lock sync (fun () ->
+            wedged <- true
+            Monitor.PulseAll sync)
 type private PreludePool(spec: Prelude.Spec, tag: Prelude.Tag) =
     member _.Spec = spec
     member val Tag = tag with get, set
@@ -1535,6 +1634,78 @@ type private PreludePool(spec: Prelude.Spec, tag: Prelude.Tag) =
 exception private PreludeEvaluationFailure of attemptedTag: Prelude.Tag * inner: exn
 
 type SessionHost(options: SessionHostOptions) =
+    let workerPoolGate = obj ()
+    let workerPool = Stack<AutoResetEvent * ref<obj>>()
+
+    let runOnPooledThread (work: unit -> 'T) : Task<'T> =
+        let tcs = TaskCompletionSource<'T>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let action () =
+            try
+                tcs.TrySetResult(work ()) |> ignore
+            with ex ->
+                tcs.TrySetException(ex) |> ignore
+        let slot =
+            lock workerPoolGate (fun () ->
+                if workerPool.Count > 0 then ValueSome(workerPool.Pop()) else ValueNone)
+        match slot with
+        | ValueSome(signal, jobRef) ->
+            jobRef.Value <- box action
+            signal.Set() |> ignore
+        | ValueNone ->
+            let signal = new AutoResetEvent(false)
+            let jobRef = ref (box action)
+            let t =
+                Thread(fun () ->
+                    let rec loop () =
+                        match jobRef.Value with
+                        | :? (unit -> unit) as fn ->
+                            jobRef.Value <- null
+                            try
+                                fn ()
+                            finally
+                                SynchronizationContext.SetSynchronizationContext null
+                        | _ -> ()
+                        let keep =
+                            lock workerPoolGate (fun () ->
+                                if workerPool.Count < 8 then
+                                    workerPool.Push(signal, jobRef)
+                                    true
+                                else
+                                    false)
+                        if keep then
+                            if signal.WaitOne(60000) then
+                                loop ()
+                            else
+                                // Only exit if we are no longer in the pool (timeout while idle).
+                                let removed =
+                                    lock workerPoolGate (fun () ->
+                                        if isNull jobRef.Value then
+                                            let remaining = ResizeArray<AutoResetEvent * ref<obj>>()
+                                            let mutable found = false
+                                            while workerPool.Count > 0 do
+                                                let item = workerPool.Pop()
+                                                if Object.ReferenceEquals(fst item, signal) then
+                                                    found <- true
+                                                else
+                                                    remaining.Add item
+                                            for i = remaining.Count - 1 downto 0 do
+                                                workerPool.Push remaining.[i]
+                                            found
+                                        else
+                                            false)
+                                if removed then
+                                    try signal.Dispose() with _ -> ()
+                                else
+                                    // A job was just assigned before we acquired the lock; run it.
+                                    loop ()
+                        else
+                            try signal.Dispose() with _ -> ()
+                    loop ())
+            t.IsBackground <- true
+            t.Name <- "fsiond-runner"
+            t.Start()
+        tcs.Task
+
     let daemonBaselineGlobalState = captureGlobalState ()
     let targetPoolSize = if options.Oneshot then 1 else max 0 options.PoolSize
     let poolGate = obj ()
@@ -1663,11 +1834,9 @@ type SessionHost(options: SessionHostOptions) =
         let phase2 = Interlocked.Exchange(&pendingUnloadPhase2, 0)
         if phase2 > 0 then
             if isQuietNow () then
-                if not forceSweep then
-                    System.Runtime.GCSettings.LargeObjectHeapCompactionMode <- System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce
-                    GC.Collect(2, GCCollectionMode.Forced, true, true)
-                else
-                    GC.Collect(2, GCCollectionMode.Forced, true, false)
+                // Avoid LOH compaction during short 500ms quiet windows (causes 200-800ms STW spikes on ~500MB heaps);
+                // LOH compaction runs in tryTrimIdleWorkingSet after TrimIdleMinutes.
+                GC.Collect(2, GCCollectionMode.Forced, true, false)
                 let alive = drainReleasedSessions ()
                 let cumulative = Interlocked.Add(&totalReleased, phase2)
                 logDetail ($"unload released={cumulative} alive={alive}")
@@ -2131,8 +2300,7 @@ type SessionHost(options: SessionHostOptions) =
                     attemptedScriptName <- scriptName
                     typesBeforeCurrentEval <- emittedTypeCount ()
                     precheckedDiagnostics <- None
-                    let errLenBefore = errWriter.SafeText().Length
-
+                    let errLenBefore = errWriter.SafeLength()
                     if request.IncludeDiagnostics && chunk.IndexOf("#load", StringComparison.Ordinal) >= 0 then
                         let checkResults =
                             let saved = Ambient.get ()
@@ -2172,13 +2340,13 @@ type SessionHost(options: SessionHostOptions) =
                     // FCS `EvalInteraction` returns without throwing on syntax/indentation errors (printing
                     // `): error FSxxxx:` without emitting any CLR types), whereas warning-only empty/stray-`;`
                     // interactions print only `warning FSxxxx:` and must stay exit 0.
-                    let errAfter = errWriter.SafeText()
-                    if
-                        errAfter.Length > errLenBefore
-                        && errAfter.IndexOf("): error FS", errLenBefore, StringComparison.Ordinal) >= 0
-                        && emittedTypeCount () = typesBeforeCurrentEval
-                    then
-                        raise (FsiCompilationException("compile error", None))
+                    if errWriter.SafeLength() > errLenBefore then
+                        let errAfter = errWriter.SafeText()
+                        if
+                            errAfter.IndexOf("): error FS", errLenBefore, StringComparison.Ordinal) >= 0
+                            && emittedTypeCount () = typesBeforeCurrentEval
+                        then
+                            raise (FsiCompilationException("compile error", None))
             finally
                 if mayMutateCompilerDirectory code then
                     claimed.CompilerDirectory <- ""
@@ -2722,6 +2890,7 @@ type SessionHost(options: SessionHostOptions) =
             match pools |> Seq.tryFind (fun slot -> slot.Spec = desiredSpec) with
             | Some slot -> slot.Warm.Count > 0
             | None -> false)
+    member _.AbortWedgedWaiters() = processState.AbortWedged()
 
     member _.ExecutedCount = executed.Value
 
@@ -2735,16 +2904,20 @@ type SessionHost(options: SessionHostOptions) =
         let timeoutFired = ref 0
         let evaluationStarted = ref 0
 
-        use disconnectRegistration =
-            disconnectToken.Register(fun () ->
+        let canceledSignal = new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let signalSupervisorAndCancel () =
+            // Signal the supervisor BEFORE calling runCts.Cancel() so a blocking user callback
+            // registered on fsionFsiState.CancellationToken cannot prevent the 1500ms grace timer.
+            canceledSignal.TrySetResult() |> ignore
+            ThreadPool.QueueUserWorkItem(fun _ ->
                 try
                     runCts.Cancel()
                 with _ ->
                     ())
+            |> ignore
 
-        let canceledSignal = new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-        use canceledRegistration = runCts.Token.Register(fun () -> canceledSignal.TrySetResult() |> ignore)
-
+        use disconnectRegistration =
+            disconnectToken.Register(fun () -> signalSupervisorAndCancel ())
         let outWriter = new RunTextWriter()
         let errWriter = new RunTextWriter()
         let mutable capturedExit: (int * string) option = None
@@ -2833,11 +3006,7 @@ type SessionHost(options: SessionHostOptions) =
                                                 new Timer(
                                                     (fun _ ->
                                                         Volatile.Write(&timeoutFired.contents, 1)
-
-                                                        try
-                                                            runCts.Cancel()
-                                                        with _ ->
-                                                            ()),
+                                                        signalSupervisorAndCancel ()),
                                                     null,
                                                     timeoutMs,
                                                     Timeout.Infinite
@@ -2872,6 +3041,8 @@ type SessionHost(options: SessionHostOptions) =
                                     | _ -> ()
                             finally
                                 Ambient.clear ()
+                                if stateless then
+                                    restoreGlobalState daemonBaselineGlobalState
                         finally
                             if entered then
                                 processState.Exit ()
@@ -2883,7 +3054,8 @@ type SessionHost(options: SessionHostOptions) =
                         else
                             releaseSession claimed
                 finally
-                    restoreGlobalState daemonBaselineGlobalState
+                    if not entered then
+                        restoreGlobalState daemonBaselineGlobalState
                     if options.LogPath.IsSome then
                         let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs
                         logDetail (
@@ -3032,7 +3204,7 @@ type SessionHost(options: SessionHostOptions) =
             | None ->
                 outcome
 
-        let worker = Task.Factory.StartNew(work, TaskCreationOptions.LongRunning)
+        let worker = runOnPooledThread work
         let canceledFirst = Task.WaitAny(worker, canceledSignal.Task) = 1
 
         if not canceledFirst then

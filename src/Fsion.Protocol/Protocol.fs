@@ -235,33 +235,28 @@ let private writeResponsePayloadWithVersion (version: int) (writer: BinaryWriter
         writer.Write 17uy
         writer.Write maxBytes
 
-let private payloadOf (write: BinaryWriter -> unit) =
-    use stream = new MemoryStream()
-    do
-        use writer = new BinaryWriter(stream, utf8, true)
-        write writer
-        writer.Flush()
-    stream.ToArray()
-
-let private sendFramed (stream: Stream) (payload: byte[]) =
-    use frameStream = new MemoryStream()
+let private sendFramedWith (stream: Stream) (write: BinaryWriter -> unit) =
+    use frameStream = new MemoryStream(256)
+    frameStream.Write(ReadOnlySpan<byte>(Array.zeroCreate<byte> 4))
     do
         use writer = new BinaryWriter(frameStream, utf8, true)
-        writer.Write payload.Length
-        writer.Write payload
+        write writer
         writer.Flush()
-    let frame = frameStream.ToArray()
-    stream.Write(frame, 0, frame.Length)
+    let totalLength = int frameStream.Length
+    let payloadLength = totalLength - 4
+    let buffer = frameStream.GetBuffer()
+    BitConverter.TryWriteBytes(Span<byte>(buffer, 0, 4), payloadLength) |> ignore
+    stream.Write(buffer, 0, totalLength)
     stream.Flush()
 
 let sendRequestWithVersion (version: int) (stream: Stream) (request: Request) =
-    sendFramed stream (payloadOf (fun writer -> writeRequestPayloadWithVersion version writer request))
+    sendFramedWith stream (fun writer -> writeRequestPayloadWithVersion version writer request)
 
 let sendRequest (stream: Stream) (request: Request) =
     sendRequestWithVersion ProtocolVersion stream request
 
 let sendResponseWithVersion (version: int) (stream: Stream) (response: Response) =
-    sendFramed stream (payloadOf (fun writer -> writeResponsePayloadWithVersion version writer response))
+    sendFramedWith stream (fun writer -> writeResponsePayloadWithVersion version writer response)
 
 let sendResponse (stream: Stream) (response: Response) =
     sendResponseWithVersion ProtocolVersion stream response

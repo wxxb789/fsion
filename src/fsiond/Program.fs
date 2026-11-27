@@ -178,7 +178,7 @@ let main argv =
         if isWindows then
             let ownershipName = "Local\\fsion-endpoint-" + sanitizeName options.Endpoint.Name
             let ownership = new Semaphore(1, 1, ownershipName)
-            let acquired = ownership.WaitOne(TimeSpan.FromSeconds 2.0)
+            let acquired = ownership.WaitOne(TimeSpan.FromMilliseconds 500.0)
 
             if not acquired then
                 ownership.Dispose()

@@ -308,8 +308,26 @@ let private ensureDaemon (options: Options) (endpoint: Endpoint) : Stream =
     match tryConnect endpoint (TimeSpan.FromMilliseconds 250.0) with
     | Some stream -> stream
     | None ->
-        spawnDaemon (Some(resolveIdleTtl options)) (Some(resolveSessionTtl options)) options endpoint
-        connect endpoint (TimeSpan.FromSeconds 30.0)
+        if OperatingSystem.IsWindows() then
+            let lockName = "Local\\fsion-autostart-" + sanitizeName endpoint.Name
+            use autoStartGate = new Mutex(false, lockName)
+            let mutable acquired = false
+            try
+                try
+                    acquired <- autoStartGate.WaitOne(TimeSpan.FromSeconds 5.0)
+                with :? AbandonedMutexException ->
+                    acquired <- true
+                match tryConnect endpoint (TimeSpan.FromMilliseconds 100.0) with
+                | Some stream -> stream
+                | None ->
+                    spawnDaemon (Some(resolveIdleTtl options)) (Some(resolveSessionTtl options)) options endpoint
+                    connect endpoint (TimeSpan.FromSeconds 30.0)
+            finally
+                if acquired then
+                    try autoStartGate.ReleaseMutex() with _ -> ()
+        else
+            spawnDaemon (Some(resolveIdleTtl options)) (Some(resolveSessionTtl options)) options endpoint
+            connect endpoint (TimeSpan.FromSeconds 30.0)
 
 type private Delivery =
     | NotDelivered
@@ -392,7 +410,8 @@ let private sendAndReceive (stream: Stream) (timeoutMs: int option) (request: Re
             let receive = Task.Run(fun () -> readNextResponse ())
             // Last-resort net only: fsiond enforces --timeout after the session is acquired, so
             // cold daemon/session creation must not be charged against this client deadline.
-            if receive.Wait(timeoutMs + 30000) then
+            let waitMs = int (min (int64 Int32.MaxValue) (int64 timeoutMs + 30000L))
+            if receive.Wait(waitMs) then
                 receive.Result
             else
                 DeadlineExpired timeoutMs

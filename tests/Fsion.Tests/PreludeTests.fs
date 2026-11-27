@@ -100,73 +100,6 @@ type PreludeTests(output: ITestOutputHelper) =
             Assert.Equal("bare" + Environment.NewLine, bare.Stdout))
 
     [<Fact>]
-    member _.``configured prelude with a nuget package preloads bindings and refreshes on edit`` () =
-        withContext "prelude-user" (fun context directory ->
-            let cacheDirectory = createTempDir "prelude-nuget-cache"
-            let packageId = uniquePackageId "fsiontiny"
-            let packagesDirectory = Path.Combine(directory, "packages")
-            let preludePath = Path.Combine(directory, "prelude.fsx")
-
-            let environment =
-                [ "FSION_PRELUDE", preludePath
-                  "FSION_CACHE_DIR", cacheDirectory
-                  "NUGET_PACKAGES", packagesDirectory ]
-
-            try
-                let feed = createTinyPackage directory packageId
-                writeNugetConfig directory feed
-
-                let preloadCountPath = Path.Combine(directory, "preload-count.txt")
-
-                File.WriteAllText(
-                    preludePath,
-                    "#r \"nuget: "
-                    + packageId
-                    + ", 1.0.0\"\n"
-                    + "System.IO.File.AppendAllText(@\""
-                    + preloadCountPath.Replace("\"", "\"\"")
-                    + "\", \"1\\n\")\n"
-                    + "let preludeGreeting () = \"first\"\n",
-                    UTF8Encoding(true)
-                )
-
-                let warmup = context.Run([ "warmup" ], timeoutMs = 240000, extraEnv = environment)
-
-                Assert.Equal(0, warmup.ExitCode)
-
-                let before = context.MetricsOrFail()
-                Assert.True(before.PoolWarm > 0, "warm pool was empty after warmup")
-                let preloadedBeforeRun = File.ReadAllLines preloadCountPath
-                Assert.True(
-                    preloadedBeforeRun.Length >= before.PoolWarm,
-                    "prelude.fsx was not evaluated during warmup pool creation"
-                )
-
-                let code = "printfn \"%s|%s\" (preludeGreeting()) (FsionTinyPkgNs.Greeter.Hello())"
-
-                let first = context.Run([ "-e"; code ], timeoutMs = 120000, extraEnv = environment)
-                Assert.Equal(0, first.ExitCode)
-                Assert.Equal("first|tiny-package-ok", first.Stdout.Trim())
-
-                let afterFirst = context.MetricsOrFail()
-                Assert.Equal(before.ColdClaims, afterFirst.ColdClaims)
-
-                let daemonPid = context.DaemonPid()
-                Assert.True(daemonPid.IsSome, "daemon was not reported as running")
-                writeFile
-                    directory
-                    "prelude.fsx"
-                    ("#r \"nuget: " + packageId + ", 1.0.0\"\n" + "let preludeGreeting () = \"edited\"\n")
-
-                let second = context.Run([ "-e"; code ], timeoutMs = 120000, extraEnv = environment)
-                Assert.Equal(0, second.ExitCode)
-                Assert.Equal("edited|tiny-package-ok", second.Stdout.Trim())
-                Assert.Equal(daemonPid, context.DaemonPid())
-            finally
-                purgeDependencyManagerCache packageId
-                tryDeleteDirectory cacheDirectory)
-
-    [<Fact>]
     member _.``default user prelude resolves POSIX XDG_CONFIG_HOME and keeps Windows SpecialFolder semantics`` () =
         withContext "prelude-platform-config" (fun context directory ->
             let configHome = Path.Combine(directory, "config-home")
@@ -474,6 +407,7 @@ type PreludeTests(output: ITestOutputHelper) =
             Assert.Equal(settled.PoolTarget, settled.PoolWarm)
             Assert.Equal(0, settled.AliveDisposedSessions))
 
+type PreludeConcurrencyTests() =
     [<Fact>]
     member _.``background file-prelude replenish stays isolated from concurrent request environment and stale failure`` () =
         withContext "prelude-replenish-isolation" (fun context directory ->
@@ -1103,6 +1037,9 @@ type PreludeTests(output: ITestOutputHelper) =
                 let warmFileInit =
                     runProcess Fsion.Tests.TestInfra.fsionBinary [ "--prelude"; slowFilePrelude; "warmup" ] directory prioEnv None 120000
                 Assert.True(warmFileInit.ExitCode = 0, warmFileInit.Stderr)
+                let consumeBareOne =
+                    runProcess Fsion.Tests.TestInfra.fsionBinary [ "--no-prelude"; "-e"; "()" ] directory prioEnv None 60000
+                Assert.True(consumeBareOne.ExitCode = 0, consumeBareOne.Stderr)
                 writeFile
                     directory
                     "slow-prio.fsx"
@@ -1110,9 +1047,6 @@ type PreludeTests(output: ITestOutputHelper) =
                         "System.IO.File.WriteAllText(@\"%s\", \"1\")\nwhile not (System.IO.File.Exists(@\"%s\")) do System.Threading.Thread.Sleep 20\nlet prioVal = 2\n"
                         slowEntered
                         slowRelease)
-                let consumeBareOne =
-                    runProcess Fsion.Tests.TestInfra.fsionBinary [ "--no-prelude"; "-e"; "()" ] directory prioEnv None 60000
-                Assert.True(consumeBareOne.ExitCode = 0, consumeBareOne.Stderr)
                 let bareWarmup =
                     runProcess Fsion.Tests.TestInfra.fsionBinary [ "--no-prelude"; "warmup" ] directory prioEnv None 15000
                 Assert.True(bareWarmup.ExitCode = 0, bareWarmup.Stderr)
@@ -1246,3 +1180,72 @@ type PreludeTests(output: ITestOutputHelper) =
                 writeFile directory "fc-release.txt" "go"
                 writeFile directory "fc-v2-release.txt" "go"
                 fcContext.StopOwnDaemon())
+
+[<Collection("NuGet")>]
+type NugetPreludeTests() =
+    [<Fact>]
+    member _.``configured prelude with a nuget package preloads bindings and refreshes on edit`` () =
+        withContext "prelude-user" (fun context directory ->
+            let cacheDirectory = createTempDir "prelude-nuget-cache"
+            let packageId = uniquePackageId "fsiontiny"
+            let packagesDirectory = Path.Combine(directory, "packages")
+            let preludePath = Path.Combine(directory, "prelude.fsx")
+
+            let environment =
+                [ "FSION_PRELUDE", preludePath
+                  "FSION_CACHE_DIR", cacheDirectory
+                  "NUGET_PACKAGES", packagesDirectory ]
+
+            try
+                let feed = createTinyPackage directory packageId
+                writeNugetConfig directory feed
+
+                let preloadCountPath = Path.Combine(directory, "preload-count.txt")
+
+                File.WriteAllText(
+                    preludePath,
+                    "#r \"nuget: "
+                    + packageId
+                    + ", 1.0.0\"\n"
+                    + "System.IO.File.AppendAllText(@\""
+                    + preloadCountPath.Replace("\"", "\"\"")
+                    + "\", \"1\\n\")\n"
+                    + "let preludeGreeting () = \"first\"\n",
+                    UTF8Encoding(true)
+                )
+
+                let warmup = context.Run([ "warmup" ], timeoutMs = 240000, extraEnv = environment)
+
+                Assert.Equal(0, warmup.ExitCode)
+
+                let before = context.MetricsOrFail()
+                Assert.True(before.PoolWarm > 0, "warm pool was empty after warmup")
+                let preloadedBeforeRun = File.ReadAllLines preloadCountPath
+                Assert.True(
+                    preloadedBeforeRun.Length >= before.PoolWarm,
+                    "prelude.fsx was not evaluated during warmup pool creation"
+                )
+
+                let code = "printfn \"%s|%s\" (preludeGreeting()) (FsionTinyPkgNs.Greeter.Hello())"
+
+                let first = context.Run([ "-e"; code ], timeoutMs = 120000, extraEnv = environment)
+                Assert.Equal(0, first.ExitCode)
+                Assert.Equal("first|tiny-package-ok", first.Stdout.Trim())
+
+                let afterFirst = context.MetricsOrFail()
+                Assert.Equal(before.ColdClaims, afterFirst.ColdClaims)
+
+                let daemonPid = context.DaemonPid()
+                Assert.True(daemonPid.IsSome, "daemon was not reported as running")
+                writeFile
+                    directory
+                    "prelude.fsx"
+                    ("#r \"nuget: " + packageId + ", 1.0.0\"\n" + "let preludeGreeting () = \"edited\"\n")
+
+                let second = context.Run([ "-e"; code ], timeoutMs = 120000, extraEnv = environment)
+                Assert.Equal(0, second.ExitCode)
+                Assert.Equal("edited|tiny-package-ok", second.Stdout.Trim())
+                Assert.Equal(daemonPid, context.DaemonPid())
+            finally
+                purgeDependencyManagerCache packageId
+                tryDeleteDirectory cacheDirectory)

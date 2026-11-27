@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   build-test-package:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.os }} / ${{ matrix.tfm }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -22,16 +22,24 @@ jobs:
           - windows-latest
           - macos-latest
           - ubuntu-latest
+        tfm:
+          - net10.0
+          - net11.0
     steps:
       - uses: actions/checkout@v4
 
-      # net10.0 and net11.0 test hosts both run here, so both runtimes must exist:
-      # 10.0.x supplies the Microsoft.NETCore.App 10 runtime, 11.0.x the SDK used to build.
+      # Some tests build net10.0 fixtures even in the net11.0 job.
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: |
             10.0.x
             11.0.x
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ runner.arch }}-${{ matrix.tfm }}-${{ hashFiles('Directory.Build.props', '**/*.fsproj') }}
 
       - name: Install NativeAOT prerequisites (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -39,13 +47,15 @@ jobs:
 
       - name: Repository gate (build, NativeAOT publish, black-box tests, LF hygiene)
         shell: pwsh
-        run: pwsh -NoProfile -File eng/gate.ps1
+        run: pwsh -NoProfile -File eng/gate.ps1 -Framework ${{ matrix.tfm }} -Filter 'Category!=Perf'
 
       - name: Package and verify the host bundle (net10.0)
+        if: matrix.tfm == 'net10.0'
         shell: pwsh
         run: pwsh -NoProfile -File eng/package.ps1 -Framework net10.0
 
       - name: Upload distribution archive
+        if: matrix.tfm == 'net10.0'
         uses: actions/upload-artifact@v4
         with:
           name: fsion-bundle-${{ matrix.os }}

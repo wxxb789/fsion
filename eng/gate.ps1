@@ -1,10 +1,20 @@
 #!/usr/bin/env pwsh
 
+[CmdletBinding()]
+param(
+    [ValidateSet('all', 'net10.0', 'net11.0')]
+    [string]$Framework = 'all',
+    [string]$Filter = ''
+)
+
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $separator = [IO.Path]::PathSeparator
+$frameworks = if ($Framework -eq 'all') { 'net10.0', 'net11.0' } else { $Framework }
+$frameworkArgs = @(if ($Framework -ne 'all') { "-p:TargetFrameworks=$Framework" })
+$filterArgs = @(if ($Filter) { '--filter'; $Filter })
 
 function Invoke-Checked {
     param([string]$Label, [scriptblock]$Command)
@@ -72,19 +82,18 @@ try {
         }
     }
 
-    Invoke-Checked 'dotnet build fsion.slnx -c Release' {
-        dotnet build fsion.slnx -c Release
-    }
-
-    foreach ($tfm in @('net10.0', 'net11.0')) {
-        Invoke-Checked "dotnet publish src/fsion -c Release -f $tfm" {
-            dotnet publish src/fsion -c Release -f $tfm
-        }
+    $buildArgs = @('build', 'fsion.slnx', '-c', 'Release') + $frameworkArgs
+    Invoke-Checked "dotnet $($buildArgs -join ' ')" {
+        dotnet @buildArgs
     }
 
     $clientName = if ($IsWindows) { 'fsion.exe' } else { 'fsion' }
 
-    foreach ($tfm in @('net10.0', 'net11.0')) {
+    foreach ($tfm in $frameworks) {
+        Invoke-Checked "dotnet publish src/fsion -c Release -f $tfm" {
+            dotnet publish src/fsion -c Release -f $tfm @frameworkArgs
+        }
+
         $native = Join-Path $repoRoot "artifacts/publish/fsion/$tfm/$clientName"
 
         if (-not (Test-Path -LiteralPath $native)) {
@@ -94,9 +103,10 @@ try {
         Write-Host "native client published: $native"
     }
 
-    foreach ($tfm in @('net10.0', 'net11.0')) {
-        Invoke-Checked "dotnet test tests/Fsion.Tests -c Release -f $tfm" {
-            dotnet test tests/Fsion.Tests/Fsion.Tests.fsproj -c Release -f $tfm
+    foreach ($tfm in $frameworks) {
+        $testArgs = @('test', 'tests/Fsion.Tests/Fsion.Tests.fsproj', '-c', 'Release', '-f', $tfm, '--no-build') + $filterArgs
+        Invoke-Checked "dotnet $($testArgs -join ' ')" {
+            dotnet @testArgs
         }
     }
 

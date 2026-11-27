@@ -9,8 +9,11 @@ open System.Threading
 open Fsion
 open Fsion.Protocol
 
-[<assembly: Xunit.CollectionBehavior(DisableTestParallelization = true)>]
+[<assembly: Xunit.CollectionBehavior(MaxParallelThreads = 3)>]
 do ()
+
+[<Xunit.CollectionDefinition("Serial", DisableParallelization = true)>]
+type SerialCollection() = class end
 
 let isWindows = OperatingSystem.IsWindows()
 
@@ -172,7 +175,9 @@ type FsionContext(workingDirectory: string) =
     let baseEnvironment =
         [ "FSION_PIPE", endpoint
           "FSIOND_PATH", fsiondBinary
-          "FSION_CONFIG_DIR", Path.Combine(workingDirectory, ".fsion-config") ]
+          "FSION_PRELUDE", null
+          "FSION_CONFIG_DIR", Path.Combine(workingDirectory, ".fsion-config")
+          "FSION_CACHE_DIR", Path.Combine(workingDirectory, ".fsion-cache") ]
 
     let mutable disposed = false
 

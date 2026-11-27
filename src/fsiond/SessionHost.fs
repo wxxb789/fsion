@@ -552,7 +552,7 @@ module private WinHandleTable =
     // rather than reopening `Assembly.Location` paths from disk. That way dynamically loaded BCL/NuGet
     // DLLs remain fast-path exempt while a user handle on a renamed/replaced DLL or `Environment.ProcessPath`
     // is never misclassified as a runtime handle.
-    let private listRegularDiskFilesSkipping (skipHandles: HashSet<nativeint> voption) : (ResizeArray<struct (nativeint * uint32 * uint64)> * HashSet<nativeint>) voption =
+    let private listRegularDiskFiles () : ResizeArray<struct (nativeint * uint32 * uint64)> voption =
         let mutable size = 32768u
         let mutable retLen = 0u
         let mutable buf = Marshal.AllocHGlobal(int size)
@@ -568,26 +568,14 @@ module private WinHandleTable =
             else
                 let count = int (Marshal.ReadIntPtr(buf, 0))
                 let list = ResizeArray<struct (nativeint * uint32 * uint64)>()
-                let liveHandles = HashSet<nativeint>(count)
                 for i = 0 to count - 1 do
                     let h = Marshal.ReadIntPtr(buf, headerSize + i * entrySize)
-                    liveHandles.Add h |> ignore
-                    let skip =
-                        match skipHandles with
-                        | ValueSome known -> known.Contains h
-                        | ValueNone -> false
-                    if not skip then
-                        match tryRegularDiskIdentity h with
-                        | ValueSome id -> list.Add id
-                        | ValueNone -> ()
-                ValueSome(list, liveHandles)
+                    match tryRegularDiskIdentity h with
+                    | ValueSome id -> list.Add id
+                    | ValueNone -> ()
+                ValueSome list
         finally
             Marshal.FreeHGlobal buf
-
-    let private listRegularDiskFiles () : ResizeArray<struct (nativeint * uint32 * uint64)> voption =
-        match listRegularDiskFilesSkipping ValueNone with
-        | ValueSome(list, _) -> ValueSome list
-        | ValueNone -> ValueNone
     let mutable private assemblyLoadHooked = false
     let mutable private baselineEpoch = 0L
     let private pendingDefaultAsmCandidates = Dictionary<struct (uint32 * uint64), int64 * HashSet<nativeint>>()
@@ -817,55 +805,9 @@ module private WinHandleTable =
             ValueNone
         else
             let snapshotEpoch = Volatile.Read(&baselineEpoch)
-            let baselineHandleValuesOpt =
-                lock baselineSync (fun () ->
-                    match baselineHandlesOpt with
-                    | ValueSome baseline when pendingDefaultAsmCandidates.Count = 0 ->
-                        let set = HashSet<nativeint>(baseline.Count)
-                        for struct (h, _, _) in baseline do
-                            set.Add h |> ignore
-                        ValueSome set
-                    | _ -> ValueNone)
-            let currentOpt =
-                match baselineHandleValuesOpt with
-                | ValueSome knownBaselineHandles ->
-                    match listRegularDiskFilesSkipping (ValueSome knownBaselineHandles) with
-                    | ValueNone -> ValueNone
-                    | ValueSome(added, liveHandles) ->
-                        let mutable allBaselineLive = true
-                        for h in knownBaselineHandles do
-                            if allBaselineLive && not (liveHandles.Contains h) then
-                                allBaselineLive <- false
-                        if allBaselineLive then
-                            lock baselineSync (fun () ->
-                                match baselineHandlesOpt with
-                                | ValueSome baseline ->
-                                    let hs = HashSet<struct (nativeint * uint32 * uint64)>(baseline)
-                                    let seenFiles = HashSet<struct (uint32 * uint64)>(baseline.Count)
-                                    let mutable hasUserFiles = false
-                                    for struct (_, vol, fileIdx) in baseline do
-                                        if not (seenFiles.Add(struct (vol, fileIdx))) then
-                                            hasUserFiles <- true
-                                    for id in added do
-                                        hs.Add id |> ignore
-                                        let struct (_, vol, fileIdx) = id
-                                        let duplicateFile = not (seenFiles.Add(struct (vol, fileIdx)))
-                                        if vol = 0xFFFFFFFFu || duplicateFile || not (baseline.Contains id) then
-                                            hasUserFiles <- true
-                                    ValueSome(Choice1Of2 { AllDiskFiles = hs; HasPreExistingUserFiles = hasUserFiles })
-                                | ValueNone -> ValueNone)
-                        else
-                            match listRegularDiskFiles () with
-                            | ValueSome list -> ValueSome(Choice2Of2 list)
-                            | ValueNone -> ValueNone
-                | ValueNone ->
-                    match listRegularDiskFiles () with
-                    | ValueSome list -> ValueSome(Choice2Of2 list)
-                    | ValueNone -> ValueNone
-            match currentOpt with
+            match listRegularDiskFiles () with
             | ValueNone -> ValueNone
-            | ValueSome(Choice1Of2 fastSnap) -> ValueSome fastSnap
-            | ValueSome(Choice2Of2 current) ->
+            | ValueSome current ->
                 lock baselineSync (fun () ->
                     match baselineHandlesOpt with
                     | ValueNone -> ValueNone
@@ -1012,35 +954,14 @@ module private WinHandleTable =
             | ValueNone -> true
             | ValueSome before when before.HasPreExistingUserFiles -> true
             | ValueSome before ->
-                // Fast incremental check: only probe handles whose HandleValue was not already
-                // in `before.AllDiskFiles` (or if any baseline handle disappeared and might be reused,
-                // fall back to full scan).
-                let beforeHandleValues = HashSet<nativeint>(before.AllDiskFiles.Count)
-                for struct (h, _, _) in before.AllDiskFiles do
-                    beforeHandleValues.Add h |> ignore
-                match listRegularDiskFilesSkipping (ValueSome beforeHandleValues) with
+                match listRegularDiskFiles () with
                 | ValueNone -> true
-                | ValueSome(addedDiskFiles, liveHandles) ->
-                    if addedDiskFiles.Count > 0 then
-                        true
-                    else
-                        // If every pre-existing baseline disk handle is still live, none could have
-                        // been closed and recycled to a different file during the run.
-                        let mutable anyClosed = false
-                        for h in beforeHandleValues do
-                            if not anyClosed && not (liveHandles.Contains h) then
-                                anyClosed <- true
-                        if not anyClosed then
-                            false
-                        else
-                            match listRegularDiskFiles () with
-                            | ValueNone -> true
-                            | ValueSome after ->
-                                let mutable found = false
-                                for id in after do
-                                    if not found && not (before.AllDiskFiles.Contains id) then
-                                        found <- true
-                                found
+                | ValueSome after ->
+                    let mutable found = false
+                    for id in after do
+                        if not found && not (before.AllDiskFiles.Contains id) then
+                            found <- true
+                    found
         else
             match posixBeforeOpt with
             | ValueNone -> true
@@ -1644,12 +1565,16 @@ type SessionHost(options: SessionHostOptions) =
                 tcs.TrySetResult(work ()) |> ignore
             with ex ->
                 tcs.TrySetException(ex) |> ignore
-        let slot =
+        let claimed =
             lock workerPoolGate (fun () ->
-                if workerPool.Count > 0 then ValueSome(workerPool.Pop()) else ValueNone)
-        match slot with
-        | ValueSome(signal, jobRef) ->
-            jobRef.Value <- box action
+                if workerPool.Count > 0 then
+                    let (signal, jobRef) = workerPool.Pop()
+                    jobRef.Value <- box action
+                    ValueSome signal
+                else
+                    ValueNone)
+        match claimed with
+        | ValueSome signal ->
             signal.Set() |> ignore
         | ValueNone ->
             let signal = new AutoResetEvent(false)
@@ -1657,9 +1582,13 @@ type SessionHost(options: SessionHostOptions) =
             let t =
                 Thread(fun () ->
                     let rec loop () =
-                        match jobRef.Value with
+                        let nextJob =
+                            lock workerPoolGate (fun () ->
+                                let v = jobRef.Value
+                                jobRef.Value <- null
+                                v)
+                        match nextJob with
                         | :? (unit -> unit) as fn ->
-                            jobRef.Value <- null
                             try
                                 fn ()
                             finally
@@ -1676,7 +1605,6 @@ type SessionHost(options: SessionHostOptions) =
                             if signal.WaitOne(60000) then
                                 loop ()
                             else
-                                // Only exit if we are no longer in the pool (timeout while idle).
                                 let removed =
                                     lock workerPoolGate (fun () ->
                                         if isNull jobRef.Value then
@@ -1696,7 +1624,9 @@ type SessionHost(options: SessionHostOptions) =
                                 if removed then
                                     try signal.Dispose() with _ -> ()
                                 else
-                                    // A job was just assigned before we acquired the lock; run it.
+                                    // A caller popped us and assigned jobRef under workerPoolGate; wait for its
+                                    // signal.Set() so the AutoResetEvent is always consumed before re-pooling.
+                                    signal.WaitOne() |> ignore
                                     loop ()
                         else
                             try signal.Dispose() with _ -> ()
@@ -3041,8 +2971,7 @@ type SessionHost(options: SessionHostOptions) =
                                     | _ -> ()
                             finally
                                 Ambient.clear ()
-                                if stateless then
-                                    restoreGlobalState daemonBaselineGlobalState
+                                restoreGlobalState daemonBaselineGlobalState
                         finally
                             if entered then
                                 processState.Exit ()
@@ -3054,8 +2983,7 @@ type SessionHost(options: SessionHostOptions) =
                         else
                             releaseSession claimed
                 finally
-                    if not entered then
-                        restoreGlobalState daemonBaselineGlobalState
+                    restoreGlobalState daemonBaselineGlobalState
                     if options.LogPath.IsSome then
                         let gateReleaseMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds - evaluateMs
                         logDetail (

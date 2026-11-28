@@ -16,10 +16,10 @@ In AI agent dynamic workflows (Code Mode), scripts are freshly generated per tur
 
 Implementations have freedom over internal module layout, wire framing, and data structures, provided these invariants hold:
 
-1. **Native Thin Client (`fsion`) + Managed Reactor Daemon (`fsiond`), 100% F# (`q2a`, `q3c`)**
+1. **Native Thin Client (`fsion`) + Managed Reactor Daemon (`fsiond`), F# Core with Zig Hot-Path Shim (`q2a`, `q3c`, owner-amended 2026-11-28)**
    - Multi-target `net10.0;net11.0`.
-   - `fsion` compiles with NativeAOT (`PublishAot=true`) so the CLI entry point pays zero CoreCLR startup tax and stays free of reflection/printf AOT traps.
-   - `fsiond` runs on CoreCLR, hosts `FSharp.Compiler.Service`, and communicates with `fsion` strictly over private local IPC (Windows Named Pipes / Unix Domain Sockets, `q1b`). Never spawn intermediate `dotnet` wrapper processes on the hot path.
+   - `fsion` uses a tiny zero-CRT cross-platform Zig hot-path shim (`src/fsion-shim/main.zig`, ~13–56 KB) that talks directly to a warm `fsiond` over private local IPC, falling back seamlessly to the colocated NativeAOT F# client (`fsion-cli`, `PublishAot=true`) for cold auto-start, management commands (`warmup`, `daemon`), `--json`, `--no-daemon`, and custom prelude resolution.
+   - `fsiond`, `Fsion.Protocol`, `fsion-cli`, and `Fsion.Tests` remain 100% F#. `fsiond` runs on CoreCLR, hosts `FSharp.Compiler.Service`, and communicates with `fsion` strictly over private local IPC (Windows Named Pipes / Unix Domain Sockets, `q1b`). Never spawn intermediate `dotnet` wrapper processes on the hot path.
 2. **Zero Disk-Emitted Temporary Assemblies on the Hot Path**
    - Script evaluation must emit IL in memory (`Reflection.Emit` / `FsiEvaluationSession` with `--optimize- --multiemit-`), never writing per-run `.dll` files that trigger Windows Defender scans.
 3. **Background-Replenished Collectible Session Pool (`q5a`, `q9a`)**

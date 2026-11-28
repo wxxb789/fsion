@@ -94,7 +94,12 @@ try {
             dotnet publish src/fsion -c Release -f $tfm @frameworkArgs
         }
 
-        $native = Join-Path $repoRoot "artifacts/publish/fsion/$tfm/$clientName"
+        $publishDir = Join-Path $repoRoot "artifacts/publish/fsion/$tfm"
+        Invoke-Checked "build Zig hot-path shim ($tfm)" {
+            & (Join-Path $repoRoot 'eng/build-shim.ps1') -OutputDirectory $publishDir
+        }
+
+        $native = Join-Path $publishDir $clientName
 
         if (-not (Test-Path -LiteralPath $native)) {
             throw "native fsion publish output missing: $native"

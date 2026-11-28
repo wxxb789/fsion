@@ -185,13 +185,22 @@ const win = if (is_windows) struct {
     const OPEN_EXISTING: u32 = 3;
     const SECURITY_SQOS_PRESENT: u32 = 0x00100000;
     const SECURITY_IDENTIFICATION: u32 = 0x00010000;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x40000000;
     const ERROR_PIPE_BUSY: u32 = 231;
+    const ERROR_IO_PENDING: u32 = 997;
     const CP_UTF8: u32 = 65001;
     const INFINITE: u32 = 0xFFFFFFFF;
     const STD_INPUT_HANDLE: u32 = @bitCast(@as(i32, -10));
     const STD_OUTPUT_HANDLE: u32 = @bitCast(@as(i32, -11));
     const STD_ERROR_HANDLE: u32 = @bitCast(@as(i32, -12));
 
+    const OVERLAPPED = extern struct {
+        Internal: usize = 0,
+        InternalHigh: usize = 0,
+        Offset: u32 = 0,
+        OffsetHigh: u32 = 0,
+        hEvent: ?HANDLE = null,
+    };
     const STARTUPINFOW = extern struct {
         cb: u32 = @sizeOf(STARTUPINFOW),
         lpReserved: ?[*]u16 = null,
@@ -232,14 +241,16 @@ const win = if (is_windows) struct {
     extern "kernel32" fn MultiByteToWideChar(cp: u32, flags: u32, src: [*]const u8, src_len: i32, dst: ?[*]u16, dst_len: i32) callconv(.winapi) i32;
     extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, disp: u32, flags: u32, tmpl: ?HANDLE) callconv(.winapi) HANDLE;
     extern "kernel32" fn WaitNamedPipeW(name: [*:0]const u16, timeout: u32) callconv(.winapi) i32;
-    extern "kernel32" fn ReadFile(h: HANDLE, buf: [*]u8, n: u32, got: *u32, ov: ?*anyopaque) callconv(.winapi) i32;
-    extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, n: u32, sent: *u32, ov: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn ReadFile(h: HANDLE, buf: [*]u8, n: u32, got: *u32, ov: ?*OVERLAPPED) callconv(.winapi) i32;
+    extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, n: u32, sent: *u32, ov: ?*OVERLAPPED) callconv(.winapi) i32;
+    extern "kernel32" fn GetOverlappedResult(h: HANDLE, ov: *OVERLAPPED, transferred: *u32, bWait: i32) callconv(.winapi) i32;
+    extern "kernel32" fn CreateEventW(sa: ?*anyopaque, manual_reset: i32, initial_state: i32, name: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn CreateThread(sa: ?*anyopaque, stack_size: usize, start: *const fn (?*anyopaque) callconv(.winapi) u32, param: ?*anyopaque, flags: u32, tid: ?*u32) callconv(.winapi) ?HANDLE;
     extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) i32;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
     extern "kernel32" fn CreateProcessW(app: ?[*:0]const u16, cmd: ?[*]u16, pa: ?*anyopaque, ta: ?*anyopaque, inherit: i32, flags: u32, env: ?*anyopaque, cwd: ?[*:0]const u16, si: *STARTUPINFOW, pi: *PROCESS_INFORMATION) callconv(.winapi) i32;
     extern "kernel32" fn WaitForSingleObject(h: HANDLE, ms: u32) callconv(.winapi) u32;
     extern "kernel32" fn GetExitCodeProcess(h: HANDLE, code: *u32) callconv(.winapi) i32;
-
     fn wlen(p: [*]const u16) usize {
         var n: usize = 0;
         while (p[n] != 0) n += 1;
@@ -461,7 +472,7 @@ const win = if (is_windows) struct {
                 0,
                 null,
                 OPEN_EXISTING,
-                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                 null,
             );
             if (h != INVALID_HANDLE_VALUE) return h;
@@ -515,18 +526,39 @@ const win = if (is_windows) struct {
         }
     }
 
-    fn readExact(h: HANDLE, dst: []u8) bool {
+    fn readExactPipe(h: HANDLE, ev: HANDLE, dst: []u8) bool {
         var got: usize = 0;
         while (got < dst.len) {
+            var ov = OVERLAPPED{ .hEvent = ev };
             var chunk: u32 = 0;
             const rem: u32 = @intCast(@min(dst.len - got, 0x40000000));
-            if (ReadFile(h, dst.ptr + got, rem, &chunk, null) == 0 or chunk == 0) return false;
+            if (ReadFile(h, dst.ptr + got, rem, &chunk, &ov) == 0) {
+                if (GetLastError() != ERROR_IO_PENDING) return false;
+                if (GetOverlappedResult(h, &ov, &chunk, 1) == 0) return false;
+            }
+            if (chunk == 0) return false;
             got += chunk;
         }
         return true;
     }
 
-    fn writeAll(h: HANDLE, src: []const u8) bool {
+    fn writeAllPipe(h: HANDLE, ev: HANDLE, src: []const u8) bool {
+        var sent: usize = 0;
+        while (sent < src.len) {
+            var ov = OVERLAPPED{ .hEvent = ev };
+            var chunk: u32 = 0;
+            const rem: u32 = @intCast(@min(src.len - sent, 0x40000000));
+            if (WriteFile(h, src.ptr + sent, rem, &chunk, &ov) == 0) {
+                if (GetLastError() != ERROR_IO_PENDING) return false;
+                if (GetOverlappedResult(h, &ov, &chunk, 1) == 0) return false;
+            }
+            if (chunk == 0) return false;
+            sent += chunk;
+        }
+        return true;
+    }
+
+    fn writeAllStd(h: HANDLE, src: []const u8) bool {
         var sent: usize = 0;
         while (sent < src.len) {
             var chunk: u32 = 0;
@@ -542,6 +574,47 @@ const win = if (is_windows) struct {
         var got: u32 = 0;
         if (ReadFile(h, dst.ptr, @intCast(dst.len), &got, null) == 0) return 0;
         return got;
+    }
+
+    const StdinTask = struct {
+        pipe: HANDLE,
+        write_ev: HANDLE,
+        max_bytes: usize,
+    };
+
+    fn stdinThreadProc(param: ?*anyopaque) callconv(.winapi) u32 {
+        const task: *StdinTask = @ptrCast(@alignCast(param orelse return 0));
+        const pipe = task.pipe;
+        const write_ev = task.write_ev;
+        const max_bytes = task.max_bytes;
+        osFree(@as([*]u8, @ptrCast(task))[0..@sizeOf(StdinTask)]);
+
+        const tmp = osAlloc(max_bytes);
+        defer osFree(tmp);
+        const got = readStdinSome(tmp);
+        var chunk = Buf{};
+        defer chunk.deinit();
+        chunk.i32Le(0);
+        chunk.i32Le(PROTOCOL_VERSION);
+        chunk.u8Val(6); // StdinChunk
+        chunk.u8Val(if (got == 0) 1 else 0);
+        chunk.i32Le(@intCast(got));
+        if (got > 0) chunk.bytes(tmp[0..got]);
+        chunk.patchFrameLen();
+        _ = writeAllPipe(pipe, write_ev, chunk.data[0..chunk.len]);
+        return 0;
+    }
+
+    fn spawnStdinRead(pipe: HANDLE, write_ev: HANDLE, max_bytes: usize) bool {
+        const mem = osAlloc(@sizeOf(StdinTask));
+        const task: *StdinTask = @ptrCast(@alignCast(mem.ptr));
+        task.* = .{ .pipe = pipe, .write_ev = write_ev, .max_bytes = max_bytes };
+        const th = CreateThread(null, 0, stdinThreadProc, task, 0, null) orelse {
+            osFree(mem);
+            return false;
+        };
+        _ = CloseHandle(th);
+        return true;
     }
 } else struct {};
 
@@ -643,6 +716,34 @@ const posix = if (!is_windows) struct {
         return buf[idx..];
     }
 
+    fn verifyPrivateSocketDir(dir_z: [*:0]const u8) bool {
+        const my_uid = getEuid();
+        if (is_linux) {
+            var stx: std.os.linux.Statx = undefined;
+            const rc: isize = @bitCast(std.os.linux.statx(
+                std.os.linux.AT.FDCWD,
+                dir_z,
+                std.os.linux.AT.SYMLINK_NOFOLLOW,
+                .{ .TYPE = true, .MODE = true, .UID = true },
+                &stx,
+            ));
+            if (rc != 0) return false;
+            if (!stx.mask.TYPE or !stx.mask.MODE or !stx.mask.UID) return false;
+            // Must be a real directory (not a symlink), owned by euid, and have no group/other bits.
+            if ((stx.mode & 0o170000) != 0o040000) return false;
+            if (stx.uid != my_uid) return false;
+            if ((stx.mode & 0o077) != 0) return false;
+            return true;
+        } else {
+            var st: std.c.Stat = undefined;
+            if (std.c.fstatat(std.c.AT.FDCWD, dir_z, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return false;
+            if ((st.mode & 0o170000) != 0o040000) return false;
+            if (st.uid != my_uid) return false;
+            if ((st.mode & 0o077) != 0) return false;
+            return true;
+        }
+    }
+
     fn resolveSocketPath(env_block: [:null]const ?[*:0]const u8, endpoint: []const u8, out: []u8) ?[]const u8 {
         var uid_buf: [16]u8 = undefined;
         const uid_s = formatU32(getEuid(), &uid_buf);
@@ -659,6 +760,7 @@ const posix = if (!is_windows) struct {
         // If candidate > 100 bytes, fall back to F# fsion-cli (handles SHA256 socket shortening).
         if (root_len + 7 + uid_s.len + 1 + san_s.len + 5 > 100) return null;
         if (root_len + 7 + uid_s.len + 1 + san_s.len + 6 > out.len) return null;
+
         var pos: usize = 0;
         @memcpy(out[pos .. pos + root_len], base_root[0..root_len]);
         pos += root_len;
@@ -666,6 +768,11 @@ const posix = if (!is_windows) struct {
         pos += 7;
         @memcpy(out[pos .. pos + uid_s.len], uid_s);
         pos += uid_s.len;
+        out[pos] = 0;
+
+        // Enforce private directory trust boundary before connecting (reject symlinks, foreign owners, group/other perms).
+        if (!verifyPrivateSocketDir(@ptrCast(out.ptr))) return null;
+
         out[pos] = '/';
         pos += 1;
         @memcpy(out[pos .. pos + san_s.len], san_s);
@@ -676,11 +783,30 @@ const posix = if (!is_windows) struct {
         return out[0..pos];
     }
 
+    fn pollConnOrStdin(conn_fd: i32, stdin_pending: bool) u32 {
+        // Bit 0: conn readable/hup, Bit 1: stdin readable/hup
+        var fds: [2]std.posix.pollfd = .{
+            .{ .fd = conn_fd, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = 0, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const nfds: usize = if (stdin_pending) 2 else 1;
+        if (is_linux) {
+            const rc: isize = @bitCast(std.os.linux.poll(&fds, @intCast(nfds), -1));
+            if (rc <= 0) return 0;
+        } else {
+            const rc = std.c.poll(&fds, @intCast(nfds), -1);
+            if (rc <= 0) return 0;
+        }
+        var mask: u32 = 0;
+        if (fds[0].revents != 0) mask |= 1;
+        if (stdin_pending and fds[1].revents != 0) mask |= 2;
+        return mask;
+    }
+
     fn connectEndpoint(env_block: [:null]const ?[*:0]const u8, endpoint: []const u8) ?i32 {
         var spath_buf: [128]u8 = undefined;
         const spath = resolveSocketPath(env_block, endpoint, &spath_buf) orelse return null;
         if (spath.len >= 104) return null;
-
         const fd_signed: isize = if (is_linux)
             @bitCast(std.os.linux.socket(AF_UNIX, SOCK_STREAM, 0))
         else
@@ -809,7 +935,7 @@ fn osExit(code: u32) noreturn {
 fn writeStdout(data: []const u8) void {
     if (data.len == 0) return;
     if (is_windows) {
-        if (win.GetStdHandle(win.STD_OUTPUT_HANDLE)) |h| _ = win.writeAll(h, data);
+        if (win.GetStdHandle(win.STD_OUTPUT_HANDLE)) |h| _ = win.writeAllStd(h, data);
     } else {
         _ = posix.writeAllFd(1, data);
     }
@@ -818,7 +944,7 @@ fn writeStdout(data: []const u8) void {
 fn writeStderr(data: []const u8) void {
     if (data.len == 0) return;
     if (is_windows) {
-        if (win.GetStdHandle(win.STD_ERROR_HANDLE)) |h| _ = win.writeAll(h, data);
+        if (win.GetStdHandle(win.STD_ERROR_HANDLE)) |h| _ = win.writeAllStd(h, data);
     } else {
         _ = posix.writeAllFd(2, data);
     }
@@ -935,7 +1061,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     req.str(src_val);
     if (is_windows) win.writeCwd(&req) else posix.writeCwd(&req);
     const script_args = args[script_args_start..];
-    req.i32Le(@intCast(script_args.len));
+    const arg0 = if (is_eval) "eval.fsx" else src_val;
+    req.i32Le(@intCast(script_args.len + 1));
+    req.str(arg0);
     for (script_args) |sa| req.str(sa);
     if (is_windows) win.writeEnv(&req) else posix.writeEnv(init.environ.block.slice, &req);
     req.u8Val(0); // IncludeDiagnostics = false
@@ -951,8 +1079,11 @@ pub fn main(init: std.process.Init.Minimal) void {
     req.u8Val(0); // PreludePath = None
     req.patchFrameLen();
 
+    const win_read_ev = if (is_windows) (win.CreateEventW(null, 1, 0, null) orelse fallbackCli(init)) else {};
+    const win_write_ev = if (is_windows) (win.CreateEventW(null, 1, 0, null) orelse fallbackCli(init)) else {};
+
     const send_ok = if (is_windows)
-        win.writeAll(conn, req.data[0..req.len])
+        win.writeAllPipe(conn, win_write_ev, req.data[0..req.len])
     else
         posix.writeAllFd(conn, req.data[0..req.len]);
     if (!send_ok) {
@@ -962,9 +1093,35 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     // Response loop: handles on-demand StdinReadRequest(17) and final Executed(11) / Failure(15)
     var resp_buf: []u8 = &.{};
+    var posix_stdin_pending: usize = 0;
     while (true) {
+        if (!is_windows and posix_stdin_pending > 0) {
+            const ready = posix.pollConnOrStdin(conn, true);
+            if ((ready & 2) != 0 and (ready & 1) == 0) {
+                const max_b = posix_stdin_pending;
+                posix_stdin_pending = 0;
+                const tmp = osAlloc(max_b);
+                defer osFree(tmp);
+                const got = posix.readStdinSome(tmp);
+                var chunk = Buf{};
+                defer chunk.deinit();
+                chunk.i32Le(0);
+                chunk.i32Le(PROTOCOL_VERSION);
+                chunk.u8Val(6); // StdinChunk
+                chunk.u8Val(if (got == 0) 1 else 0);
+                chunk.i32Le(@intCast(got));
+                if (got > 0) chunk.bytes(tmp[0..got]);
+                chunk.patchFrameLen();
+                if (!posix.writeAllFd(conn, chunk.data[0..chunk.len])) {
+                    posix.closeFd(conn);
+                    osExit(1);
+                }
+                continue;
+            }
+        }
+
         var hdr: [4]u8 = undefined;
-        const hdr_ok = if (is_windows) win.readExact(conn, &hdr) else posix.readExactFd(conn, &hdr);
+        const hdr_ok = if (is_windows) win.readExactPipe(conn, win_read_ev, &hdr) else posix.readExactFd(conn, &hdr);
         if (!hdr_ok) {
             if (is_windows) _ = win.CloseHandle(conn) else posix.closeFd(conn);
             osExit(1);
@@ -981,7 +1138,7 @@ pub fn main(init: std.process.Init.Minimal) void {
             resp_buf = osRealloc(resp_buf, rlen);
         }
         const body = resp_buf[0..rlen];
-        const body_ok = if (is_windows) win.readExact(conn, body) else posix.readExactFd(conn, body);
+        const body_ok = if (is_windows) win.readExactPipe(conn, win_read_ev, body) else posix.readExactFd(conn, body);
         if (!body_ok) {
             if (is_windows) _ = win.CloseHandle(conn) else posix.closeFd(conn);
             osExit(1);
@@ -1002,28 +1159,17 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
 
         if (kind == 17) {
-            // StdinReadRequest(maxBytes)
+            // StdinReadRequest(maxBytes) — service asynchronously so response loop never stalls
+            // if a background thread reads stdin while foreground evaluation completes.
             const raw_max = rdI32(body, &off) orelse 4096;
             const clamped: usize = if (raw_max <= 0) 4096 else @min(@as(usize, @intCast(raw_max)), 65536);
-            const tmp = osAlloc(clamped);
-            defer osFree(tmp);
-            const got = if (is_windows) win.readStdinSome(tmp) else posix.readStdinSome(tmp);
-            var chunk = Buf{};
-            defer chunk.deinit();
-            chunk.i32Le(0);
-            chunk.i32Le(PROTOCOL_VERSION);
-            chunk.u8Val(6); // StdinChunk
-            chunk.u8Val(if (got == 0) 1 else 0);
-            chunk.i32Le(@intCast(got));
-            if (got > 0) chunk.bytes(tmp[0..got]);
-            chunk.patchFrameLen();
-            const wok = if (is_windows)
-                win.writeAll(conn, chunk.data[0..chunk.len])
-            else
-                posix.writeAllFd(conn, chunk.data[0..chunk.len]);
-            if (!wok) {
-                if (is_windows) _ = win.CloseHandle(conn) else posix.closeFd(conn);
-                osExit(1);
+            if (is_windows) {
+                if (!win.spawnStdinRead(conn, win_write_ev, clamped)) {
+                    _ = win.CloseHandle(conn);
+                    osExit(1);
+                }
+            } else {
+                posix_stdin_pending = clamped;
             }
             continue;
         }

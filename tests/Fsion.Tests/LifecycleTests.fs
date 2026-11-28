@@ -236,9 +236,13 @@ let ``fsion discovers fsiond next to its own binary without FSIOND_PATH`` () =
         let deployedClient = Path.Combine(deployDirectory, clientName)
         File.Copy(fsionBinary, deployedClient, true)
 
+        let fallbackName = if isWindows then "fsion-cli.exe" else "fsion-cli"
+        let fallbackSource = Path.Combine(Path.GetDirectoryName fsionBinary, fallbackName)
+        if File.Exists fallbackSource then
+            File.Copy(fallbackSource, Path.Combine(deployDirectory, fallbackName), true)
+
         for file in Directory.EnumerateFiles(Path.GetDirectoryName fsiondBinary) do
             File.Copy(file, Path.Combine(deployDirectory, Path.GetFileName file), true)
-
         let endpoint = "fsion-test-" + Guid.NewGuid().ToString("N")
         let environment = [ "FSION_PIPE", endpoint ]
 

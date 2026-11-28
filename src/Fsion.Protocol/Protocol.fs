@@ -236,7 +236,7 @@ let private writeResponsePayloadWithVersion (version: int) (writer: BinaryWriter
         writer.Write maxBytes
 
 let private sendFramedWith (stream: Stream) (write: BinaryWriter -> unit) =
-    use frameStream = new MemoryStream(256)
+    use frameStream = new MemoryStream(16384)
     frameStream.Write(ReadOnlySpan<byte>(Array.zeroCreate<byte> 4))
     do
         use writer = new BinaryWriter(frameStream, utf8, true)

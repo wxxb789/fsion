@@ -135,6 +135,7 @@ let connect (endpoint: Endpoint) (timeout: TimeSpan) : Stream =
     validateEndpointName endpoint.Name
     let deadline = DateTime.UtcNow + timeout
     let mutable stream: Stream = null
+    let mutable backoffMs = 1
     while isNull stream do
         try
             let candidate =
@@ -164,7 +165,8 @@ let connect (endpoint: Endpoint) (timeout: TimeSpan) : Stream =
         with ex ->
             if DateTime.UtcNow >= deadline then
                 raise (TimeoutException("fsiond endpoint '" + endpointDisplay endpoint + "' is not reachable", ex))
-            Thread.Sleep 20
+            Thread.Sleep backoffMs
+            backoffMs <- min 20 (backoffMs * 2)
     stream
 
 let tryConnect (endpoint: Endpoint) (timeout: TimeSpan) : Stream option =

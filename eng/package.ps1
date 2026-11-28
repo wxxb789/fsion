@@ -155,6 +155,12 @@ Invoke-DotnetPublish "dotnet publish src/fsion -c Release -f $Framework -r $Runt
     '-c', 'Release', '-f', $Framework, '-r', $Runtime, '-o', $stage
 )
 
+Write-Host "==> build Zig hot-path shim ($Runtime)"
+& (Join-Path $repoRoot 'eng/build-shim.ps1') -OutputDirectory $stage -Runtime $Runtime
+if ($LASTEXITCODE -ne 0) {
+    throw "build-shim.ps1 failed with exit code $LASTEXITCODE"
+}
+
 Invoke-DotnetPublish "dotnet publish src/fsiond -c Release -f $Framework -r $Runtime (framework-dependent ReadyToRun)" @(
     'publish', (Join-Path $repoRoot 'src/fsiond/fsiond.fsproj'),
     '-c', 'Release', '-f', $Framework, '-r', $Runtime, '--self-contained', 'false', '-p:PublishReadyToRun=true', '-o', $stage

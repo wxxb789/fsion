@@ -543,8 +543,10 @@ let private emit (options: Options) (elapsedMs: float) (response: Response) : in
             if result.StandardError.Length > 0 then
                 standardError.Value.Write result.StandardError
 
-            standardOut.Value.Flush()
-            standardError.Value.Flush()
+            if standardOut.IsValueCreated then
+                standardOut.Value.Flush()
+            if standardError.IsValueCreated then
+                standardError.Value.Flush()
 
         result.ExitCode
     | Failure message -> emitFailure options elapsedMs message
@@ -712,7 +714,7 @@ let private executeInput
 let main argv =
     let started = Stopwatch.StartNew()
 
-    if not redirectBoth.Value then
+    if not redirectBoth.Value && Console.OutputEncoding.CodePage <> 65001 then
         try
             Console.OutputEncoding <- UTF8Encoding(false)
         with _ ->
